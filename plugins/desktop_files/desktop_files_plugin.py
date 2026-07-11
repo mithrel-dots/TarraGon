@@ -33,7 +33,11 @@ def _to_bool(value: str) -> bool:
 def _split_keywords(raw_keywords: str) -> list[str]:
     if not raw_keywords:
         return []
-    return [part.strip() for part in raw_keywords.replace(",", ";").split(";") if part.strip()]
+    return [
+        part.strip()
+        for part in raw_keywords.replace(",", ";").split(";")
+        if part.strip()
+    ]
 
 
 def _get_option(entry: configparser.SectionProxy, key: str) -> str:
@@ -63,9 +67,16 @@ def _desktop_dirs() -> list[Path]:
 
 def scan_desktop_entries() -> list[dict]:
     entries: list[dict] = []
+    seen: set[str] = set()
 
     for directory in _desktop_dirs():
         for file_path in directory.rglob("*.desktop"):
+            desktop_id = file_path.relative_to(directory).as_posix().replace("/", "-")
+
+            if desktop_id in seen:
+                continue
+
+            seen.add(desktop_id)
             parser = configparser.ConfigParser(strict=False, interpolation=None)
             try:
                 with open(file_path, "r", encoding="utf-8", errors="replace") as f:
@@ -229,12 +240,16 @@ def _launch_detached(cmd: list[str]) -> None:
                 pass
 
 
-def _start_refresh_thread(cache: DesktopEntryCache, stop_event: threading.Event) -> threading.Thread:
+def _start_refresh_thread(
+    cache: DesktopEntryCache, stop_event: threading.Event
+) -> threading.Thread:
     def _loop():
         while not stop_event.wait(RESCAN_INTERVAL_SECONDS):
             try:
                 cache.refresh()
-            except Exception as err:  # pragma: no cover - defensive logging in daemon loop
+            except (
+                Exception
+            ) as err:  # pragma: no cover - defensive logging in daemon loop
                 logger.error("background refresh failed: %s", err)
 
     t = threading.Thread(target=_loop, daemon=True)
@@ -313,7 +328,19 @@ def run_daemon() -> int:
                 if action and action != "open":
                     raise ValueError(f"unsupported action: {action}")
                 cmd = shlex.split(result_id)
-                desktop_tokens = {"%u", "%U", "%f", "%F", "%d", "%D", "%n", "%N", "%i", "%c", "%k"}
+                desktop_tokens = {
+                    "%u",
+                    "%U",
+                    "%f",
+                    "%F",
+                    "%d",
+                    "%D",
+                    "%n",
+                    "%N",
+                    "%i",
+                    "%c",
+                    "%k",
+                }
                 cmd = [part for part in cmd if part not in desktop_tokens]
                 if not cmd:
                     raise ValueError("empty command")
