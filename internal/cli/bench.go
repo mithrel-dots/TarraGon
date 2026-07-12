@@ -58,6 +58,7 @@ func init() {
 	ipcCmd.Flags().IntVar(&opts.Burst, "burst", 1, "Queries sent back-to-back before waiting for all results (1-64)")
 	ipcCmd.Flags().IntVar(&opts.Rounds, "rounds", 3, "Number of rounds, rotating the route order")
 	ipcCmd.Flags().DurationVar(&opts.Timeout, "timeout", 3*time.Second, "Deadline per fixture I/O operation")
+	ipcCmd.Flags().BoolVar(&opts.Matrix, "matrix", false, "Also exercise all combinations of native and UDS-adapted broker clients")
 	ipcCmd.AddCommand(&cobra.Command{
 		Use:    "fixture",
 		Hidden: true,

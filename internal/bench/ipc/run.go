@@ -24,9 +24,26 @@ type Options struct {
 	Samples, Warmup, Rounds int
 	Plugins, Burst          int
 	Timeout                 time.Duration
+	Matrix                  bool
 }
 
 type route struct{ plugin, ui string }
+
+func routes(matrix bool) []route {
+	paths := []string{tcp, bridged}
+	if matrix {
+		paths = append(paths, adapter)
+	}
+	result := []route{{direct, direct}}
+	for _, plugin := range paths {
+		for _, ui := range paths {
+			if matrix || plugin == ui {
+				result = append(result, route{plugin, ui})
+			}
+		}
+	}
+	return result
+}
 
 type coreStamp struct {
 	id     string
@@ -259,7 +276,7 @@ func Run(ctx context.Context, opts Options, out io.Writer) error {
 	}
 	ctx, cancel := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-	paths := []route{{direct, direct}, {tcp, tcp}, {bridged, bridged}}
+	paths := routes(opts.Matrix)
 	results := make(map[route]*roundResult)
 	for _, r := range paths {
 		results[r] = &roundResult{}

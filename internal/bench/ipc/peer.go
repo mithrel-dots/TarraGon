@@ -108,6 +108,13 @@ func startPeer(ctx context.Context, dir string, broker *server.Server, cfg fixtu
 			return nil, err
 		}
 		p.cleanups = append(p.cleanups, stop)
+	case adapter:
+		side, err := bus(nats.DefaultURL, cfg.Token, toPeer, fromPeer, cfg.Timeout, nats.InProcessServer(broker))
+		if err != nil {
+			return nil, err
+		}
+		p.cleanups = append(p.cleanups, side.close)
+		adapt(local, side)
 	}
 	return p, nil
 }

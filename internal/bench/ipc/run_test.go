@@ -24,14 +24,14 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-func TestDeliveryPaths(t *testing.T) {
+func TestDeliveryMatrix(t *testing.T) {
 	var out bytes.Buffer
-	err := Run(context.Background(), Options{Samples: 3, Warmup: 1, Plugins: 1, Burst: 1, Rounds: 1, Timeout: 5 * time.Second}, &out)
+	err := Run(context.Background(), Options{Samples: 3, Warmup: 1, Plugins: 1, Burst: 1, Rounds: 1, Timeout: 5 * time.Second, Matrix: true}, &out)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rows := strings.Count(out.String(), "  3/3  "); rows != 3 {
-		t.Fatalf("expected three delivery paths, got %d:\n%s", rows, out.String())
+	if rows := strings.Count(out.String(), "  3/3  "); rows != 10 {
+		t.Fatalf("expected direct UDS plus nine broker paths, got %d:\n%s", rows, out.String())
 	}
 }
 
@@ -39,11 +39,11 @@ func TestPipelinedFanout(t *testing.T) {
 	// Partial warmup and measurement bursts; each cumulative snapshot must
 	// contribute only the newly visible (query, plugin) suggestion.
 	var out bytes.Buffer
-	err := Run(context.Background(), Options{Samples: 5, Warmup: 3, Plugins: 4, Burst: 2, Rounds: 1, Timeout: 5 * time.Second}, &out)
+	err := Run(context.Background(), Options{Samples: 5, Warmup: 3, Plugins: 4, Burst: 2, Rounds: 1, Timeout: 5 * time.Second, Matrix: true}, &out)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rows := strings.Count(out.String(), "  20/20  "); rows != 3 {
+	if rows := strings.Count(out.String(), "  20/20  "); rows != 10 {
 		t.Fatalf("expected 20 measured suggestions for each route:\n%s", out.String())
 	}
 }

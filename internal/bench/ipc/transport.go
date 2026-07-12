@@ -18,6 +18,7 @@ const (
 	direct  = "uds"
 	tcp     = "nats-tcp"
 	bridged = "nats-uds-bridge"
+	adapter = "uds-adapter"
 )
 
 // Each link carries whole JSON messages. Only the framing changes.
@@ -141,6 +142,23 @@ func bridge(client net.Conn, broker *server.Server) (func(), error) {
 	return closeBoth, nil
 }
 
+// Forward NDJSON frames to the fixture's request/response subjects, and put
+// the NDJSON delimiter back on messages coming from the broker.
+func adapt(legacy, native link) {
+	copyMessages := func(dst, src link) {
+		for {
+			data, err := src.read()
+			// A socket writer appends a delimiter; neither an inbound NATS
+			// message nor a Scanner token owns the bytes past its end.
+			if err != nil || dst.write(data[:len(data):len(data)]) != nil {
+				return
+			}
+		}
+	}
+	go copyMessages(native, legacy)
+	go copyMessages(legacy, native)
+}
+
 func subjects(role string) (toPeer, fromPeer string) {
 	return "bench." + role + ".in", "bench." + role + ".out"
 }
@@ -148,7 +166,7 @@ func subjects(role string) (toPeer, fromPeer string) {
 func openFixtureLink(cfg fixtureConfig) (link, error) {
 	toPeer, fromPeer := subjects(cfg.Name)
 	switch cfg.Path {
-	case direct:
+	case direct, adapter:
 		conn, err := net.DialTimeout("unix", cfg.Address, cfg.Timeout)
 		if err != nil {
 			return nil, err
