@@ -51,6 +51,9 @@ Plugins can be invoked directly or contextually, and can expose commands, values
 ### Plugin Benchmarking
 - `tarragon bench` connects to the daemon like an external frontend, sends benchmark queries through the UI socket, and prints plugin latency results as a table.
 - Run it with `just bench` while the daemon is running.
+- `just bench ipc` runs a separate suggestion-delivery experiment. It starts its own core, persistent fixture plugin processes, and headless UI. No running daemon or installed plugins are needed.
+- For congestion, try `just bench ipc --plugins 50 --burst 8 --samples 80 --warmup 16 --rounds 3`. Each plugin returns one small suggestion per query. The UI sends each burst back-to-back, then waits for every plugin's suggestion for every query before starting the next burst. Use `--burst 1` at the same plugin count as a control. Both flags default to 1.
+- The table reports mean/p50/p95/p99 in microseconds for plugin encode to core decode, aggregation (including contention), outbound update to UI decode, and end to end. The UI times the first appearance of each `(query, plugin)` in cumulative snapshots. `Query->first` and `Query->all` start at UI query send; `Queries/s` measures completed queries over the elapsed UI measurement window. Startup, warmup, and rendering are excluded. A missing or mismatched suggestion fails the run.
 
 ### Plugin Installation & Security
 - **Bundled plugin sources**: First-party bundled plugins live in `plugins/`.
