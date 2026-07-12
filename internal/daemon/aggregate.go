@@ -51,6 +51,30 @@ type aggregateStore struct {
 	byClient map[string]map[string]struct{}
 }
 
+// NewTransientQueryStore provides the daemon's normal aggregation pipeline
+// without opening a user's frecency database.
+func NewTransientQueryStore() *aggregateStore {
+	return newAggregateStore(64, "global", nil, 0.3)
+}
+
+func (s *aggregateStore) PrepareQuery(qid, client, input string, plugins []string) *wire.UpdateMessage {
+	s.create(qid, client, input)
+	snapshot, ok := s.setExpectedPlugins(qid, plugins)
+	if !ok {
+		return nil
+	}
+	return &wire.UpdateMessage{Type: "update", QueryID: qid, Payload: snapshot}
+}
+
+// ApplyPluginResponse builds the exact update delivered to a frontend.
+func (s *aggregateStore) ApplyPluginResponse(plugin string, resp wire.PluginResponse, elapsedMs float64) (*wire.UpdateMessage, bool) {
+	snapshot, ok := s.update(resp.QueryID, plugin, elapsedMs, resp.Data)
+	if !ok {
+		return nil, false
+	}
+	return &wire.UpdateMessage{Type: "update", QueryID: resp.QueryID, Payload: snapshot}, true
+}
+
 func newAggregateStore(limit int, orderingMode string, frecencyDB *db.DB, frecencyWeight float64) *aggregateStore {
 	if orderingMode == "" {
 		orderingMode = "global"

@@ -234,9 +234,9 @@ func handlePluginConn(ctx context.Context, conn net.Conn, registry *pluginRegist
 			if resp.QueryID == "" {
 				continue
 			}
-			snap, ok := store.update(resp.QueryID, hello.Name, elapsedMs(resp.QueryID, hello.Name), resp.Data)
+			update, ok := store.ApplyPluginResponse(hello.Name, resp, elapsedMs(resp.QueryID, hello.Name))
 			if ok {
-				ui.publish(&wire.UpdateMessage{Type: "update", QueryID: resp.QueryID, Payload: snap})
+				ui.publish(update)
 			}
 
 		case wire.MsgSelectResponse:
