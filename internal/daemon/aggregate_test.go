@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"math"
 	"path/filepath"
 	"reflect"
@@ -11,6 +12,30 @@ import (
 	"github.com/mithrel-dots/tarragon/internal/db"
 	"github.com/mithrel-dots/tarragon/internal/wire"
 )
+
+// Time a complete query, including every cumulative snapshot sent to the UI.
+func BenchmarkAggregateFanout(b *testing.B) {
+	for _, count := range []int{1, 10, 50} {
+		b.Run(fmt.Sprintf("%d-plugins", count), func(b *testing.B) {
+			s := NewTransientQueryStore()
+			plugins := make([]string, count)
+			for i := range plugins {
+				plugins[i] = fmt.Sprintf("plugin-%02d", i)
+			}
+			data := json.RawMessage(`{"id":"result","label":"Benchmark suggestion","score":0.8}`)
+			b.ReportAllocs()
+			for b.Loop() {
+				s.PrepareQuery("q", "ui", "bench", plugins)
+				for _, plugin := range plugins {
+					if _, ok := s.update("q", plugin, 1, data); !ok {
+						b.Fatal("missing update")
+					}
+				}
+				s.removeByClient("ui")
+			}
+		})
+	}
+}
 
 func TestAggregateStoreCreateUpdateSnapshot(t *testing.T) {
 	s := newAggregateStore(10, "global", nil, 0.3)
@@ -108,6 +133,41 @@ func TestAggregateStorePluginStates(t *testing.T) {
 	}
 	if ag.Plugins["pluginC"].State != "error" || ag.Plugins["pluginC"].Error != "boom" {
 		t.Fatalf("expected pluginC error state, got %+v", ag.Plugins["pluginC"])
+	}
+}
+
+func TestAggregateReplacesCachedItemsAndRescoresEarlierResponses(t *testing.T) {
+	s := newAggregateStore(1, "global", nil, 0.5)
+	s.PrepareQuery("q", "ui", "query", []string{"a", "b"})
+	update := func(plugin, data string) aggregate {
+		t.Helper()
+		snap, ok := s.update("q", plugin, 1, json.RawMessage(data))
+		if !ok {
+			t.Fatalf("missing update for %s", plugin)
+		}
+		var ag aggregate
+		if err := json.Unmarshal(snap, &ag); err != nil {
+			t.Fatal(err)
+		}
+		return ag
+	}
+
+	update("a", `{"items":[{"id":"a1","score":4},{"id":"a2","score":2}]}`)
+	// Simulate a frecency refresh between replies. Reusing previously ranked
+	// items would apply the weight twice or leave the old ranking in place.
+	s.frecencyCache = map[string]float64{"a:a2": 10}
+	ag := update("b", `["b1"]`)
+	if len(ag.List) != 3 || ag.List[0].ID != "a2" || ag.List[0].Score != 6 || ag.List[1].Score != 2 {
+		t.Fatalf("expected scores from the original plugin items and refreshed frecency: %+v", ag.List)
+	}
+
+	ag = update("a", `{"error":"unavailable"}`)
+	if len(ag.List) != 1 || ag.List[0].ID != "b1" || ag.Plugins["a"].Error != "unavailable" {
+		t.Fatalf("stale suggestions after replacement: %+v", ag)
+	}
+	ag = update("b", `[]`)
+	if ag.List == nil || len(ag.List) != 0 || ag.Plugins["b"].State != "empty" {
+		t.Fatalf("expected an empty result list: %+v", ag)
 	}
 }
 

@@ -14,8 +14,9 @@ import (
 
 // aggregate store keeps full results per query for streaming snapshots
 type aggResult struct {
-	ElapsedMs float64         `json:"elapsed_ms"`
-	Data      json.RawMessage `json:"data"`
+	ElapsedMs float64           `json:"elapsed_ms"`
+	Data      json.RawMessage   `json:"data"`
+	items     []wire.ResultItem // normalized, with the original plugin scores
 }
 
 type aggPluginState struct {
@@ -120,11 +121,8 @@ func (s *aggregateStore) RefreshFrecencyCache(ctx context.Context) error {
 func (s *aggregateStore) frecencyScoresSnapshot() map[string]float64 {
 	s.frecencyCacheMu.RLock()
 	defer s.frecencyCacheMu.RUnlock()
-	out := make(map[string]float64, len(s.frecencyCache))
-	for k, v := range s.frecencyCache {
-		out[k] = v
-	}
-	return out
+	// Refresh publishes a new map; callers can read the old one until done.
+	return s.frecencyCache
 }
 
 func (s *aggregateStore) create(qid, client, input string) {
@@ -180,10 +178,9 @@ func (s *aggregateStore) setExpectedPlugins(qid string, plugins []string) ([]byt
 // update returns a snapshot JSON after applying the update.
 func (s *aggregateStore) update(qid, plugin string, elapsed float64, data json.RawMessage) ([]byte, bool) {
 	frecencyScores := s.frecencyScoresSnapshot()
-	items := normalizeResults(plugin, data)
+	items, errMsg := normalizeResults(plugin, data)
 	count := len(items)
 	state := "done"
-	errMsg := extractErrorMessage(data)
 	if errMsg != "" {
 		state = "error"
 	} else if count == 0 {
@@ -196,9 +193,16 @@ func (s *aggregateStore) update(qid, plugin string, elapsed float64, data json.R
 	if !ok {
 		return nil, false
 	}
-	ag.Results[plugin] = aggResult{ElapsedMs: elapsed, Data: data}
+	total := len(ag.List) - len(ag.Results[plugin].items) + count
+	ag.Results[plugin] = aggResult{ElapsedMs: elapsed, Data: data, items: items}
 	ag.Plugins[plugin] = aggPluginState{State: state, Count: count, ElapsedMs: elapsed, Error: errMsg}
-	ag.List = orderResults(flattenResults(ag.Results), s.orderingMode, frecencyScores, s.frecencyW)
+	// Ranking mutates its input. Copy the cached items so later updates
+	// always apply the current frecency weights to the original scores.
+	list := make([]wire.ResultItem, 0, total)
+	for _, res := range ag.Results {
+		list = append(list, res.items...)
+	}
+	ag.List = orderResults(list, s.orderingMode, frecencyScores, s.frecencyW)
 	return s.marshalSnapshotLocked(ag)
 }
 
@@ -221,47 +225,35 @@ func (s *aggregateStore) marshalSnapshotLocked(ag *aggregate) ([]byte, bool) {
 	return snap, true
 }
 
-func flattenResults(results map[string]aggResult) []wire.ResultItem {
-	out := make([]wire.ResultItem, 0)
-	for name, res := range results {
-		out = append(out, normalizeResults(name, res.Data)...)
-	}
-	return out
-}
-
-func normalizeResults(plugin string, raw json.RawMessage) []wire.ResultItem {
-	if len(raw) == 0 {
-		return nil
-	}
+func normalizeResults(plugin string, raw json.RawMessage) ([]wire.ResultItem, string) {
 	// Object with known array fields.
 	var obj map[string]json.RawMessage
 	if json.Unmarshal(raw, &obj) == nil {
+		errMsg := readStringField(obj, "error")
 		for _, k := range []string{"suggestions", "variants", "items", "choices", "results"} {
 			if arr, ok := obj[k]; ok {
 				if items := parseArrayItems(plugin, arr); len(items) > 0 {
-					return items
+					return items, errMsg
 				}
 			}
 		}
 		// Single object with id/label/title/text.
 		if item, ok := parseObjectItem(plugin, obj); ok {
-			return []wire.ResultItem{item}
+			return []wire.ResultItem{item}, errMsg
 		}
+		return nil, errMsg
 	}
 	// Top-level array.
-	if items := parseArrayItems(plugin, raw); len(items) > 0 {
-		return items
-	}
-	return nil
+	return parseArrayItems(plugin, raw), ""
 }
 
 func parseArrayItems(plugin string, raw json.RawMessage) []wire.ResultItem {
 	// Array of objects.
-	var objs []map[string]any
+	var objs []map[string]json.RawMessage
 	if json.Unmarshal(raw, &objs) == nil && len(objs) > 0 {
 		out := make([]wire.ResultItem, 0, len(objs))
 		for _, o := range objs {
-			if item, ok := parseObjectItem(plugin, toRawMap(o)); ok {
+			if item, ok := parseObjectItem(plugin, o); ok {
 				out = append(out, item)
 			}
 		}
@@ -315,17 +307,6 @@ func parseObjectItem(plugin string, obj map[string]json.RawMessage) (wire.Result
 	}, true
 }
 
-func extractErrorMessage(raw json.RawMessage) string {
-	if len(raw) == 0 {
-		return ""
-	}
-	var obj map[string]json.RawMessage
-	if json.Unmarshal(raw, &obj) != nil {
-		return ""
-	}
-	return readStringField(obj, "error")
-}
-
 func readStringField(obj map[string]json.RawMessage, key string) string {
 	raw, ok := obj[key]
 	if !ok {
@@ -360,16 +341,6 @@ func readActionsField(obj map[string]json.RawMessage, key string) []wire.Action 
 		return actions
 	}
 	return nil
-}
-
-func toRawMap(m map[string]any) map[string]json.RawMessage {
-	out := make(map[string]json.RawMessage, len(m))
-	for k, v := range m {
-		if b, err := json.Marshal(v); err == nil {
-			out[k] = b
-		}
-	}
-	return out
 }
 
 func orderResults(items []wire.ResultItem, mode string, frecencyScores map[string]float64, weight float64) []wire.ResultItem {
