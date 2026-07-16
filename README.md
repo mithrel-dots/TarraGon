@@ -34,6 +34,11 @@ Plugins can be invoked directly or contextually, and can expose commands, values
 - Optional icon display (depending on UI backend).
 - Launched applications are detached from the plugin process and remain running across Tarragon daemon restarts.
 
+### Hyprland Windows
+- The bundled [`hyprland_windows`](plugins/hyprland_windows/README.md) plugin lists open windows with `@windows`, searchable by title, app, and workspace.
+- Focus a window, bring it to the currently focused workspace, close it, or toggle floating mode.
+- Install with `just plugin-install hyprland_windows`, then run `tarragon plugin restart hyprland_windows`.
+
 ### Plugin System
 - **Integrated Suggestions**: Seamlessly blends suggestions from eligible plugins, including bundled plugins for installed applications and other local tasks.
 - **Language Agnostic**: Plugins are external executables or scripts.

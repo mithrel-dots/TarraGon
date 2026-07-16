@@ -1,0 +1,13 @@
+id = "hyprland_windows"
+name = "Hyprland Windows"
+description = "Find, focus, move, and close open Hyprland windows"
+enabled = true
+entrypoint = "hyprland_windows_plugin.py"
+lifecycle_mode = "on_call"
+
+provides_general_suggestions = false
+prefix = "windows"
+require_prefix = true
+build_dependencies = ["python3", "hyprctl"]
+capabilities = ["suggest", "action"]
+icon = "preferences-system-windows"
