@@ -42,7 +42,9 @@ func TestHandlePluginConn_SelectResponseBroadcastsToUI(t *testing.T) {
 
 	uiSrv, uiCli := net.Pipe()
 	defer func() { _ = uiCli.Close() }()
-	uiReg.add(&uiClient{conn: uiSrv, scanner: wire.NewScanner(uiSrv), clientID: "u1"})
+	client := &uiClient{conn: uiSrv, clientID: "u1"}
+	uiReg.add(client)
+	defer uiReg.remove(client)
 
 	pluginSrv, pluginCli := net.Pipe()
 	defer func() { _ = pluginCli.Close() }()

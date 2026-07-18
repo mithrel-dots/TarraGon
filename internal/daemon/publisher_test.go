@@ -13,7 +13,9 @@ func TestUIRegistryPublish(t *testing.T) {
 	defer func() { _ = c2.Close() }()
 
 	r := newUIRegistry()
-	r.add(&uiClient{conn: c1, scanner: wire.NewScanner(c1), clientID: "u1"})
+	client := &uiClient{conn: c1, clientID: "u1"}
+	r.add(client)
+	defer r.remove(client)
 
 	done := make(chan *wire.UpdateMessage, 1)
 	go func() {
@@ -35,7 +37,9 @@ func TestUIRegistryPublishSelectResponse(t *testing.T) {
 	defer func() { _ = c2.Close() }()
 
 	r := newUIRegistry()
-	r.add(&uiClient{conn: c1, scanner: wire.NewScanner(c1), clientID: "u1"})
+	client := &uiClient{conn: c1, clientID: "u1"}
+	r.add(client)
+	defer r.remove(client)
 
 	done := make(chan *wire.SelectResponse, 1)
 	go func() {

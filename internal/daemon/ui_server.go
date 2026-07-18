@@ -1,10 +1,10 @@
 package daemon
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"sort"
@@ -24,9 +24,32 @@ var querySeq uint64
 // uiClient tracks a connected UI.
 type uiClient struct {
 	conn     net.Conn
-	scanner  *bufio.Scanner
 	clientID string
-	mu       sync.Mutex // serialize writes
+	out      chan any
+	done     chan struct{}
+	stopOnce sync.Once
+}
+
+type writeBarrier chan struct{}
+
+func (c *uiClient) stop() {
+	c.stopOnce.Do(func() {
+		close(c.done)
+		_ = c.conn.Close()
+	})
+}
+
+func (c *uiClient) send(msg any) error {
+	select {
+	case c.out <- msg:
+		return nil
+	case <-c.done:
+		return net.ErrClosed
+	default:
+		// A stalled frontend must not hold up every plugin or another UI.
+		c.stop()
+		return net.ErrClosed
+	}
 }
 
 // uiRegistry tracks active UI clients.
@@ -40,53 +63,62 @@ func newUIRegistry() *uiRegistry {
 }
 
 func (r *uiRegistry) add(c *uiClient) {
+	c.out = make(chan any, 128)
+	c.done = make(chan struct{})
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if old, ok := r.clients[c.clientID]; ok && old != c {
-		_ = old.conn.Close()
+		old.stop()
 	}
 	r.clients[c.clientID] = c
+	go func() {
+		defer r.remove(c)
+		for {
+			select {
+			case <-c.done:
+				return
+			case msg := <-c.out:
+				if barrier, ok := msg.(writeBarrier); ok {
+					close(barrier)
+					continue
+				}
+				_ = c.conn.SetWriteDeadline(time.Now().Add(100 * time.Millisecond))
+				if err := wire.WriteMsg(c.conn, msg); err != nil {
+					return
+				}
+			}
+		}
+	}()
 }
 
 func (r *uiRegistry) updateClientID(c *uiClient, newID string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.clients[c.clientID] != c {
+		return
+	}
 	delete(r.clients, c.clientID)
 	c.clientID = newID
 	if old, ok := r.clients[newID]; ok && old != c {
-		_ = old.conn.Close()
+		old.stop()
 	}
 	r.clients[newID] = c
 }
 
-func (r *uiRegistry) remove(id string) {
+func (r *uiRegistry) remove(c *uiClient) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if c, ok := r.clients[id]; ok {
-		_ = c.conn.Close()
-		delete(r.clients, id)
+	if r.clients[c.clientID] == c {
+		delete(r.clients, c.clientID)
 	}
+	c.stop()
 }
 
 func (r *uiRegistry) publish(msg any) {
 	r.mu.RLock()
-	clients := make([]*uiClient, 0, len(r.clients))
-	ids := make([]string, 0, len(r.clients))
-	for id, c := range r.clients {
-		ids = append(ids, id)
-		clients = append(clients, c)
-	}
-	r.mu.RUnlock()
-
-	for i, c := range clients {
-		c.mu.Lock()
-		_ = c.conn.SetWriteDeadline(time.Now().Add(100 * time.Millisecond))
-		err := wire.WriteMsg(c.conn, msg)
-		_ = c.conn.SetWriteDeadline(time.Time{})
-		c.mu.Unlock()
-		if err != nil {
-			r.remove(ids[i])
-		}
+	defer r.mu.RUnlock()
+	for _, c := range r.clients {
+		_ = c.send(msg)
 	}
 }
 
@@ -119,9 +151,11 @@ func startUIServer(ctx context.Context, mgr *plugins.Manager, reqOut chan<- plug
 func handleUIClient(ctx context.Context, conn net.Conn, mgr *plugins.Manager, reqOut chan<- pluginRequest, pluginsReg *pluginRegistry, store *aggregateStore, ui *uiRegistry, frecencyDB *db.DB) {
 	scanner := wire.NewScanner(conn)
 	uid := fmt.Sprintf("ui-%d", time.Now().UnixNano())
-	client := &uiClient{conn: conn, scanner: scanner, clientID: uid}
+	client := &uiClient{conn: conn, clientID: uid}
 	ui.add(client)
-	defer ui.remove(uid)
+	stopOnShutdown := context.AfterFunc(ctx, client.stop)
+	defer stopOnShutdown()
+	defer ui.remove(client)
 
 	for {
 		select {
@@ -132,6 +166,17 @@ func handleUIClient(ctx context.Context, conn net.Conn, mgr *plugins.Manager, re
 
 		var parsed wire.UIRequest
 		if err := wire.ReadMsg(scanner, &parsed); err != nil {
+			if err == io.EOF {
+				// A client may close its write half after a control request.
+				// Deliver the replies already accepted by its writer first.
+				flushed := make(writeBarrier)
+				if client.send(flushed) == nil {
+					select {
+					case <-flushed:
+					case <-client.done:
+					}
+				}
+			}
 			return
 		}
 
@@ -146,7 +191,7 @@ func handleUIClient(ctx context.Context, conn net.Conn, mgr *plugins.Manager, re
 				targetClient = client.clientID
 			}
 			_ = store.removeByClient(targetClient)
-			_ = wire.WriteMsg(conn, map[string]any{"type": "ok"})
+			_ = client.send(map[string]any{"type": "ok"})
 			continue
 		case "select":
 			selectedID := parsed.ID
@@ -190,7 +235,7 @@ func handleUIClient(ctx context.Context, conn net.Conn, mgr *plugins.Manager, re
 					ui.publish(&resp)
 				}
 			}
-			_ = wire.WriteMsg(conn, map[string]any{"type": "ok"})
+			_ = client.send(map[string]any{"type": "ok"})
 			continue
 		case "status":
 			connected := pluginsReg.Names()
@@ -220,7 +265,7 @@ func handleUIClient(ctx context.Context, conn net.Conn, mgr *plugins.Manager, re
 			sort.Slice(pluginInfos, func(i, j int) bool {
 				return pluginInfos[i].ID < pluginInfos[j].ID
 			})
-			_ = wire.WriteMsg(conn, &wire.StatusResponse{
+			_ = client.send(&wire.StatusResponse{
 				Type:      "status",
 				Connected: connected,
 				Total:     total,
@@ -229,7 +274,7 @@ func handleUIClient(ctx context.Context, conn net.Conn, mgr *plugins.Manager, re
 			continue
 		case "reload":
 			if err := config.ReloadConfig(); err != nil {
-				_ = wire.WriteMsg(conn, &wire.ReloadResponse{Type: "reload_response", Success: false, Message: fmt.Sprintf("failed to read config: %v", err)})
+				_ = client.send(&wire.ReloadResponse{Type: "reload_response", Success: false, Message: fmt.Sprintf("failed to read config: %v", err)})
 				continue
 			}
 
@@ -244,7 +289,7 @@ func handleUIClient(ctx context.Context, conn net.Conn, mgr *plugins.Manager, re
 
 			if err := mgr.DiscoverNew(); err != nil {
 				mgr.Unlock()
-				_ = wire.WriteMsg(conn, &wire.ReloadResponse{
+				_ = client.send(&wire.ReloadResponse{
 					Type:    "reload_response",
 					Success: false,
 					Message: fmt.Sprintf("failed to discover new plugins: %v", err),
@@ -254,7 +299,7 @@ func handleUIClient(ctx context.Context, conn net.Conn, mgr *plugins.Manager, re
 
 			if err := mgr.ApplyOverrides(); err != nil {
 				mgr.Unlock()
-				_ = wire.WriteMsg(conn, &wire.ReloadResponse{
+				_ = client.send(&wire.ReloadResponse{
 					Type:    "reload_response",
 					Success: false,
 					Message: fmt.Sprintf("failed to apply config overrides: %v", err),
@@ -296,12 +341,12 @@ func handleUIClient(ctx context.Context, conn net.Conn, mgr *plugins.Manager, re
 
 			if startPersistent {
 				if err := mgr.StartPersistent(ctx, wire.ResolvePluginsSocketPath()); err != nil {
-					_ = wire.WriteMsg(conn, &wire.ReloadResponse{Type: "reload_response", Success: false, Message: fmt.Sprintf("reload applied, but failed to start daemon plugins: %v", err)})
+					_ = client.send(&wire.ReloadResponse{Type: "reload_response", Success: false, Message: fmt.Sprintf("reload applied, but failed to start daemon plugins: %v", err)})
 					continue
 				}
 			}
 
-			_ = wire.WriteMsg(conn, &wire.ReloadResponse{Type: "reload_response", Success: true, Message: "configuration reloaded"})
+			_ = client.send(&wire.ReloadResponse{Type: "reload_response", Success: true, Message: "configuration reloaded"})
 			continue
 		case "restart":
 			// Re-read manifests and overrides first so a restart also picks up
@@ -317,7 +362,7 @@ func handleUIClient(ctx context.Context, conn net.Conn, mgr *plugins.Manager, re
 				log.Printf("[UI] restart: plugin discovery failed: %v", discoverErr)
 			}
 			if overrideErr != nil {
-				_ = wire.WriteMsg(conn, &wire.RestartResponse{
+				_ = client.send(&wire.RestartResponse{
 					Type:    "restart_response",
 					Success: false,
 					Message: fmt.Sprintf("failed to apply config overrides: %v", overrideErr),
@@ -353,7 +398,7 @@ func handleUIClient(ctx context.Context, conn net.Conn, mgr *plugins.Manager, re
 			if failed > 0 {
 				msg = fmt.Sprintf("%s, %d failed", msg, failed)
 			}
-			_ = wire.WriteMsg(conn, &wire.RestartResponse{
+			_ = client.send(&wire.RestartResponse{
 				Type:    "restart_response",
 				Success: failed == 0,
 				Message: msg,
@@ -363,7 +408,7 @@ func handleUIClient(ctx context.Context, conn net.Conn, mgr *plugins.Manager, re
 		case "query", "":
 			// handled below
 		default:
-			_ = wire.WriteMsg(conn, map[string]any{"type": "error", "error": "unknown request type"})
+			_ = client.send(map[string]any{"type": "error", "error": "unknown request type"})
 			continue
 		}
 
@@ -377,7 +422,7 @@ func handleUIClient(ctx context.Context, conn net.Conn, mgr *plugins.Manager, re
 		}
 
 		qid := fmt.Sprintf("q-%d-%d", time.Now().UnixNano(), atomicAdd(&querySeq, 1))
-		if err := wire.WriteMsg(conn, &wire.AckMessage{Type: "ack", QueryID: qid}); err != nil {
+		if err := client.send(&wire.AckMessage{Type: "ack", QueryID: qid}); err != nil {
 			return
 		}
 

@@ -175,6 +175,9 @@ func TestUIServer_SelectAndDetachAck(t *testing.T) {
 	if err := wire.WriteMsg(conn, &wire.UIRequest{Type: "detach", ClientID: "cli-test"}); err != nil {
 		t.Fatalf("write detach: %v", err)
 	}
+	if err := conn.(*net.UnixConn).CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
 	if err := wire.ReadMsg(scanner, &okMsg); err != nil {
 		t.Fatalf("read detach ack: %v", err)
 	}
