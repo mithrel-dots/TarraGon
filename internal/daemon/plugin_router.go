@@ -101,34 +101,6 @@ func startPluginListener(ctx context.Context, store *aggregateStore, ui *uiRegis
 	log.Printf("[PLUGINS] listening on %s", socketPath)
 	registry := &pluginRegistry{conns: make(map[string]net.Conn), scanners: make(map[string]*bufio.Scanner)}
 
-	type timingStore struct {
-		mu sync.Mutex
-		m  map[string]map[string]time.Time // queryID -> plugin -> start
-	}
-	ts := &timingStore{m: make(map[string]map[string]time.Time)}
-	startTiming := func(qid, plugin string) {
-		ts.mu.Lock()
-		defer ts.mu.Unlock()
-		if ts.m[qid] == nil {
-			ts.m[qid] = make(map[string]time.Time)
-		}
-		ts.m[qid][plugin] = time.Now()
-	}
-	elapsedMs := func(qid, plugin string) float64 {
-		ts.mu.Lock()
-		defer ts.mu.Unlock()
-		if pm, ok := ts.m[qid]; ok {
-			if t0, ok2 := pm[plugin]; ok2 {
-				delete(pm, plugin)
-				if len(pm) == 0 {
-					delete(ts.m, qid)
-				}
-				return float64(time.Since(t0).Microseconds()) / 1000.0
-			}
-		}
-		return 0
-	}
-
 	go func() {
 		for {
 			conn, err := ln.Accept()
@@ -139,7 +111,7 @@ func startPluginListener(ctx context.Context, store *aggregateStore, ui *uiRegis
 				log.Printf("[PLUGINS] accept error: %v", err)
 				continue
 			}
-			go handlePluginConn(ctx, conn, registry, store, ui, elapsedMs)
+			go handlePluginConn(ctx, conn, registry, store, ui)
 		}
 	}()
 
@@ -159,6 +131,18 @@ func startPluginListener(ctx context.Context, store *aggregateStore, ui *uiRegis
 				if msgType == "" {
 					msgType = wire.MsgRequest
 				}
+				if msgType == wire.MsgRequest {
+					q := store.query(req.queryID)
+					if q == nil {
+						continue // evicted while queued
+					}
+					q.mu.Lock()
+					if q.started == nil {
+						q.started = make(map[string]time.Time)
+					}
+					q.started[req.name] = time.Now()
+					q.mu.Unlock()
+				}
 				_ = conn.SetWriteDeadline(time.Now().Add(100 * time.Millisecond))
 				var err error
 				if msgType == wire.MsgSelect {
@@ -177,7 +161,6 @@ func startPluginListener(ctx context.Context, store *aggregateStore, ui *uiRegis
 					registry.remove(req.name)
 					continue
 				}
-				startTiming(req.queryID, req.name)
 			}
 		}
 	}()
@@ -185,7 +168,7 @@ func startPluginListener(ctx context.Context, store *aggregateStore, ui *uiRegis
 	return reqChan, registry
 }
 
-func handlePluginConn(ctx context.Context, conn net.Conn, registry *pluginRegistry, store *aggregateStore, ui *uiRegistry, elapsedMs func(qid, plugin string) float64) {
+func handlePluginConn(ctx context.Context, conn net.Conn, registry *pluginRegistry, store *aggregateStore, ui *uiRegistry) {
 	scanner := wire.NewScanner(conn)
 	var hello wire.PluginHello
 	if err := wire.ReadMsg(scanner, &hello); err != nil {
@@ -214,35 +197,34 @@ func handlePluginConn(ctx context.Context, conn net.Conn, registry *pluginRegist
 		default:
 		}
 
-		var raw map[string]json.RawMessage
-		if err := wire.ReadMsg(scanner, &raw); err != nil {
+		if !scanner.Scan() {
 			return
 		}
-
-		var msgType string
-		if b, ok := raw["type"]; ok {
-			_ = json.Unmarshal(b, &msgType)
+		raw := scanner.Bytes()
+		var resp wire.PluginResponse
+		if err := json.Unmarshal(raw, &resp); err != nil {
+			continue
 		}
 
-		switch msgType {
+		switch resp.Type {
 		case wire.MsgResponse:
-			var resp wire.PluginResponse
-			b, err := json.Marshal(raw)
-			if err != nil || json.Unmarshal(b, &resp) != nil {
+			q := store.query(resp.QueryID)
+			if q == nil {
 				continue
 			}
-			if resp.QueryID == "" {
-				continue
+			q.mu.Lock()
+			start := q.started[hello.Name]
+			delete(q.started, hello.Name)
+			q.mu.Unlock()
+			var elapsed float64
+			if !start.IsZero() {
+				elapsed = float64(time.Since(start).Microseconds()) / 1000
 			}
-			update, ok := store.ApplyPluginResponse(hello.Name, resp, elapsedMs(resp.QueryID, hello.Name))
-			if ok {
-				ui.publish(update)
-			}
+			store.SubmitResponse(hello.Name, resp, elapsed, ui.publishSnapshot)
 
 		case wire.MsgSelectResponse:
 			var resp wire.SelectResponse
-			b, err := json.Marshal(raw)
-			if err != nil || json.Unmarshal(b, &resp) != nil {
+			if json.Unmarshal(raw, &resp) != nil {
 				continue
 			}
 			if resp.Type == "" {

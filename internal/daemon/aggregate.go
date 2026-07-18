@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"log"
+	"maps"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -37,8 +39,21 @@ type aggregate struct {
 	Created         time.Time                 `json:"-"`
 }
 
+// Each live query has a single publisher. Plugin readers only replace their
+// own state; ranking, JSON encoding and delivery happen outside both locks.
+type queryState struct {
+	aggregate
+	mu         sync.Mutex
+	publishing bool
+	changed    []string
+	started    map[string]time.Time
+	encoders   int
+	mapsShared bool
+}
+
 type aggregateStore struct {
-	mu           sync.Mutex
+	mu           sync.RWMutex
+	publishers   sync.WaitGroup
 	limit        int
 	orderingMode string
 	frecencyDB   *db.DB
@@ -48,7 +63,7 @@ type aggregateStore struct {
 	frecencyCache   map[string]float64
 
 	order    []string
-	byID     map[string]*aggregate
+	byID     map[string]*queryState
 	byClient map[string]map[string]struct{}
 }
 
@@ -67,15 +82,6 @@ func (s *aggregateStore) PrepareQuery(qid, client, input string, plugins []strin
 	return &wire.UpdateMessage{Type: "update", QueryID: qid, Payload: snapshot}
 }
 
-// ApplyPluginResponse builds the exact update delivered to a frontend.
-func (s *aggregateStore) ApplyPluginResponse(plugin string, resp wire.PluginResponse, elapsedMs float64) (*wire.UpdateMessage, bool) {
-	snapshot, ok := s.update(resp.QueryID, plugin, elapsedMs, resp.Data)
-	if !ok {
-		return nil, false
-	}
-	return &wire.UpdateMessage{Type: "update", QueryID: resp.QueryID, Payload: snapshot}, true
-}
-
 func newAggregateStore(limit int, orderingMode string, frecencyDB *db.DB, frecencyWeight float64) *aggregateStore {
 	if orderingMode == "" {
 		orderingMode = "global"
@@ -92,7 +98,7 @@ func newAggregateStore(limit int, orderingMode string, frecencyDB *db.DB, frecen
 		frecencyDB:    frecencyDB,
 		frecencyW:     frecencyWeight,
 		frecencyCache: make(map[string]float64),
-		byID:          make(map[string]*aggregate),
+		byID:          make(map[string]*queryState),
 		byClient:      make(map[string]map[string]struct{}),
 	}
 	if err := s.RefreshFrecencyCache(context.Background()); err != nil {
@@ -132,20 +138,9 @@ func (s *aggregateStore) create(qid, client, input string) {
 		return
 	}
 	if s.limit > 0 && len(s.byID) >= s.limit {
-		// evict oldest
-		oldest := s.order[0]
-		s.order = s.order[1:]
-		if ag, ok := s.byID[oldest]; ok {
-			delete(s.byID, oldest)
-			if set, ok := s.byClient[ag.Client]; ok {
-				delete(set, oldest)
-				if len(set) == 0 {
-					delete(s.byClient, ag.Client)
-				}
-			}
-		}
+		s.removeLocked(s.order[0])
 	}
-	s.byID[qid] = &aggregate{
+	s.byID[qid] = &queryState{aggregate: aggregate{
 		QueryID:         qid,
 		Input:           input,
 		StartedAtUnixMs: time.Now().UnixMilli(),
@@ -153,7 +148,7 @@ func (s *aggregateStore) create(qid, client, input string) {
 		Plugins:         make(map[string]aggPluginState),
 		Client:          client,
 		Created:         time.Now(),
-	}
+	}}
 	s.order = append(s.order, qid)
 	if s.byClient[client] == nil {
 		s.byClient[client] = make(map[string]struct{})
@@ -161,24 +156,50 @@ func (s *aggregateStore) create(qid, client, input string) {
 	s.byClient[client][qid] = struct{}{}
 }
 
+func (s *aggregateStore) removeLocked(id string) {
+	q := s.byID[id]
+	delete(s.byID, id)
+	delete(s.byClient[q.Client], id)
+	if len(s.byClient[q.Client]) == 0 {
+		delete(s.byClient, q.Client)
+	}
+	i := slices.Index(s.order, id)
+	s.order = slices.Delete(s.order, i, i+1)
+}
+
+func (s *aggregateStore) query(qid string) *queryState {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.byID[qid]
+}
+
 func (s *aggregateStore) setExpectedPlugins(qid string, plugins []string) ([]byte, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	ag, ok := s.byID[qid]
-	if !ok {
+	ag := s.query(qid)
+	if ag == nil {
 		return nil, false
 	}
+	ag.mu.Lock()
+	ag.detachSnapshot()
 	ag.Plugins = make(map[string]aggPluginState, len(plugins))
 	for _, name := range plugins {
 		ag.Plugins[name] = aggPluginState{State: "pending"}
 	}
-	return s.marshalSnapshotLocked(ag)
+	return s.encodeUnlocked(ag)
 }
 
-// update returns a snapshot JSON after applying the update.
-func (s *aggregateStore) update(qid, plugin string, elapsed float64, data json.RawMessage) ([]byte, bool) {
-	frecencyScores := s.frecencyScoresSnapshot()
-	items, errMsg := normalizeResults(plugin, data)
+// SnapshotPublisher receives a cumulative snapshot and the names of the
+// plugins whose updates it incorporates since the previous publication.
+type SnapshotPublisher func(*wire.UpdateMessage, []string)
+
+// SubmitResponse accepts a plugin's replacement result for a live query.
+// Pass the same publisher for every response to that query; callbacks are
+// serialized per query and may run asynchronously.
+func (s *aggregateStore) SubmitResponse(plugin string, resp wire.PluginResponse, elapsed float64, publish SnapshotPublisher) bool {
+	q := s.query(resp.QueryID)
+	if q == nil {
+		return false
+	}
+	items, errMsg := normalizeResults(plugin, resp.Data)
 	count := len(items)
 	state := "done"
 	if errMsg != "" {
@@ -187,37 +208,105 @@ func (s *aggregateStore) update(qid, plugin string, elapsed float64, data json.R
 		state = "empty"
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	ag, ok := s.byID[qid]
-	if !ok {
-		return nil, false
-	}
-	total := len(ag.List) - len(ag.Results[plugin].items) + count
-	ag.Results[plugin] = aggResult{ElapsedMs: elapsed, Data: data, items: items}
-	ag.Plugins[plugin] = aggPluginState{State: state, Count: count, ElapsedMs: elapsed, Error: errMsg}
-	// Ranking mutates its input. Copy the cached items so later updates
-	// always apply the current frecency weights to the original scores.
-	list := make([]wire.ResultItem, 0, total)
-	for _, res := range ag.Results {
-		list = append(list, res.items...)
-	}
-	ag.List = orderResults(list, s.orderingMode, frecencyScores, s.frecencyW)
-	return s.marshalSnapshotLocked(ag)
+	q.mu.Lock()
+	q.detachSnapshot()
+	q.Results[plugin] = aggResult{ElapsedMs: elapsed, Data: resp.Data, items: items}
+	q.Plugins[plugin] = aggPluginState{State: state, Count: count, ElapsedMs: elapsed, Error: errMsg}
+	s.scheduleLocked(q, plugin, publish)
+	return true
 }
 
-func (s *aggregateStore) markPluginError(qid, plugin string, elapsed float64, errMsg string) ([]byte, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	ag, ok := s.byID[qid]
-	if !ok {
-		return nil, false
+func (s *aggregateStore) submitError(qid, plugin string, elapsed float64, errMsg string, publish SnapshotPublisher) bool {
+	q := s.query(qid)
+	if q == nil {
+		return false
 	}
-	ag.Plugins[plugin] = aggPluginState{State: "error", ElapsedMs: elapsed, Error: errMsg}
-	return s.marshalSnapshotLocked(ag)
+	q.mu.Lock()
+	q.detachSnapshot()
+	q.Plugins[plugin] = aggPluginState{State: "error", ElapsedMs: elapsed, Error: errMsg}
+	s.scheduleLocked(q, plugin, publish)
+	return true
 }
 
-func (s *aggregateStore) marshalSnapshotLocked(ag *aggregate) ([]byte, bool) {
+// scheduleLocked releases q.mu. No timer delays the first or final update.
+func (s *aggregateStore) scheduleLocked(q *queryState, plugin string, publish SnapshotPublisher) {
+	if !slices.Contains(q.changed, plugin) {
+		q.changed = append(q.changed, plugin)
+	}
+	if q.publishing {
+		q.mu.Unlock()
+		return
+	}
+	q.publishing = true
+	single := len(q.Plugins) == 1
+	s.publishers.Add(1)
+	q.mu.Unlock()
+	if single {
+		s.drain(q, publish)
+	} else {
+		go s.drain(q, publish)
+	}
+}
+
+func (s *aggregateStore) drain(q *queryState, publish SnapshotPublisher) {
+	defer s.publishers.Done()
+	for {
+		q.mu.Lock()
+		changed := q.changed
+		if len(changed) == 0 {
+			q.publishing = false
+			q.mu.Unlock()
+			return
+		}
+		q.changed = nil
+		if data, ok := s.encodeUnlocked(q); ok && s.query(q.QueryID) == q {
+			publish(&wire.UpdateMessage{Type: "update", QueryID: q.QueryID, Payload: data}, changed)
+		}
+	}
+}
+
+// WaitForPublications drains accepted updates once all submitters have stopped.
+func (s *aggregateStore) WaitForPublications() { s.publishers.Wait() }
+
+// Called before mutating either map under q.mu. When encoding and ingestion
+// overlap, copy the maps once for the entire next batch. Payloads and items
+// are immutable. Uncontended queries need no copies.
+func (q *queryState) detachSnapshot() {
+	if q.mapsShared {
+		q.Results = maps.Clone(q.Results)
+		q.Plugins = maps.Clone(q.Plugins)
+		q.mapsShared = false
+	}
+}
+
+// Called with q.mu held; returns with it unlocked.
+func (s *aggregateStore) encodeUnlocked(q *queryState) ([]byte, bool) {
+	snapshot := q.aggregate
+	q.encoders++
+	q.mapsShared = true
+	q.mu.Unlock()
+	data, ok := s.encodeSnapshot(&snapshot)
+	q.mu.Lock()
+	q.encoders--
+	if q.encoders == 0 {
+		q.mapsShared = false
+	}
+	q.mu.Unlock()
+	return data, ok
+}
+
+func (s *aggregateStore) encodeSnapshot(ag *aggregate) ([]byte, bool) {
+	if len(ag.Results) != 0 {
+		total := 0
+		for _, res := range ag.Results {
+			total += len(res.items)
+		}
+		list := make([]wire.ResultItem, 0, total)
+		for _, res := range ag.Results {
+			list = append(list, res.items...)
+		}
+		ag.List = orderResults(list, s.orderingMode, s.frecencyScoresSnapshot(), s.frecencyW)
+	}
 	snap, err := json.Marshal(ag)
 	if err != nil {
 		return nil, false
@@ -422,18 +511,9 @@ func (s *aggregateStore) removeByClient(client string) int {
 	if set == nil {
 		return 0
 	}
-	removed := 0
+	removed := len(set)
 	for qid := range set {
-		delete(s.byID, qid)
-		removed++
-		// remove from order
-		for i, id := range s.order {
-			if id == qid {
-				s.order = append(s.order[:i], s.order[i+1:]...)
-				break
-			}
-		}
+		s.removeLocked(qid)
 	}
-	delete(s.byClient, client)
 	return removed
 }

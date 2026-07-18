@@ -59,7 +59,7 @@ func TestHandlePluginConn_SelectResponseBroadcastsToUI(t *testing.T) {
 		done <- &resp
 	}()
 
-	go handlePluginConn(ctx, pluginSrv, registry, store, uiReg, func(string, string) float64 { return 0 })
+	go handlePluginConn(ctx, pluginSrv, registry, store, uiReg)
 
 	if err := wire.WriteMsg(pluginCli, &wire.PluginHello{Type: wire.MsgHello, Name: "plug1"}); err != nil {
 		t.Fatalf("write hello: %v", err)

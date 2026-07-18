@@ -178,17 +178,39 @@ func measure(ctx context.Context, r route, opts Options) (*roundResult, error) {
 	return result, nil
 }
 
-// Read each plugin concurrently, like the daemon's per-connection handlers.
-// Cumulative snapshots must reach the UI in aggregation order: take the output
-// lock before releasing the aggregation lock, so the next snapshot can be built
-// while this one is written. Time waiting to publish is part of core->UI.
+// Use the daemon's publisher, including its coalescing policy. Attribute t2
+// to the first emitted snapshot containing each individual fixture result.
 func serveQueries(plugins []*peer, names []string, ui *peer, count int) ([][]coreStamp, error) {
 	store := daemon.NewTransientQueryStore()
-	var aggregate, output sync.Mutex
+	var output sync.Mutex
+	var publishErr error
 	core := make([][]coreStamp, len(plugins))
+	pluginIndex := make(map[string]int, len(names))
+	queryIndex := make(map[string]int, count)
+	for i, name := range names {
+		pluginIndex[name] = i
+		core[i] = make([]coreStamp, count)
+	}
+	for i := range count {
+		queryIndex[sampleID(i)] = i
+	}
+	publish := func(update *wire.UpdateMessage, changed []string) {
+		t2 := now()
+		q := queryIndex[update.QueryID]
+		for _, plugin := range changed {
+			core[pluginIndex[plugin]][q].t2 = t2
+		}
+		output.Lock()
+		defer output.Unlock()
+		if publishErr == nil {
+			publishErr = send(ui, update)
+			if publishErr != nil {
+				ui.close()
+			}
+		}
+	}
 	finished := make(chan error, len(plugins)+1)
 	handlePlugin := func(i int) error {
-		core[i] = make([]coreStamp, 0, count)
 		for q := range count {
 			var response wire.PluginResponse
 			if err := receive(plugins[i], &response); err != nil {
@@ -199,21 +221,10 @@ func serveQueries(plugins []*peer, names []string, ui *peer, count int) ([][]cor
 			if id != sampleID(q) || response.Type != wire.MsgResponse {
 				return fmt.Errorf("unexpected response from %s for %s", names[i], id)
 			}
-			aggregate.Lock()
-			update, ok := store.ApplyPluginResponse(names[i], response, 0)
-			t2 := now()
-			output.Lock()
-			aggregate.Unlock()
-			if !ok {
-				output.Unlock()
+			core[i][q] = coreStamp{id: id, t1: t1}
+			if !store.SubmitResponse(names[i], response, 0, publish) {
 				return fmt.Errorf("missing aggregate for %s", id)
 			}
-			err := send(ui, update)
-			output.Unlock()
-			if err != nil {
-				return fmt.Errorf("publish %s/%s: %w", names[i], id, err)
-			}
-			core[i] = append(core[i], coreStamp{id, t1, t2})
 		}
 		return nil
 	}
@@ -261,6 +272,10 @@ func serveQueries(plugins []*peer, names []string, ui *peer, count int) ([][]cor
 				p.close()
 			}
 		}
+	}
+	store.WaitForPublications()
+	if publishErr != nil {
+		return nil, publishErr
 	}
 	return core, firstErr
 }

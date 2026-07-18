@@ -13,7 +13,22 @@ import (
 	"github.com/mithrel-dots/tarragon/internal/wire"
 )
 
-// Time a complete query, including every cumulative snapshot sent to the UI.
+// Inspect each update synchronously in the store's snapshot contract tests.
+func (s *aggregateStore) update(id, plugin string, elapsed float64, data json.RawMessage) ([]byte, bool) {
+	var result []byte
+	ok := s.SubmitResponse(plugin, wire.PluginResponse{QueryID: id, Data: data}, elapsed, func(msg *wire.UpdateMessage, _ []string) { result = msg.Payload })
+	s.WaitForPublications()
+	return result, ok
+}
+
+func (s *aggregateStore) markPluginError(id, plugin string, elapsed float64, reason string) ([]byte, bool) {
+	var result []byte
+	ok := s.submitError(id, plugin, elapsed, reason, func(msg *wire.UpdateMessage, _ []string) { result = msg.Payload })
+	s.WaitForPublications()
+	return result, ok
+}
+
+// Time a complete query with the same coalescing policy as the daemon.
 func BenchmarkAggregateFanout(b *testing.B) {
 	for _, count := range []int{1, 10, 50} {
 		b.Run(fmt.Sprintf("%d-plugins", count), func(b *testing.B) {
@@ -27,10 +42,11 @@ func BenchmarkAggregateFanout(b *testing.B) {
 			for b.Loop() {
 				s.PrepareQuery("q", "ui", "bench", plugins)
 				for _, plugin := range plugins {
-					if _, ok := s.update("q", plugin, 1, data); !ok {
+					if !s.SubmitResponse(plugin, wire.PluginResponse{QueryID: "q", Data: data}, 1, func(*wire.UpdateMessage, []string) {}) {
 						b.Fatal("missing update")
 					}
 				}
+				s.WaitForPublications()
 				s.removeByClient("ui")
 			}
 		})

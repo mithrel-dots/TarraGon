@@ -1,12 +1,51 @@
 package daemon
 
 import (
+	"encoding/json"
 	"net"
 	"testing"
 	"time"
 
 	"github.com/mithrel-dots/tarragon/internal/wire"
 )
+
+func TestPublishWhileEarlierSnapshotIsInFlight(t *testing.T) {
+	s := NewTransientQueryStore()
+	s.PrepareQuery("q", "ui", "search", []string{"a", "b", "c"})
+	snapshots := make(chan aggregate, 4)
+	unblock := make(chan struct{})
+	first := true
+	publish := func(update *wire.UpdateMessage, _ []string) {
+		var ag aggregate
+		if err := json.Unmarshal(update.Payload, &ag); err != nil {
+			t.Error(err)
+		}
+		snapshots <- ag
+		if first {
+			first = false
+			<-unblock
+		}
+	}
+	submit := func(plugin, data string) {
+		s.SubmitResponse(plugin, wire.PluginResponse{QueryID: "q", Data: json.RawMessage(data)}, 1, publish)
+	}
+	submit("a", `["old"]`)
+	if ag := <-snapshots; len(ag.List) != 1 || ag.List[0].ID != "old" {
+		t.Fatal("first result did not stream immediately")
+	}
+	submit("a", `["new"]`)
+	submit("b", `[]`)
+	s.submitError("q", "c", 3, "offline", publish)
+	close(unblock)
+	s.WaitForPublications()
+	if len(snapshots) != 1 {
+		t.Fatalf("expected one coalesced snapshot, got %d", len(snapshots))
+	}
+	ag := <-snapshots
+	if len(ag.List) != 1 || ag.List[0].ID != "new" || ag.Plugins["b"].State != "empty" || ag.Plugins["c"].State != "error" {
+		t.Fatalf("incomplete final snapshot: %+v", ag)
+	}
+}
 
 // Keep the slow writer blocked until the queue limit is reached, independent
 // of wall-clock timing on a loaded test runner.

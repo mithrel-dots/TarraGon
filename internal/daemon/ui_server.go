@@ -122,6 +122,8 @@ func (r *uiRegistry) publish(msg any) {
 	}
 }
 
+func (r *uiRegistry) publishSnapshot(msg *wire.UpdateMessage, _ []string) { r.publish(msg) }
+
 func startUIServer(ctx context.Context, mgr *plugins.Manager, reqOut chan<- pluginRequest, pluginsReg *pluginRegistry, store *aggregateStore, ui *uiRegistry, frecencyDB *db.DB) {
 	socketPath := wire.ResolveUISocketPath()
 	ln, err := wire.ListenUnix(socketPath)
@@ -482,9 +484,7 @@ func dispatchQuery(ctx context.Context, queryText, qid string, mgr *plugins.Mana
 		if snap.cfg.Lifecycle == plugins.LifecycleOnDemandPersistent && !pluginsReg.isConnected(snap.name) {
 			if err := mgr.StartOnDemand(ctx, snap.name, wire.ResolvePluginsSocketPath()); err != nil {
 				log.Printf("[UI] failed to start on-demand plugin %s: %v", snap.name, err)
-				if updateSnap, ok := store.markPluginError(qid, snap.name, 0, err.Error()); ok {
-					ui.publish(&wire.UpdateMessage{Type: "update", QueryID: qid, Payload: updateSnap})
-				}
+				store.submitError(qid, snap.name, 0, err.Error(), ui.publishSnapshot)
 				continue
 			}
 
@@ -499,17 +499,15 @@ func dispatchQuery(ctx context.Context, queryText, qid string, mgr *plugins.Mana
 
 			if !connected {
 				log.Printf("[UI] on-demand plugin %s did not connect within 2s; skipping query %s", snap.name, qid)
-				if updateSnap, ok := store.markPluginError(qid, snap.name, 2000, "plugin did not connect"); ok {
-					ui.publish(&wire.UpdateMessage{Type: "update", QueryID: qid, Payload: updateSnap})
-				}
+				store.submitError(qid, snap.name, 2000, "plugin did not connect", ui.publishSnapshot)
 				continue
 			}
 		}
 
 		if pluginsReg.isConnected(snap.name) {
 			reqOut <- pluginRequest{name: snap.name, queryID: qid, text: queryText}
-		} else if updateSnap, ok := store.markPluginError(qid, snap.name, 0, "plugin not connected"); ok {
-			ui.publish(&wire.UpdateMessage{Type: "update", QueryID: qid, Payload: updateSnap})
+		} else {
+			store.submitError(qid, snap.name, 0, "plugin not connected", ui.publishSnapshot)
 		}
 	}
 
@@ -527,9 +525,7 @@ func dispatchQuery(ctx context.Context, queryText, qid string, mgr *plugins.Mana
 		if err != nil {
 			raw = json.RawMessage([]byte(fmt.Sprintf(`{"error":"%s"}`, escapeJSONString(err.Error()))))
 		}
-		if updateSnap, ok := store.update(qid, snap.name, float64(time.Since(t0).Microseconds())/1000.0, raw); ok {
-			ui.publish(&wire.UpdateMessage{Type: "update", QueryID: qid, Payload: updateSnap})
-		}
+		store.SubmitResponse(snap.name, wire.PluginResponse{QueryID: qid, Data: raw}, float64(time.Since(t0).Microseconds())/1000.0, ui.publishSnapshot)
 	}
 }
 
