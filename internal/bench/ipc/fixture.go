@@ -19,8 +19,9 @@ type fixtureConfig struct {
 }
 
 type fixtureTrace struct {
-	Marks       []stamp
-	QueryStarts []int64 `json:",omitempty"` // UI only, before sending each query
+	Marks                   []stamp
+	QueryStarts             []int64 `json:",omitempty"` // UI only, before sending each query
+	Snapshots, PayloadBytes int     `json:",omitempty"`
 }
 
 type stamp struct {
@@ -151,6 +152,10 @@ func runUI(l link, cfg fixtureConfig) (fixtureTrace, error) {
 			}
 			if update.Type != "update" || !acked[update.QueryID] {
 				return trace, fmt.Errorf("unexpected %s for %s", update.Type, update.QueryID)
+			}
+			if idx >= cfg.Warmup {
+				trace.Snapshots++
+				trace.PayloadBytes += len(update.Payload)
 			}
 			var snapshot struct {
 				QueryID string            `json:"query_id"`

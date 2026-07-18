@@ -53,10 +53,11 @@ type coreStamp struct {
 type durations [4]int64 // ingress, aggregation, egress, end-to-end, in ns
 
 type roundResult struct {
-	suggestions []durations
-	first       []int64 // query send to first visible suggestion
-	complete    []int64 // query send to last distinct suggestion at the UI
-	elapsedNS   int64   // first measured send to last measured delivery
+	suggestions             []durations
+	first                   []int64 // query send to first visible suggestion
+	complete                []int64 // query send to last distinct suggestion at the UI
+	elapsedNS               int64   // first measured send to last measured delivery
+	snapshots, payloadBytes int
 }
 
 func join(plugin, ui []stamp, core []coreStamp, warmup int) ([]durations, error) {
@@ -173,6 +174,7 @@ func measure(ctx context.Context, r route, opts Options) (*roundResult, error) {
 		result.suggestions = append(result.suggestions, joined...)
 	}
 	result.elapsedNS = lastDelivery - uiTrace.QueryStarts[opts.Warmup]
+	result.snapshots, result.payloadBytes = uiTrace.Snapshots, uiTrace.PayloadBytes
 	return result, nil
 }
 
@@ -296,12 +298,15 @@ func Run(ctx context.Context, opts Options, out io.Writer) error {
 			result.first = append(result.first, values.first...)
 			result.complete = append(result.complete, values.complete...)
 			result.elapsedNS += values.elapsedNS
+			result.snapshots += values.snapshots
+			result.payloadBytes += values.payloadBytes
 		}
 	}
 	columns := []texttable.Column{
 		{Header: "Plugin path"}, {Header: "UI path"}, {Header: "Sent/received"}, {Header: "Timeouts"},
 		{Header: "Plugin->core"}, {Header: "Core"}, {Header: "Core->UI"}, {Header: "Plugin->UI"},
 		{Header: "Query->first"}, {Header: "Query->all"}, {Header: "Queries/s"},
+		{Header: "Snapshots/query"}, {Header: "Payload B/query"},
 	}
 	var rows [][]string
 	for _, r := range paths {
@@ -317,6 +322,7 @@ func Run(ctx context.Context, opts Options, out io.Writer) error {
 		}
 		qps := float64(len(result.complete)) * 1e9 / float64(result.elapsedNS)
 		row = append(row, latencySummary(result.first), latencySummary(result.complete), fmt.Sprintf("%.1f", qps))
+		row = append(row, fmt.Sprintf("%.1f", float64(result.snapshots)/float64(len(result.complete))), fmt.Sprintf("%.0f", float64(result.payloadBytes)/float64(len(result.complete))))
 		rows = append(rows, row)
 	}
 	fmt.Fprintln(out, "Latency in microseconds (mean/p50/p95/p99), pooled across rounds:")
