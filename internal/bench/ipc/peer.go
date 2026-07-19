@@ -43,8 +43,8 @@ func (p *peer) trace() (fixtureTrace, error) {
 	return marks, err
 }
 
-// The parent is the TarraGon core. Each peer is a separate invocation of
-// tarragon so that both measured legs cross real process boundaries.
+// The parent runs the core. Each peer re-execs the benchmark runner so that
+// both measured legs cross real process boundaries.
 func startPeer(ctx context.Context, dir string, broker *server.Server, cfg fixtureConfig) (_ *peer, err error) {
 	ctx, cancel := context.WithCancel(ctx)
 	p := &peer{cancel: cancel}
@@ -81,7 +81,7 @@ func startPeer(ctx context.Context, dir string, broker *server.Server, cfg fixtu
 	if err != nil {
 		return nil, err
 	}
-	p.cmd = exec.CommandContext(ctx, exe, "bench", "ipc", "fixture")
+	p.cmd = exec.CommandContext(ctx, exe, "ipc", "fixture")
 	p.cmd.Stdin = bytes.NewReader(config)
 	p.cmd.Stdout, p.cmd.Stderr = &p.stdout, &p.stderr
 	if err := p.cmd.Start(); err != nil {

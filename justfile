@@ -106,10 +106,11 @@ test-cover:
 
 # ─── Benchmarks ───────────────────────────────────────────────────
 
-# Run plugin benchmark through the daemon UI socket
-[doc("Run plugin benchmark against running daemon")]
-bench *FLAGS: build
-    {{ build_output }} bench {{ FLAGS }}
+# Run benchmarks from the checkout
+[doc("Benchmark a running daemon, or use `ipc` for isolated transport benchmarks")]
+[positional-arguments]
+bench *FLAGS:
+    go run ./tools/bench "$@"
 
 # Run Go benchmarks (unit-level)
 [doc("Run Go benchmark functions in all packages")]

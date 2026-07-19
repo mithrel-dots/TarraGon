@@ -1,6 +1,8 @@
-package cli
+// Command bench runs TarraGon's development benchmarks from a checkout.
+package main
 
 import (
+	"os"
 	"time"
 
 	"github.com/mithrel-dots/tarragon/internal/bench"
@@ -9,45 +11,29 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var benchCmd = &cobra.Command{
-	Use:          "bench",
-	Short:        "Benchmark installed plugins through the daemon UI socket",
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		return bench.Run(bench.Options{
-			RandomInputs: benchRandom,
-			Iterations:   benchIterations,
-			Timeout:      benchTimeout,
-			Seed:         benchSeed,
-			WorstPct:     benchWorstPct,
-			Socket:       benchSocket,
-		}, cmd.OutOrStdout())
-	},
-}
-
-var (
-	benchRandom     int
-	benchIterations int
-	benchTimeout    time.Duration
-	benchSeed       int64
-	benchWorstPct   float64
-	benchSocket     string
-)
-
-func init() {
-	benchCmd.Flags().IntVar(&benchRandom, "random", 100, "Number of random inputs")
-	benchCmd.Flags().IntVar(&benchIterations, "iterations", 1, "Runs per input")
-	benchCmd.Flags().DurationVar(&benchTimeout, "timeout", 2*time.Second, "Timeout per query")
-	benchCmd.Flags().Int64Var(&benchSeed, "seed", 0, "Random seed (default: time-based)")
-	benchCmd.Flags().Float64Var(&benchWorstPct, "worst-pct", 99, "Percentile for latency reporting")
-	benchCmd.Flags().StringVar(&benchSocket, "socket", wire.ResolveUISocketPath(), "Daemon UI Unix socket path")
+func main() {
+	var plugins bench.Options
+	benchCmd := &cobra.Command{
+		Use:          "bench",
+		Short:        "Benchmark installed plugins through the daemon UI socket",
+		Args:         cobra.NoArgs,
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return bench.Run(plugins, cmd.OutOrStdout())
+		},
+	}
+	benchCmd.CompletionOptions.DisableDefaultCmd = true
+	benchCmd.Flags().IntVar(&plugins.RandomInputs, "random", 100, "Number of random inputs")
+	benchCmd.Flags().IntVar(&plugins.Iterations, "iterations", 1, "Runs per input")
+	benchCmd.Flags().DurationVar(&plugins.Timeout, "timeout", 2*time.Second, "Timeout per query")
+	benchCmd.Flags().Int64Var(&plugins.Seed, "seed", 0, "Random seed (default: time-based)")
+	benchCmd.Flags().Float64Var(&plugins.WorstPct, "worst-pct", 99, "Percentile for latency reporting")
+	benchCmd.Flags().StringVar(&plugins.Socket, "socket", wire.ResolveUISocketPath(), "Daemon UI Unix socket path")
 	var opts ipc.Options
 	ipcCmd := &cobra.Command{
 		Use:   "ipc",
 		Short: "Measure plugin-to-core and core-to-UI suggestion delivery on isolated local transports",
 		Args:  cobra.NoArgs,
-		// The experiment and its subprocesses don't load or generate daemon configuration.
-		PersistentPreRunE: func(*cobra.Command, []string) error { return nil },
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return ipc.Run(cmd.Context(), opts, cmd.OutOrStdout())
 		},
@@ -68,5 +54,7 @@ func init() {
 		},
 	})
 	benchCmd.AddCommand(ipcCmd)
-	rootCmd.AddCommand(benchCmd)
+	if err := benchCmd.Execute(); err != nil {
+		os.Exit(1)
+	}
 }

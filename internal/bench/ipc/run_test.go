@@ -14,7 +14,7 @@ import (
 // startPeer re-execs the running binary. Route its private fixture invocation
 // the same way as Cobra while exercising the actual three-process topology.
 func TestMain(m *testing.M) {
-	if slices.Equal(os.Args[1:], []string{"bench", "ipc", "fixture"}) {
+	if slices.Equal(os.Args[1:], []string{"ipc", "fixture"}) {
 		if err := RunFixture(os.Stdin, os.Stdout); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)

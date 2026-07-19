@@ -54,8 +54,9 @@ Plugins can be invoked directly or contextually, and can expose commands, values
 - **Live Restart**: `tarragon plugin restart [plugin-id]` re-reads manifests and bounces plugin processes without restarting the daemon.
 
 ### Plugin Benchmarking
-- `tarragon bench` connects to the daemon like an external frontend, sends benchmark queries through the UI socket, and prints plugin latency results as a table.
-- Run it with `just bench` while the daemon is running.
+Benchmarks run from a source checkout; they are not included in the installed `tarragon` binary.
+
+- `just bench` connects to a running daemon like an external frontend, sends queries through the UI socket, and prints plugin latency results as a table.
 - `just bench ipc` runs a separate suggestion-delivery experiment. It starts its own core, persistent fixture plugin processes, and headless UI. No running daemon or installed plugins are needed.
 - `just bench ipc --matrix --samples 2000 --warmup 200 --rounds 3` also measures mixed plugin/UI paths through embedded Core NATS. `uds` is direct NDJSON. `nats-tcp` is loopback TCP. `nats-uds-bridge` carries NATS protocol bytes over a Unix socket forwarded to the embedded server's in-process connection (no TCP on that leg). `uds-adapter` translates between NDJSON frames and NATS subjects.
 - For congestion, try `just bench ipc --plugins 50 --burst 8 --samples 80 --warmup 16 --rounds 3`. Each plugin returns one small suggestion per query. The UI sends each burst back-to-back, then waits for every plugin's suggestion for every query before starting the next burst. Use `--burst 1` at the same plugin count as a control. Both flags default to 1.
