@@ -43,6 +43,13 @@ rather than hardcoding a path.
    - Replace your displayed snapshot with the latest one for that `query_id`.
 3) On exit, write NDJSON line `{ "type": "detach", "client_id": "<id>" }\n` (best-effort) to let the daemon purge memory.
 
+For a search box that only displays the newest input, send a stable, nonempty
+`query_stream` with each query, e.g. `{"type":"query","query_stream":"search","text":"tar"}`.
+Each query still gets an ack. The new query supersedes the previous query in
+that stream on the same connection. Ignore already queued updates for old query
+IDs; superseded queries may never receive a final snapshot. Omit `query_stream`
+for searches that must all complete, or use distinct streams for distinct inputs.
+
 ### Query Replacement Actions
 
 An action may use `type: "query_replace"` and provide a `query`:

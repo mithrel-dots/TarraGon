@@ -43,12 +43,15 @@ type aggregate struct {
 // own state; ranking, JSON encoding and delivery happen outside both locks.
 type queryState struct {
 	aggregate
-	mu         sync.Mutex
-	publishing bool
-	changed    []string
-	started    map[string]time.Time
-	encoders   int
-	mapsShared bool
+	mu              sync.Mutex
+	publishing      bool
+	changed         []string
+	session, stream string
+	ctx             context.Context
+	cancel          context.CancelFunc
+	started         map[string]time.Time
+	encoders        int
+	mapsShared      bool
 }
 
 type aggregateStore struct {
@@ -132,15 +135,29 @@ func (s *aggregateStore) frecencyScoresSnapshot() map[string]float64 {
 }
 
 func (s *aggregateStore) create(qid, client, input string) {
+	s.startQuery(context.Background(), qid, client, input, "", "")
+}
+
+func (s *aggregateStore) startQuery(ctx context.Context, qid, client, input, session, stream string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, ok := s.byID[qid]; ok {
 		return
 	}
+	var cancel context.CancelFunc
+	if stream != "" {
+		for id, q := range s.byID {
+			if q.stream == stream && q.session == session {
+				s.removeLocked(id)
+				break
+			}
+		}
+		ctx, cancel = context.WithCancel(ctx)
+	}
 	if s.limit > 0 && len(s.byID) >= s.limit {
 		s.removeLocked(s.order[0])
 	}
-	s.byID[qid] = &queryState{aggregate: aggregate{
+	s.byID[qid] = &queryState{ctx: ctx, cancel: cancel, session: session, stream: stream, aggregate: aggregate{
 		QueryID:         qid,
 		Input:           input,
 		StartedAtUnixMs: time.Now().UnixMilli(),
@@ -158,6 +175,9 @@ func (s *aggregateStore) create(qid, client, input string) {
 
 func (s *aggregateStore) removeLocked(id string) {
 	q := s.byID[id]
+	if q.cancel != nil {
+		q.cancel()
+	}
 	delete(s.byID, id)
 	delete(s.byClient[q.Client], id)
 	if len(s.byClient[q.Client]) == 0 {
@@ -165,6 +185,16 @@ func (s *aggregateStore) removeLocked(id string) {
 	}
 	i := slices.Index(s.order, id)
 	s.order = slices.Delete(s.order, i, i+1)
+}
+
+func (s *aggregateStore) removeStreams(session string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for id, q := range s.byID {
+		if q.stream != "" && q.session == session {
+			s.removeLocked(id)
+		}
+	}
 }
 
 func (s *aggregateStore) query(qid string) *queryState {

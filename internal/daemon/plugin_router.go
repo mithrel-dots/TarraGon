@@ -133,8 +133,8 @@ func startPluginListener(ctx context.Context, store *aggregateStore, ui *uiRegis
 				}
 				if msgType == wire.MsgRequest {
 					q := store.query(req.queryID)
-					if q == nil {
-						continue // evicted while queued
+					if q == nil || q.ctx.Err() != nil {
+						continue // evicted or superseded while queued
 					}
 					q.mu.Lock()
 					if q.started == nil {

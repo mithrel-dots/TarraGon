@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"context"
 	"encoding/json"
 	"net"
 	"testing"
@@ -44,6 +45,31 @@ func TestPublishWhileEarlierSnapshotIsInFlight(t *testing.T) {
 	ag := <-snapshots
 	if len(ag.List) != 1 || ag.List[0].ID != "new" || ag.Plugins["b"].State != "empty" || ag.Plugins["c"].State != "error" {
 		t.Fatalf("incomplete final snapshot: %+v", ag)
+	}
+}
+
+func TestSupersedeOnlyMatchingQueryStream(t *testing.T) {
+	s := NewTransientQueryStore()
+	start := func(id, conn, stream string) {
+		s.startQuery(context.Background(), id, "ui", "bench", conn, stream)
+	}
+	start("old", "one", "search")
+	old := s.query("old").ctx
+	start("independent", "one", "")
+	start("other-box", "one", "filter")
+	start("other-ui", "two", "search")
+	start("new", "one", "search")
+	if old.Err() == nil || s.SubmitResponse("p", wire.PluginResponse{QueryID: "old"}, 0, nil) {
+		t.Fatal("superseded query accepted a late reply")
+	}
+	for _, id := range []string{"independent", "other-box", "other-ui", "new"} {
+		if q := s.query(id); q == nil || q.ctx.Err() != nil {
+			t.Fatalf("cancelled unrelated query %s", id)
+		}
+	}
+	s.removeStreams("one")
+	if s.query("other-ui") == nil || s.query("independent") == nil || s.query("new") != nil {
+		t.Fatal("stream disconnect affected the wrong queries")
 	}
 }
 

@@ -152,12 +152,13 @@ func startUIServer(ctx context.Context, mgr *plugins.Manager, reqOut chan<- plug
 
 func handleUIClient(ctx context.Context, conn net.Conn, mgr *plugins.Manager, reqOut chan<- pluginRequest, pluginsReg *pluginRegistry, store *aggregateStore, ui *uiRegistry, frecencyDB *db.DB) {
 	scanner := wire.NewScanner(conn)
-	uid := fmt.Sprintf("ui-%d", time.Now().UnixNano())
+	uid := fmt.Sprintf("ui-%d-%d", time.Now().UnixNano(), atomicAdd(&querySeq, 1))
 	client := &uiClient{conn: conn, clientID: uid}
 	ui.add(client)
 	stopOnShutdown := context.AfterFunc(ctx, client.stop)
 	defer stopOnShutdown()
 	defer ui.remove(client)
+	defer store.removeStreams(uid)
 
 	for {
 		select {
@@ -424,11 +425,10 @@ func handleUIClient(ctx context.Context, conn net.Conn, mgr *plugins.Manager, re
 		}
 
 		qid := fmt.Sprintf("q-%d-%d", time.Now().UnixNano(), atomicAdd(&querySeq, 1))
+		store.startQuery(ctx, qid, clientID, input, uid, parsed.QueryStream)
 		if err := client.send(&wire.AckMessage{Type: "ack", QueryID: qid}); err != nil {
 			return
 		}
-
-		store.create(qid, clientID, input)
 
 		targetName, targetText, hasTarget := resolvePrefixTarget(input, mgr)
 		if !hasTarget {
@@ -443,6 +443,11 @@ func handleUIClient(ctx context.Context, conn net.Conn, mgr *plugins.Manager, re
 }
 
 func dispatchQuery(ctx context.Context, queryText, qid string, mgr *plugins.Manager, reqOut chan<- pluginRequest, pluginsReg *pluginRegistry, store *aggregateStore, ui *uiRegistry, hasTarget bool, targetName string) {
+	query := store.query(qid)
+	if query == nil {
+		return
+	}
+	queryCtx := query.ctx
 	type pluginSnapshot struct {
 		name string
 		dir  string
@@ -458,6 +463,9 @@ func dispatchQuery(ctx context.Context, queryText, qid string, mgr *plugins.Mana
 
 	targets := make([]string, 0, len(snaps))
 	for _, snap := range snaps {
+		if queryCtx.Err() != nil {
+			return
+		}
 		if !snap.cfg.Enabled {
 			continue
 		}
@@ -471,6 +479,9 @@ func dispatchQuery(ctx context.Context, queryText, qid string, mgr *plugins.Mana
 	}
 
 	for _, snap := range snaps {
+		if queryCtx.Err() != nil {
+			return
+		}
 		if !snap.cfg.Enabled {
 			continue
 		}
@@ -494,7 +505,11 @@ func dispatchQuery(ctx context.Context, queryText, qid string, mgr *plugins.Mana
 					connected = true
 					break
 				}
-				time.Sleep(50 * time.Millisecond)
+				select {
+				case <-time.After(50 * time.Millisecond):
+				case <-queryCtx.Done():
+					return
+				}
 			}
 
 			if !connected {
@@ -505,13 +520,20 @@ func dispatchQuery(ctx context.Context, queryText, qid string, mgr *plugins.Mana
 		}
 
 		if pluginsReg.isConnected(snap.name) {
-			reqOut <- pluginRequest{name: snap.name, queryID: qid, text: queryText}
+			select {
+			case reqOut <- pluginRequest{name: snap.name, queryID: qid, text: queryText}:
+			case <-queryCtx.Done():
+				return
+			}
 		} else {
 			store.submitError(qid, snap.name, 0, "plugin not connected", ui.publishSnapshot)
 		}
 	}
 
 	for _, snap := range snaps {
+		if queryCtx.Err() != nil {
+			return
+		}
 		if !snap.cfg.Enabled || snap.cfg.Lifecycle != plugins.LifecycleOnCall {
 			continue
 		}
@@ -519,7 +541,7 @@ func dispatchQuery(ctx context.Context, queryText, qid string, mgr *plugins.Mana
 			continue
 		}
 		t0 := time.Now()
-		pctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		pctx, cancel := context.WithTimeout(queryCtx, 3*time.Second)
 		raw, err := invokeOnCallQuery(pctx, &plugins.Plugin{Dir: snap.dir, Config: snap.cfg}, queryText)
 		cancel()
 		if err != nil {

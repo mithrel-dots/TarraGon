@@ -91,6 +91,8 @@ type UIRequest struct {
 	Type     string `json:"type"`
 	ClientID string `json:"client_id,omitempty"`
 	Text     string `json:"text,omitempty"`
+	// New queries supersede older queries in this stream on the same connection.
+	QueryStream string `json:"query_stream,omitempty"`
 	// Optional fields for actions such as selection
 	QueryID  string `json:"query_id,omitempty"`
 	Plugin   string `json:"plugin,omitempty"`

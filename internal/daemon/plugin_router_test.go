@@ -105,6 +105,11 @@ func TestPluginListener_SendSelectRequestShape(t *testing.T) {
 	}
 
 	scanner := wire.NewScanner(conn)
+	// A queued query can be superseded before the router reads it. A select
+	// for a result the UI already showed must still reach the plugin.
+	store.startQuery(ctx, "q-123", "ui", "old", "session", "search")
+	store.startQuery(ctx, "q-124", "ui", "new", "session", "search")
+	reqOut <- pluginRequest{name: "plug_select", queryID: "q-123", text: "old"}
 	reqOut <- pluginRequest{name: "plug_select", queryID: "q-123", resultID: "r-42", action: "open", msgType: wire.MsgSelect}
 
 	var raw map[string]json.RawMessage
