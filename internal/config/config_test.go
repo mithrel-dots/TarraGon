@@ -474,12 +474,15 @@ func TestWritePluginOverridePreservesCommentsAndUpdatesSection(t *testing.T) {
 	content := strings.Join([]string{
 		"# top comment",
 		"run_tcp = false",
-		"",
+		"note = '''",
 		"[plugins.calculator]",
+		"'''",
+		"",
+		"[plugins.'calculator'] # local settings",
 		"enabled = true",
 		"prefix = \"@calc\"",
 		"",
-		"[plugins.other]",
+		"[plugins.other] # separate table",
 		"enabled = true",
 		"",
 	}, "\n")
@@ -507,13 +510,14 @@ func TestWritePluginOverridePreservesCommentsAndUpdatesSection(t *testing.T) {
 	if !strings.Contains(txt, "# top comment") {
 		t.Fatalf("expected original comment to be preserved, got:\n%s", txt)
 	}
-	if !strings.Contains(txt, "[plugins.calculator]") ||
+	if !strings.Contains(txt, "[plugins.'calculator'] # local settings") ||
+		!strings.Contains(txt, "note = '''\n[plugins.calculator]\n'''") ||
 		!strings.Contains(txt, "enabled = false") ||
 		!strings.Contains(txt, "prefix = \"=\"") ||
 		!strings.Contains(txt, "lifecycle_mode = \"on_call\"") {
 		t.Fatalf("expected calculator overrides section to be updated, got:\n%s", txt)
 	}
-	if !strings.Contains(txt, "[plugins.other]") {
+	if !strings.Contains(txt, "[plugins.other] # separate table\nenabled = true") {
 		t.Fatalf("expected unrelated plugin section to remain, got:\n%s", txt)
 	}
 }

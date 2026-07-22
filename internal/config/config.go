@@ -11,6 +11,8 @@ import (
 	"strings"
 
 	"github.com/mithrel-dots/tarragon/internal/db"
+	"github.com/pelletier/go-toml/v2"
+	"github.com/pelletier/go-toml/v2/unstable"
 	"github.com/spf13/viper"
 )
 
@@ -511,7 +513,16 @@ func updatePluginSectionInConfig(name, section string, remove bool) error {
 		return fmt.Errorf("read config file: %w", err)
 	}
 
-	updated := replacePluginSectionText(string(data), name, section, remove)
+	updated, err := replacePluginSectionText(data, name, section, remove)
+	if err != nil {
+		return err
+	}
+	// For example, an inline table cannot be extended with a new table
+	// header. Leave the original file intact if it cannot be edited this way.
+	var check map[string]any
+	if err := toml.Unmarshal([]byte(updated), &check); err != nil {
+		return fmt.Errorf("cannot update plugin section in %s: %w", path, err)
+	}
 	if err := os.WriteFile(path, []byte(updated), 0o644); err != nil {
 		return fmt.Errorf("write config file: %w", err)
 	}
@@ -519,56 +530,47 @@ func updatePluginSectionInConfig(name, section string, remove bool) error {
 	return nil
 }
 
-func replacePluginSectionText(content, name, section string, remove bool) string {
-	// Accept both the bare and quoted spelling so hand-written sections are
-	// updated in place instead of being duplicated.
-	targetHeaders := map[string]bool{
-		fmt.Sprintf("[plugins.%s]", name): true,
-		pluginSectionHeader(name):         true,
-	}
-	lines := strings.Split(content, "\n")
-
-	start := -1
-	for i, line := range lines {
-		if targetHeaders[strings.TrimSpace(line)] {
-			start = i
+func replacePluginSectionText(data []byte, name, section string, remove bool) (string, error) {
+	// Find actual TOML tables: headers may be quoted or followed by a
+	// comment, and header-like lines may be part of a multiline string.
+	start, end := -1, len(data)
+	var parser unstable.Parser
+	parser.Reset(data)
+	for parser.NextExpression() {
+		node := parser.Expression()
+		if node.Kind != unstable.Table && node.Kind != unstable.ArrayTable {
+			continue
+		}
+		key := node.Child()
+		line := bytes.LastIndexByte(data[:key.Raw.Offset], '\n') + 1
+		if start >= 0 {
+			end = line
 			break
 		}
-	}
-
-	end := len(lines)
-	if start >= 0 {
-		for i := start + 1; i < len(lines); i++ {
-			trimmed := strings.TrimSpace(lines[i])
-			if strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]") {
-				end = i
-				break
-			}
+		next := key.Next()
+		if node.Kind == unstable.Table && strings.EqualFold(string(key.Data), "plugins") &&
+			next != nil && strings.EqualFold(string(next.Data), name) && next.Next() == nil {
+			start = line
 		}
 	}
-
+	if err := parser.Error(); err != nil {
+		return "", err
+	}
+	content := string(data)
+	if start < 0 {
+		if remove {
+			return content, nil
+		}
+		if content = strings.TrimRight(content, "\n"); content != "" {
+			content += "\n\n"
+		}
+		return content + section, nil
+	}
 	if remove {
-		if start < 0 {
-			return content
-		}
-		result := append([]string{}, lines[:start]...)
-		result = append(result, lines[end:]...)
-		return strings.TrimRight(strings.Join(result, "\n"), "\n") + "\n"
+		return content[:start] + content[end:], nil
 	}
-
-	sectionLines := strings.Split(strings.TrimRight(section, "\n"), "\n")
-
-	if start >= 0 {
-		result := append([]string{}, lines[:start]...)
-		result = append(result, sectionLines...)
-		result = append(result, lines[end:]...)
-		return strings.TrimRight(strings.Join(result, "\n"), "\n") + "\n"
-	}
-
-	trimmed := strings.TrimRight(content, "\n")
-	if trimmed == "" {
-		return strings.Join(sectionLines, "\n") + "\n"
-	}
-
-	return trimmed + "\n\n" + strings.Join(sectionLines, "\n") + "\n"
+	// Keep the original header, including quoting and a trailing comment.
+	header, _, _ := strings.Cut(content[start:end], "\n")
+	_, body, _ := strings.Cut(section, "\n")
+	return content[:start] + header + "\n" + body + content[end:], nil
 }
