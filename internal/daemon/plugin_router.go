@@ -36,18 +36,15 @@ func (r *pluginRegistry) set(name string, conn net.Conn, scanner *bufio.Scanner)
 	r.scanners[name] = scanner
 }
 
-func (r *pluginRegistry) remove(name string) {
+func (r *pluginRegistry) remove(name string, conn net.Conn) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.conns != nil {
-		if c, ok := r.conns[name]; ok {
-			_ = c.Close()
-		}
-		delete(r.conns, name)
+	if r.conns[name] != conn {
+		return // the restarted plugin already registered a new connection
 	}
-	if r.scanners != nil {
-		delete(r.scanners, name)
-	}
+	_ = conn.Close()
+	delete(r.conns, name)
+	delete(r.scanners, name)
 }
 
 func (r *pluginRegistry) isConnected(name string) bool {
@@ -158,7 +155,7 @@ func startPluginListener(ctx context.Context, store *aggregateStore, ui *uiRegis
 				_ = conn.SetWriteDeadline(time.Time{})
 				if err != nil {
 					log.Printf("[PLUGINS] send to %s failed: %v", req.name, err)
-					registry.remove(req.name)
+					registry.remove(req.name, conn)
 					continue
 				}
 			}
@@ -186,7 +183,7 @@ func handlePluginConn(ctx context.Context, conn net.Conn, registry *pluginRegist
 	log.Printf("[PLUGINS] plugin connected: %s", hello.Name)
 
 	defer func() {
-		registry.remove(hello.Name)
+		registry.remove(hello.Name, conn)
 		log.Printf("[PLUGINS] plugin disconnected: %s", hello.Name)
 	}()
 

@@ -27,7 +27,14 @@ func TestPluginRegistryBasic(t *testing.T) {
 	if !ok || c == nil {
 		t.Fatalf("unexpected conn: %v %v", c, ok)
 	}
-	r.remove("p1")
+	restarted, peer := net.Pipe()
+	defer peer.Close()
+	r.set("p1", restarted, wire.NewScanner(restarted))
+	r.remove("p1", c1)
+	if conn, _ := r.getConn("p1"); conn != restarted {
+		t.Fatal("old connection removed the restarted plugin")
+	}
+	r.remove("p1", restarted)
 	if r.isConnected("p1") {
 		t.Fatalf("expected disconnected after remove")
 	}
