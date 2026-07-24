@@ -62,10 +62,14 @@ type PluginConfig struct {
 	// ResolvedPrefix is the prefix a user actually types. It is derived from
 	// Prefix and the global prefix symbol, and is never read from the manifest.
 	ResolvedPrefix string `toml:"-"`
+	PrefixSymbol   string `toml:"-"` // symbol used to compute ResolvedPrefix
 }
 
 // DefaultPrefixSymbol is used when the config does not set prefix_symbol.
 const DefaultPrefixSymbol = "@"
+
+// OverviewID is owned by the daemon rather than an external plugin process.
+const OverviewID = "plugins"
 
 // ResolvePrefix combines the configured prefix symbol with a manifest prefix.
 //
@@ -161,8 +165,14 @@ func DefaultDir() string {
 
 // NewManager creates a new Manager for the given directory.
 func NewManager(dir string) *Manager {
+	overview := PluginConfig{
+		ID: OverviewID, Name: "Plugins", Description: "Browse and manage plugins",
+		Source: "builtin", Enabled: true, Lifecycle: LifecycleOnCall,
+		Prefix: OverviewID, RequirePrefix: true, Capabilities: []string{"suggest", "action"},
+		ResolvedPrefix: ResolvePrefix(OverviewID, PrefixSymbol()),
+	}
 	return &Manager{
-		Plugins:     make(map[string]*Plugin),
+		Plugins:     map[string]*Plugin{OverviewID: {BaseConfig: overview, Config: overview}},
 		pluginDir:   dir,
 		stopTimeout: DefaultStopTimeout,
 	}
@@ -246,6 +256,9 @@ func loadPluginConfig(pluginDir, dirName string) (PluginConfig, error) {
 	if cfg.ID == "" {
 		return PluginConfig{}, fmt.Errorf("cannot derive a plugin id from directory %q", dirName)
 	}
+	if cfg.ID == OverviewID {
+		return PluginConfig{}, fmt.Errorf("plugin id %q is reserved for the built-in overview", cfg.ID)
+	}
 
 	cfg.Name = strings.TrimSpace(cfg.Name)
 	if cfg.Name == "" {
@@ -258,7 +271,7 @@ func loadPluginConfig(pluginDir, dirName string) (PluginConfig, error) {
 // Discover scans the plugin directory for plugins and loads their configs.
 func (m *Manager) Discover() error {
 	entries, err := os.ReadDir(m.pluginDir)
-	if err != nil {
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("reading plugin dir: %w", err)
 	}
 
@@ -286,7 +299,7 @@ func (m *Manager) Discover() error {
 // (running process handles, etc.) remains consistent.
 func (m *Manager) DiscoverNew() error {
 	entries, err := os.ReadDir(m.pluginDir)
-	if err != nil {
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("reading plugin dir: %w", err)
 	}
 
@@ -318,7 +331,7 @@ func (m *Manager) DiscoverNew() error {
 // managed safely.
 func (m *Manager) RefreshConfigs() error {
 	entries, err := os.ReadDir(m.pluginDir)
-	if err != nil {
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("reading plugin dir: %w", err)
 	}
 
@@ -399,6 +412,10 @@ func (m *Manager) ApplyOverrides() error {
 		}
 
 		if path, ok := lookupOverride(sections, "lifecycle_mode"); ok {
+			if id == OverviewID {
+				log.Printf("config: %s is ignored for the built-in plugin", path)
+				continue
+			}
 			mode, err := ParseLifecycleMode(viper.GetString(path))
 			if err != nil {
 				return fmt.Errorf("invalid lifecycle override for plugin %q: %w", id, err)
@@ -420,6 +437,7 @@ func (m *Manager) ApplyOverrides() error {
 func (m *Manager) ResolvePrefixes() {
 	symbol := PrefixSymbol()
 	for _, p := range m.Plugins {
+		p.Config.PrefixSymbol = symbol
 		p.Config.ResolvedPrefix = ResolvePrefix(p.Config.Prefix, symbol)
 	}
 }
@@ -789,7 +807,9 @@ func (m *Manager) Restart(ctx context.Context, ipcEndpoint string, names []strin
 	if !explicit {
 		names = make([]string, 0, len(m.Plugins))
 		for name := range m.Plugins {
-			names = append(names, name)
+			if name != OverviewID {
+				names = append(names, name)
+			}
 		}
 	}
 	sort.Strings(names)

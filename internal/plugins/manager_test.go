@@ -59,6 +59,27 @@ func TestDefaultDirContainsHome(t *testing.T) {
 	}
 }
 
+func TestOverviewDoesNotNeedOrLoadAnExternalManifest(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "plugins")
+	m := NewManager(root)
+	if err := m.Discover(); err != nil {
+		t.Fatal(err)
+	}
+	overview := m.Plugins[OverviewID]
+	if overview == nil || !overview.Config.Enabled || overview.Config.ResolvedPrefix != "@plugins" {
+		t.Fatalf("missing built-in overview on a fresh install: %+v", overview)
+	}
+	writeManifest(t, root, "other", "id='plugins'\nentrypoint='other'\nlifecycle_mode='daemon'\n")
+	for _, discover := range []func() error{m.Discover, m.DiscoverNew, m.RefreshConfigs} {
+		if err := discover(); err != nil {
+			t.Fatal(err)
+		}
+		if p := m.Plugins[OverviewID]; p != overview || p.Config.Entrypoint != "" || p.BaseConfig.Source != "builtin" {
+			t.Fatalf("external manifest replaced the built-in: %+v", p)
+		}
+	}
+}
+
 func TestStartPersistentSkipsNonDaemonAndDisabled(t *testing.T) {
 	m := &Manager{Plugins: make(map[string]*Plugin)}
 	m.Plugins["on_call"] = &Plugin{Config: PluginConfig{Name: "on_call", Enabled: true, Entrypoint: "nope.sh", Lifecycle: LifecycleOnCall}}

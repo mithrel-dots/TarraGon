@@ -95,6 +95,9 @@ var pluginConfigCmd = &cobra.Command{
 		}
 
 		if setLifecycle {
+			if name == plugins.OverviewID {
+				return errors.New("the built-in plugins overview has no configurable lifecycle")
+			}
 			mode, err := plugins.ParseLifecycleMode(strings.TrimSpace(pluginConfigLifecycle))
 			if err != nil {
 				return fmt.Errorf("invalid --lifecycle value: %w", err)

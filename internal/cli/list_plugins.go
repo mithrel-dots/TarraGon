@@ -4,25 +4,14 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"os"
-	"path/filepath"
 	"sort"
 	"time"
 
 	"github.com/mithrel-dots/tarragon/internal/plugins"
 	"github.com/mithrel-dots/tarragon/internal/texttable"
 	"github.com/mithrel-dots/tarragon/internal/wire"
-	"github.com/pelletier/go-toml/v2"
 	"github.com/spf13/cobra"
 )
-
-type installedPlugin struct {
-	ID            string `toml:"id"`
-	Name          string `toml:"name"`
-	Description   string `toml:"description"`
-	LifecycleMode string `toml:"lifecycle_mode"`
-	Enabled       bool   `toml:"enabled"`
-}
 
 var listPluginsCmd = &cobra.Command{
 	Use:   "list",
@@ -33,54 +22,17 @@ var listPluginsCmd = &cobra.Command{
 			return errors.New("could not determine plugin installation directory")
 		}
 
-		entries, err := os.ReadDir(pluginRoot)
-		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				if _, err := fmt.Fprintln(cmd.OutOrStdout(), "No plugins installed."); err != nil {
-					return err
-				}
-				return nil
-			}
-			return fmt.Errorf("read plugin directory: %w", err)
+		mgr := plugins.NewManager(pluginRoot)
+		if err := mgr.Discover(); err != nil {
+			return err
 		}
-
+		if err := mgr.ApplyOverrides(); err != nil {
+			return err
+		}
 		loaded, daemonAvailable := loadedPluginsFromDaemon(750 * time.Millisecond)
-		installed := make([]installedPlugin, 0, len(entries))
-		for _, entry := range entries {
-			if !entry.IsDir() {
-				continue
-			}
-
-			pluginTomlPath := filepath.Join(pluginRoot, entry.Name(), "plugin.toml")
-			data, err := os.ReadFile(pluginTomlPath)
-			if err != nil {
-				continue
-			}
-
-			var cfg installedPlugin
-			if err := toml.Unmarshal(data, &cfg); err != nil {
-				continue
-			}
-
-			cfg.ID = plugins.NormalizePluginID(cfg.ID)
-			if cfg.ID == "" {
-				cfg.ID = plugins.NormalizePluginID(entry.Name())
-			}
-			if cfg.ID == "" {
-				continue
-			}
-			if cfg.Name == "" {
-				cfg.Name = cfg.ID
-			}
-
-			installed = append(installed, cfg)
-		}
-
-		if len(installed) == 0 {
-			if _, err := fmt.Fprintln(cmd.OutOrStdout(), "No plugins installed."); err != nil {
-				return err
-			}
-			return nil
+		installed := make([]plugins.PluginConfig, 0, len(mgr.Plugins))
+		for _, p := range mgr.Plugins {
+			installed = append(installed, p.Config)
 		}
 
 		sort.Slice(installed, func(i, j int) bool { return installed[i].ID < installed[j].ID })
@@ -95,7 +47,7 @@ var listPluginsCmd = &cobra.Command{
 				cfg.ID,
 				cfg.Name,
 				cfg.Description,
-				cfg.LifecycleMode,
+				string(cfg.Lifecycle),
 				fmt.Sprintf("%t", cfg.Enabled),
 				loadedValue,
 			})

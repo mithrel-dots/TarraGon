@@ -84,6 +84,9 @@ var installPluginCmd = &cobra.Command{
 		if pluginID == "" {
 			return errors.New("plugin.toml has no usable id or name")
 		}
+		if pluginID == plugins.OverviewID {
+			return fmt.Errorf("plugin id %q is built in", pluginID)
+		}
 
 		makefilePath := filepath.Join(repoDir, "Makefile")
 		if _, err := os.Stat(makefilePath); err == nil {

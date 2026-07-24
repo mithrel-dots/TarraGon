@@ -237,8 +237,8 @@ func TestUIServer_StatusIncludesPluginSourceMetadata(t *testing.T) {
 	if status.Type != wire.MsgStatus {
 		t.Fatalf("unexpected status type: %q", status.Type)
 	}
-	if status.Total != 2 {
-		t.Fatalf("expected 2 enabled plugins, got %d", status.Total)
+	if status.Total != 3 {
+		t.Fatalf("expected two external plugins and the overview, got %d enabled plugins", status.Total)
 	}
 
 	seen := map[string]wire.PluginInfo{}
@@ -251,6 +251,9 @@ func TestUIServer_StatusIncludesPluginSourceMetadata(t *testing.T) {
 	}
 	if got := seen["legacy_plugin"].Source; got != "" {
 		t.Fatalf("expected legacy_plugin source empty, got %q", got)
+	}
+	if p := seen["Plugins"]; p.ID != plugins.OverviewID || p.Source != "builtin" || !p.RequirePrefix || p.Connected {
+		t.Fatalf("unexpected overview metadata: %+v", p)
 	}
 }
 

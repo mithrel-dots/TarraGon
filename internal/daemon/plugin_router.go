@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/mithrel-dots/tarragon/internal/plugins"
 	"github.com/mithrel-dots/tarragon/internal/wire"
 )
 
@@ -173,7 +174,7 @@ func handlePluginConn(ctx context.Context, conn net.Conn, registry *pluginRegist
 		_ = conn.Close()
 		return
 	}
-	if hello.Type != wire.MsgHello || hello.Name == "" {
+	if hello.Type != wire.MsgHello || hello.Name == "" || hello.Name == plugins.OverviewID {
 		log.Printf("[PLUGINS] invalid hello: type=%q name=%q", hello.Type, hello.Name)
 		_ = conn.Close()
 		return

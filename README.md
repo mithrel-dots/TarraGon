@@ -39,6 +39,11 @@ Plugins can be invoked directly or contextually, and can expose commands, values
 - Focus a window, bring it to the currently focused workspace, close it, or toggle floating mode.
 - Install with `just plugin-install hyprland_windows`, then run `tarragon plugin restart hyprland_windows`.
 
+### Plugin Overview
+Type `@plugins` to browse plugins, including disabled ones. Filter by name or status with `@plugins calc` or `@plugins disabled`. Each row shows the plugin ID, effective prefix, lifecycle, and connection state. The overview is built into the daemon and uses your configured prefix symbol.
+
+Use **open** to search a plugin by its prefix, **enable** or **disable** to change its setting, and **restart** for persistent plugins. Changes use the same primary TOML overrides as `tarragon plugin config`; higher-priority drop-ins still apply. An on-demand plugin restarts on its next matching query.
+
 ### Plugin System
 - **Integrated Suggestions**: Seamlessly blends suggestions from eligible plugins, including bundled plugins for installed applications and other local tasks.
 - **Language Agnostic**: Plugins are external executables or scripts.

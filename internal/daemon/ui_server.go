@@ -7,7 +7,6 @@ import (
 	"io"
 	"log"
 	"net"
-	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -56,6 +55,9 @@ func (c *uiClient) send(msg any) error {
 type uiRegistry struct {
 	mu      sync.RWMutex
 	clients map[string]*uiClient
+	// Serialize config changes through the resulting process stops/starts,
+	// without holding the query path's manager lock while waiting for exit.
+	management sync.Mutex
 }
 
 func newUIRegistry() *uiRegistry {
@@ -215,6 +217,27 @@ func handleUIClient(ctx context.Context, conn net.Conn, mgr *plugins.Manager, re
 					}
 				}(parsed.Plugin, selectedID)
 			}
+			if parsed.Plugin == plugins.OverviewID {
+				if err := client.send(map[string]any{"type": "ok"}); err != nil {
+					return
+				}
+				msg, err := ui.selectOverview(ctx, mgr, pluginsReg, selectedID, parsed.Action)
+				if err != nil {
+					msg = err.Error()
+				}
+				_ = client.send(&wire.SelectResponse{Type: wire.MsgSelectResponse, Success: err == nil, Message: msg})
+				switch parsed.Action {
+				case "enable", "disable", "restart":
+					// Re-read effective state even when starting the process failed
+					// after its configuration was successfully changed.
+					if q := store.query(parsed.QueryID); q != nil && q.session == uid {
+						if target, filter, ok := resolvePrefixTarget(q.Input, mgr); ok && target == plugins.OverviewID {
+							publishOverview(mgr, pluginsReg, store, ui, parsed.QueryID, filter)
+						}
+					}
+				}
+				continue
+			}
 			if parsed.Plugin != "" && parsed.QueryID != "" && pluginsReg.isConnected(parsed.Plugin) {
 				reqOut <- pluginRequest{name: parsed.Plugin, queryID: parsed.QueryID, resultID: selectedID, action: parsed.Action, msgType: wire.MsgSelect}
 			} else if parsed.Plugin != "" {
@@ -241,172 +264,23 @@ func handleUIClient(ctx context.Context, conn net.Conn, mgr *plugins.Manager, re
 			_ = client.send(map[string]any{"type": "ok"})
 			continue
 		case "status":
-			connected := pluginsReg.Names()
-			total := 0
-			mgr.RLock()
-			pluginInfos := make([]wire.PluginInfo, 0, len(mgr.Plugins))
-			for _, p := range mgr.Plugins {
-				if p.Config.Enabled {
-					total++
-				}
-				pluginInfos = append(pluginInfos, wire.PluginInfo{
-					ID:              p.Config.ID,
-					Name:            p.Config.Name,
-					Description:     p.Config.Description,
-					Source:          p.Config.Source,
-					Enabled:         p.Config.Enabled,
-					Connected:       pluginsReg.isConnected(p.Config.ID),
-					Lifecycle:       string(p.Config.Lifecycle),
-					Prefix:          p.Config.ResolvedPrefix,
-					RequirePrefix:   p.Config.RequirePrefix,
-					ProvidesGeneral: p.Config.ProvidesGeneral,
-					Capabilities:    p.Config.Capabilities,
-					Icon:            p.Config.Icon,
-				})
-			}
-			mgr.RUnlock()
-			sort.Slice(pluginInfos, func(i, j int) bool {
-				return pluginInfos[i].ID < pluginInfos[j].ID
-			})
-			_ = client.send(&wire.StatusResponse{
-				Type:      "status",
-				Connected: connected,
-				Total:     total,
-				Plugins:   pluginInfos,
-			})
+			_ = client.send(pluginStatus(mgr, pluginsReg))
 			continue
 		case "reload":
-			if err := config.ReloadConfig(); err != nil {
-				_ = client.send(&wire.ReloadResponse{Type: "reload_response", Success: false, Message: fmt.Sprintf("failed to read config: %v", err)})
-				continue
+			ui.management.Lock()
+			err := reloadPlugins(ctx, mgr, config.ReloadConfig)
+			ui.management.Unlock()
+			msg := "configuration reloaded"
+			if err != nil {
+				msg = err.Error()
 			}
-
-			startPersistent := false
-			mgr.Lock()
-			beforeEnabled := make(map[string]bool, len(mgr.Plugins))
-			beforeLifecycle := make(map[string]plugins.LifecycleMode, len(mgr.Plugins))
-			for name, p := range mgr.Plugins {
-				beforeEnabled[name] = p.Config.Enabled
-				beforeLifecycle[name] = p.Config.Lifecycle
-			}
-
-			if err := mgr.DiscoverNew(); err != nil {
-				mgr.Unlock()
-				_ = client.send(&wire.ReloadResponse{
-					Type:    "reload_response",
-					Success: false,
-					Message: fmt.Sprintf("failed to discover new plugins: %v", err),
-				})
-				continue
-			}
-
-			if err := mgr.ApplyOverrides(); err != nil {
-				mgr.Unlock()
-				_ = client.send(&wire.ReloadResponse{
-					Type:    "reload_response",
-					Success: false,
-					Message: fmt.Sprintf("failed to apply config overrides: %v", err),
-				})
-				continue
-			}
-
-			var toStop []string
-			for name, p := range mgr.Plugins {
-				wasEnabled := beforeEnabled[name]
-				wasLifecycle := beforeLifecycle[name]
-				isEnabled := p.Config.Enabled
-				isLifecycle := p.Config.Lifecycle
-
-				if !isEnabled {
-					if p.Running() {
-						toStop = append(toStop, name)
-					}
-					continue
-				}
-
-				if wasLifecycle != isLifecycle && p.Running() {
-					toStop = append(toStop, name)
-				}
-
-				if (!wasEnabled && isEnabled && isLifecycle == plugins.LifecycleDaemon) ||
-					(wasLifecycle != isLifecycle && isLifecycle == plugins.LifecycleDaemon) {
-					startPersistent = true
-				}
-			}
-			mgr.Unlock()
-
-			// Stop after releasing the lock: plugins now get a grace period to
-			// exit, and holding the manager lock through it would block every
-			// concurrent query.
-			if len(toStop) > 0 {
-				mgr.StopPlugins(toStop)
-			}
-
-			if startPersistent {
-				if err := mgr.StartPersistent(ctx, wire.ResolvePluginsSocketPath()); err != nil {
-					_ = client.send(&wire.ReloadResponse{Type: "reload_response", Success: false, Message: fmt.Sprintf("reload applied, but failed to start daemon plugins: %v", err)})
-					continue
-				}
-			}
-
-			_ = client.send(&wire.ReloadResponse{Type: "reload_response", Success: true, Message: "configuration reloaded"})
+			_ = client.send(&wire.ReloadResponse{Type: "reload_response", Success: err == nil, Message: msg})
 			continue
 		case "restart":
-			// Re-read manifests and overrides first so a restart also picks up
-			// plugins installed or reconfigured since the daemon started.
-			if err := config.ReloadConfig(); err != nil {
-				log.Printf("[UI] restart: could not re-read config: %v", err)
-			}
-			mgr.Lock()
-			discoverErr := mgr.RefreshConfigs()
-			overrideErr := mgr.ApplyOverrides()
-			mgr.Unlock()
-			if discoverErr != nil {
-				log.Printf("[UI] restart: plugin discovery failed: %v", discoverErr)
-			}
-			if overrideErr != nil {
-				_ = client.send(&wire.RestartResponse{
-					Type:    "restart_response",
-					Success: false,
-					Message: fmt.Sprintf("failed to apply config overrides: %v", overrideErr),
-				})
-				continue
-			}
-
-			var targets []string
-			if parsed.Plugin != "" {
-				targets = []string{parsed.Plugin}
-			}
-
-			results := mgr.Restart(ctx, wire.ResolvePluginsSocketPath(), targets)
-
-			wireResults := make([]wire.RestartResult, 0, len(results))
-			failed := 0
-			restarted := 0
-			for _, r := range results {
-				if r.Status == plugins.RestartStatusError {
-					failed++
-				}
-				if r.Status == plugins.RestartStatusRestarted {
-					restarted++
-				}
-				wireResults = append(wireResults, wire.RestartResult{
-					Name:    r.Name,
-					Status:  r.Status,
-					Message: r.Message,
-				})
-			}
-
-			msg := fmt.Sprintf("restarted %d plugin(s)", restarted)
-			if failed > 0 {
-				msg = fmt.Sprintf("%s, %d failed", msg, failed)
-			}
-			_ = client.send(&wire.RestartResponse{
-				Type:    "restart_response",
-				Success: failed == 0,
-				Message: msg,
-				Results: wireResults,
-			})
+			ui.management.Lock()
+			resp := restartPlugins(ctx, mgr, parsed.Plugin)
+			ui.management.Unlock()
+			_ = client.send(resp)
 			continue
 		case "query", "":
 			// handled below
@@ -436,7 +310,9 @@ func handleUIClient(ctx context.Context, conn net.Conn, mgr *plugins.Manager, re
 		}
 		// A query beginning with the routing symbol is an explicit routing
 		// attempt, even when its prefix is only partially typed or unknown.
+		mgr.RLock()
 		prefixTargeted := hasTarget || startsWithRoutingPrefix(input)
+		mgr.RUnlock()
 
 		go dispatchQuery(ctx, targetText, qid, mgr, reqOut, pluginsReg, store, ui, prefixTargeted, targetName)
 	}
@@ -476,6 +352,10 @@ func dispatchQuery(ctx context.Context, queryText, qid string, mgr *plugins.Mana
 	}
 	if snap, ok := store.setExpectedPlugins(qid, targets); ok {
 		ui.publish(&wire.UpdateMessage{Type: "update", QueryID: qid, Payload: snap})
+	}
+	if targetName == plugins.OverviewID && len(targets) == 1 {
+		publishOverview(mgr, pluginsReg, store, ui, qid, queryText)
+		return
 	}
 
 	for _, snap := range snaps {

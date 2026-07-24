@@ -120,6 +120,9 @@ func rewriteManifestForSystem(manifest []byte, binaryPath string, fallbackName s
 	if pluginName == "" {
 		return nil, "", errors.New("plugin manifest has no usable id or name")
 	}
+	if pluginName == plugins.OverviewID {
+		return nil, "", fmt.Errorf("plugin id %q is built in", pluginName)
+	}
 	if strings.TrimSpace(cfg.Entrypoint) == "" {
 		return nil, "", errors.New("plugin manifest is missing required field: entrypoint")
 	}
