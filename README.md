@@ -20,8 +20,31 @@ Plugins can be invoked directly or contextually, and can expose commands, values
 
 ## Core Architecture
 
-- **Daemon Mode**: The core launcher logic runs as a persistent background daemon for instant availability.
-- **Attachable UI**: A lightweight UI attaches to the daemon on pressing a keyboard shortcut, providing immediate access.
+The running daemon uses Unix domain sockets (UDS). A frontend attaches to `ui.sock`; persistent plugins connect to `plugins.sock`. Both sockets carry newline-delimited JSON (NDJSON). On-call plugins instead receive a command-line invocation and return JSON on stdout.
+
+![Frontends send queries to the TarraGon core, which gathers plugin replies and streams ranked snapshots. SQLite selection history feeds the ranking cache. Dashed routes show how the benchmark connects equivalent UI and plugin fixtures through embedded NATS.](docs/diagrams/architecture.svg)
+
+**Solid lines** trace the running daemon. **Dashed lines** trace the IPC benchmark: fixtures take the place of the UI and plugins, and the benchmark runs the same aggregation code in its own process.
+
+### How a suggestion reaches the UI
+
+1. **Dispatch.** The [daemon router](internal/daemon/ui_server.go) acknowledges the query with a `query_id` and publishes an initial snapshot with the target plugins marked `pending`. A matching prefix selects one plugin and is stripped before dispatch. An unprefixed query fans out to eligible general-suggestion plugins.
+2. **Gather.** As each plugin replies, the [query store](internal/daemon/aggregate.go) normalizes its JSON into result items and replaces that plugin’s previous batch for the same `query_id`. Other plugins’ items stay in the snapshot. The daemon tracks each target as `pending`, `done`, `empty`, or `error`.
+3. **Publish.** One publisher per query combines replies that arrive while it is busy, ranks the accumulated items, and queues a full `update` for each connected UI. The frontend base64-decodes the [snapshot payload](docs/ui.md#message-shapes) and replaces its displayed list for that `query_id`. The first plugin’s suggestions can appear while other plugins are still pending.
+
+**Frecency and ranking.** On `select`, the daemon asynchronously increments the selection count and records the last selection time for the `(plugin ID, result ID)` pair in SQLite. The file defaults to `$XDG_STATE_HOME/tarragon/tarragon.db` (normally `~/.local/state/tarragon/tarragon.db`); `db_path` overrides it.
+
+At startup and after a selection write, the daemon [computes frecency](internal/db/db.go) as `selection count × exp(−0.1 × days since last selection)` and refreshes an in-memory cache. Ranking reads the cache on each snapshot. With the default `frecency_weight` of `0.3`, the final score is `0.7 × plugin score + 0.3 × cached frecency`.
+
+### UDS, NATS and combined transports
+
+The [IPC benchmark](#plugin-benchmarking) measures two connections: **plugin → benchmark core** carries a suggestion; **benchmark core → UI** carries a ranked snapshot. Its query store is transient and never opens the user’s frecency DB.
+
+- **Direct UDS (`uds`):** the plugin writes a response as one NDJSON line. The core reads it directly and writes the cumulative update to the UI’s Unix socket.
+- **Native NATS (`nats-tcp`):** the plugin publishes JSON on `bench.<plugin>.out` over loopback TCP. The embedded Core NATS broker delivers it to the benchmark core’s in-process subscription. After aggregation, the core publishes to `bench.ui.in`, which the UI subscribes to. Queries and plugin requests travel the other way on `bench.ui.out` and `bench.<plugin>.in`.
+- **Combined (UDS + NATS):** `nats-uds-bridge` carries native NATS protocol bytes over a Unix socket and forwards them unchanged to the broker’s in-process connection. `uds-adapter` lets a peer keep speaking NDJSON: it publishes one NATS message per socket line and restores the newline in the reverse direction. With `--matrix`, each connection independently uses `nats-tcp`, `nats-uds-bridge`, or `uds-adapter`: nine broker-backed pairings plus the separate `uds`/`uds` baseline.
+
+To regenerate the SVG locally, edit the [diagram source](docs/diagrams/architecture.d2) and run `just diagram` with the [D2 CLI](https://d2lang.com/tour/install/) installed. The source selects the Dagre layout.
 
 ---
 
@@ -63,7 +86,7 @@ Benchmarks run from a source checkout; they are not included in the installed `t
 
 - `just bench` connects to a running daemon like an external frontend, sends queries through the UI socket, and prints plugin latency results as a table.
 - `just bench ipc` runs a separate suggestion-delivery experiment. It starts its own core, persistent fixture plugin processes, and headless UI. No running daemon or installed plugins are needed.
-- `just bench ipc --matrix --samples 2000 --warmup 200 --rounds 3` also measures mixed plugin/UI paths through embedded Core NATS. `uds` is direct NDJSON. `nats-tcp` is loopback TCP. `nats-uds-bridge` carries NATS protocol bytes over a Unix socket forwarded to the embedded server's in-process connection (no TCP on that leg). `uds-adapter` translates between NDJSON frames and NATS subjects.
+- `just bench ipc --matrix --samples 2000 --warmup 200 --rounds 3` measures the [direct, native NATS, and combined transport paths](#uds-nats-and-combined-transports).
 - For congestion, try `just bench ipc --plugins 50 --burst 8 --samples 80 --warmup 16 --rounds 3`. Each plugin returns one small suggestion per query. The UI sends each burst back-to-back, then waits for every plugin's suggestion for every query before starting the next burst. Use `--burst 1` at the same plugin count as a control. Both flags default to 1.
 - The table reports mean/p50/p95/p99 in microseconds for plugin encode to core decode, aggregation (including contention), outbound update to UI decode, and end to end. The UI times the first appearance of each `(query, plugin)` in cumulative snapshots. `Query->first` and `Query->all` start at UI query send; `Queries/s` measures completed queries over the elapsed UI measurement window. Startup, warmup, and rendering are excluded. A missing or mismatched suggestion fails the run.
 
@@ -142,63 +165,4 @@ Other examples:
 tarragon completion generate bash > ~/.local/share/bash-completion/completions/tarragon
 tarragon completion generate fish > ~/.config/fish/completions/tarragon.fish
 tarragon completion generate powershell > tarragon.ps1
-```
-
-
-## Flowchart
-
-```mermaid
-graph TD
- subgraph Plugins["Plugin System"]
-        DaemonPlugins["Daemon Plugins
-(Run persistently)"]
-        ClipboardMgr["Example: Clipboard Manager"]
-        OnDemandPlugins["On-Demand Plugins
-(Run when UI attaches)"]
-        AppLauncher["Example: App Launcher"]
-        OnCallPlugins["On-Call Plugins
-(Run when explicitly invoked)"]
-        SearchEngines["Example: Search Engines
-        (Youtube/Wiki)"]
-        Socket{"IPC (UDS + NDJSON)"}
-  end
- subgraph Daemon["TarraGon Daemon"]
-        Core["Core Engine"]
-        QueryProcessor["Query Processor"]
-        PluginManager["Plugin Manager"]
-        ResultAggregator["Result Aggregator"]
-        Config[("Configuration")]
-        FrecencyDB[("Frecency DB")]
-        Plugins
-  end
- subgraph PluginInstall["Plugin Installation Process"]
-        GitRepo["Git Repository"]
-        InstallCommand["tarragon plugin install <git-url>"]
-        DepCheck["make check-deps"]
-        MakeInstall["make install"]
-        PluginDir["~/.local/lib/tarragon/plugins/"]
-  end
-    User(["User"]) --> UI["UI Layer"]
-    User -.-> InstallCommand
-    UI <--> QueryProcessor
-    QueryProcessor --> Core
-    Core --> PluginManager
-    Core <--> Config
-    ResultAggregator <--> FrecencyDB
-    PluginManager --> Socket
-    Socket <--> DaemonPlugins
-    DaemonPlugins --> ClipboardMgr
-    Socket <--> OnDemandPlugins
-    OnDemandPlugins --> AppLauncher
-    OnCallPlugins --> SearchEngines
-    Socket <--> OnCallPlugins
-    ResultAggregator --> UI
-    Socket --> ResultAggregator
-    InstallCommand -- "1. Clone" --> GitRepo
-    GitRepo -- "2. Check Dependencies" --> DepCheck
-    DepCheck -- "3. Build & Install" --> MakeInstall
-    MakeInstall -- "4. Register" --> PluginDir
-    PluginDir -.-> PluginManager
-
-    classDef anchor shape:anchor
 ```

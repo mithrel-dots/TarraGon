@@ -1,0 +1,98 @@
+vars: {
+  d2-config: {
+    layout-engine: dagre
+    pad: 20
+    dark-theme-id: 200
+    theme-overrides: {
+      N1: "#1C2834"
+      N2: "#3D5264"
+      N7: "#FBFCFD"
+      B1: "#647B8D"
+      B2: "#2B807D"
+      B4: "#F0F4F6"
+      AA4: "#E0EAF0"
+    }
+    dark-theme-overrides: {
+      N1: "#EDF2F5"
+      N2: "#CDD9E2"
+      N7: "#0E1114"
+      B1: "#8598A9"
+      B2: "#66BCB4"
+      B4: "#1A2026"
+      AA4: "#233342"
+    }
+  }
+}
+
+direction: down
+
+classes: {
+  card: {
+    grid-columns: 1
+    horizontal-gap: 24
+    vertical-gap: 14
+    style: {border-radius: 12; stroke-width: 1; font-size: 22; bold: true}
+  }
+  detail: {shape: text; style.font-size: 18}
+  hub: {style: {stroke-width: 2; font-size: 25; font-color: "#EFF5FB"}}
+  hub-detail: {shape: text; style: {font-size: 18; font-color: "#EFF5FB"}}
+  runtime: {style: {font-size: 16; italic: false}}
+  benchmark: {style: {stroke-dash: 5; font-size: 16; italic: false}}
+}
+
+frontend: UDS frontends {
+  class: card
+  clients: GUI or CLI {class: detail}
+}
+nats_ui: Native NATS UI {
+  class: card
+  role: Benchmark fixture {class: detail}
+}
+
+broker: Embedded NATS {
+  class: [card; hub]
+  style: {fill: "#123B38"; stroke: "#239D92"}
+  transport: "IPC benchmark · fixture traffic only\nNative: NATS over loopback TCP\nCombined: bridge or adapt over UDS" {class: hub-detail}
+}
+core: Daemon core {
+  class: [card; hub]
+  style: {fill: "#203750"; stroke: "#5389C4"}
+  flow: "Route queries and manage plugin lifecycles\nNormalize and merge replies per query\nCoalesce, rank and stream full snapshots" {class: hub-detail}
+}
+
+adapter: UDS plugin adapter {
+  class: card
+  translation: NDJSON lines ↔ NATS subjects {class: detail}
+}
+nats_plugin: Native NATS plugin {
+  class: card
+  role: Benchmark fixture {class: detail}
+}
+persistent: Persistent plugins {
+  class: card
+  connection: "plugins.sock · NDJSON\nStart with the daemon or on first match" {class: detail}
+}
+on_call: On-call plugins {
+  class: card
+  lifecycle: One process per request {class: detail}
+}
+frecency: "SQLite frecency DB\nCount + last selection time" {
+  shape: cylinder
+  style: {font-size: 19; stroke-width: 1}
+}
+
+# Dashed connections stand in for the equivalent endpoint on a benchmark fixture.
+frontend <-> broker: UDS frontend adapter {class: benchmark}
+nats_ui <-> broker: TCP or UDS byte bridge {class: benchmark}
+frontend <-> core: "ui.sock · NDJSON\n↓ query / select   ↑ snapshot" {class: runtime}
+broker <-> core: "in-process\nshared aggregation code" {class: benchmark}
+core <-> persistent: {
+  class: runtime
+  source-arrowhead.label: suggestions
+  target-arrowhead.label: requests
+}
+core <-> frecency: "↓ record selection\n↑ refresh in-memory scores" {class: runtime}
+core <-> on_call: "↓ exec   ↑ JSON stdout" {class: runtime}
+broker <-> adapter: {class: benchmark}
+adapter <-> persistent: {class: benchmark}
+broker <-> nats_plugin: native NATS {class: benchmark}

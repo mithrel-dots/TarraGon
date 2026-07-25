@@ -260,6 +260,10 @@ config-generate *FLAGS:
 
 # ─── Utilities ────────────────────────────────────────────────────
 
+[doc("Render the README architecture diagram locally with D2")]
+diagram:
+    d2 docs/diagrams/architecture.d2 docs/diagrams/architecture.svg
+
 # Clean build artifacts
 [doc("Remove build directory and coverage output")]
 clean:
