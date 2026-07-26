@@ -255,6 +255,74 @@ func TestOrderResultsGroupedSortsGroupsByBestScore(t *testing.T) {
 	}
 }
 
+func TestAggregateSnapshotRanking(t *testing.T) {
+	const aUnequal = `[{"id":"a2","score":2},{"id":"a1","score":6}]`
+	const bUnequal = `[{"id":"b2","score":4},{"id":"b1","score":8}]`
+	for _, tc := range []struct {
+		name     string
+		a, b     string
+		frecency map[string]float64
+		global   []string
+		grouped  []string
+	}{
+		{
+			name:    "equal",
+			a:       `[{"id":"a2","score":1},{"id":"a1","score":1}]`,
+			b:       `[{"id":"b2","score":1},{"id":"b1","score":1}]`,
+			global:  []string{"a2", "a1", "b2", "b1"},
+			grouped: []string{"a2", "a1", "b2", "b1"},
+		},
+		{
+			name: "unequal", a: aUnequal, b: bUnequal,
+			global:  []string{"b1", "a1", "b2", "a2"},
+			grouped: []string{"b2", "b1", "a2", "a1"},
+		},
+		{
+			// At weight 0.5, a2, a1 and b1 tie at 4; b2 scores 2.
+			name: "frecency", a: aUnequal, b: bUnequal,
+			frecency: map[string]float64{"a:a2": 6, "a:a1": 2},
+			global:   []string{"a2", "a1", "b1", "b2"},
+			grouped:  []string{"a2", "a1", "b2", "b1"},
+		},
+	} {
+		for mode, want := range map[string][]string{"global": tc.global, "grouped": tc.grouped} {
+			for _, order := range [][]string{{"a", "b"}, {"b", "a"}} {
+				t.Run(tc.name+"/"+mode+"/"+order[0]+"-first", func(t *testing.T) {
+					s := newAggregateStore(1, mode, nil, 0.5)
+					s.frecencyCache = tc.frecency
+					s.PrepareQuery("q", "ui", "query", order)
+					data := map[string]string{"a": tc.a, "b": tc.b}
+					for _, plugin := range order {
+						if _, ok := s.update("q", plugin, 1, json.RawMessage(data[plugin])); !ok {
+							t.Fatalf("response rejected for %s", plugin)
+						}
+					}
+
+					q := s.query("q")
+					for range 32 {
+						q.mu.Lock()
+						payload, ok := s.encodeUnlocked(q)
+						if !ok {
+							t.Fatal("could not encode snapshot")
+						}
+						var snap aggregate
+						if err := json.Unmarshal(payload, &snap); err != nil {
+							t.Fatal(err)
+						}
+						var ids []string
+						for _, row := range snap.List {
+							ids = append(ids, row.ID)
+						}
+						if !reflect.DeepEqual(ids, want) {
+							t.Fatalf("snapshot list = %v, want %v", ids, want)
+						}
+					}
+				})
+			}
+		}
+	}
+}
+
 func TestAggregateStoreUpdateUsesConfiguredOrderingMode(t *testing.T) {
 	s := newAggregateStore(10, "grouped", nil, 0.3)
 	s.create("q1", "cli", "hello")

@@ -476,16 +476,18 @@ func orderResults(items []wire.ResultItem, mode string, frecencyScores map[strin
 
 	if mode != "grouped" {
 		sort.SliceStable(items, func(i, j int) bool {
+			if items[i].Score == items[j].Score {
+				return items[i].Plugin < items[j].Plugin
+			}
 			return items[i].Score > items[j].Score
 		})
 		return items
 	}
 
 	type pluginGroup struct {
-		name     string
-		best     float64
-		items    []wire.ResultItem
-		position int
+		name  string
+		best  float64
+		items []wire.ResultItem
 	}
 
 	groupIndex := make(map[string]int)
@@ -496,10 +498,9 @@ func orderResults(items []wire.ResultItem, mode string, frecencyScores map[strin
 			idx = len(groups)
 			groupIndex[item.Plugin] = idx
 			groups = append(groups, pluginGroup{
-				name:     item.Plugin,
-				best:     item.Score,
-				items:    []wire.ResultItem{item},
-				position: idx,
+				name:  item.Plugin,
+				best:  item.Score,
+				items: []wire.ResultItem{item},
 			})
 			continue
 		}
@@ -509,7 +510,10 @@ func orderResults(items []wire.ResultItem, mode string, frecencyScores map[strin
 		groups[idx].items = append(groups[idx].items, item)
 	}
 
-	sort.SliceStable(groups, func(i, j int) bool {
+	sort.Slice(groups, func(i, j int) bool {
+		if groups[i].best == groups[j].best {
+			return groups[i].name < groups[j].name
+		}
 		return groups[i].best > groups[j].best
 	})
 
