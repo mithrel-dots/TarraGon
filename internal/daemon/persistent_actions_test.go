@@ -281,6 +281,7 @@ func TestPersistentTaggedReplyMatching(t *testing.T) {
 	other.readBarrier(t)
 	plugin.reply(t, "", "untagged", true)
 	plugin.reply(t, "unknown", "unmatched", true)
+	plugin.send(t, wire.ActionProgress{Type: wire.MsgActionProgress, ActionID: a.ActionID, Message: "not opted in"})
 	plugin.reply(t, b.ActionID, "b failed", false)
 	if r := second.outcome(t, b, false, ""); r.Message != "b failed" {
 		t.Fatal(r)
@@ -297,6 +298,43 @@ func TestPersistentTaggedReplyMatching(t *testing.T) {
 	plugin.expectSelect(t, "c", "")
 	plugin.reply(t, "", "new legacy connection", true)
 	second.outcome(t, c, true, "")
+}
+
+func TestPersistentTaggedProgressRenewsOnlyItsAction(t *testing.T) {
+	const timeout = 300 * time.Millisecond
+	f := persistentFixture(t, true, timeout)
+	plugin := persistentPlugin(t, f, "p")
+	first, second := f.connectUI(t, f.requests), f.connectUI(t, f.requests)
+	req := click("b")
+	req.UIFeatures = []string{wire.MsgActionProgress}
+	b := second.selectRow(t, req)
+	plugin.expectSelect(t, "b", b.ActionID)
+	a := first.selectRow(t, click("a"))
+	plugin.expectSelect(t, "a", a.ActionID)
+	// B was accepted before A. Keep B busy for longer than both original
+	// deadlines while A receives no progress.
+	end := time.Now().Add(timeout + timeout/2)
+	for time.Now().Before(end) {
+		time.Sleep(timeout / 5)
+		plugin.send(t, wire.ActionProgress{Type: wire.MsgActionProgress, ActionID: b.ActionID, Message: "applying"})
+		var progress wire.ActionProgress
+		second.read(t, &progress)
+		if progress.Type != wire.MsgActionProgress || progress.ActionID != b.ActionID || progress.RequestID != b.RequestID || progress.Message != "applying" {
+			t.Fatalf("invalid progress: %+v", progress)
+		}
+	}
+	// A's late answer precedes B's real answer on the very same reader.
+	plugin.reply(t, a.ActionID, "late a", true)
+	plugin.reply(t, b.ActionID, "real b", true)
+	first.outcome(t, a, false, "completion_unknown")
+	if r := second.outcome(t, b, true, ""); r.Message != "real b" {
+		t.Fatal(r)
+	}
+	plugin.send(t, wire.ActionProgress{Type: wire.MsgActionProgress, ActionID: b.ActionID, Message: "already over"})
+	plugin.readBarrier(t)
+	second.expectStatus(t)
+	first.expectStatus(t)
+	checkPersistentQuery(t, f, plugin)
 }
 
 func TestPersistentTaggedAdmissionBound(t *testing.T) {

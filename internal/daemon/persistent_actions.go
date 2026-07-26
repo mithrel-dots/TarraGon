@@ -158,6 +158,15 @@ func (s *pluginSession) final(resp wire.SelectResponse) bool {
 	return ready
 }
 
+func (s *pluginSession) progress(resp wire.ActionProgress) {
+	s.mu.Lock()
+	a := s.inFlight[resp.ActionID]
+	s.mu.Unlock()
+	if !s.tagged || a == nil || !a.progress(resp.Message) {
+		log.Printf("[PLUGINS] dropping unmatched action_progress from %s (action_id=%q)", s.name, resp.ActionID)
+	}
+}
+
 // Detach every match before the registry makes a replacement visible. Leave
 // publishing outcomes and closing the transport until after releasing its lock.
 func (s *pluginSession) retire() []*selectAction {

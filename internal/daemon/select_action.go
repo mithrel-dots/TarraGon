@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"fmt"
 	"log"
+	"slices"
 	"sync"
 	"time"
 
@@ -25,10 +26,11 @@ type selectAction struct {
 	handler   string
 	action    string
 
-	client   *uiClient
-	received time.Time
-	timeout  time.Duration
-	done     chan struct{}
+	client        *uiClient
+	wantsProgress bool
+	received      time.Time
+	timeout       time.Duration
+	done          chan struct{}
 
 	mu         sync.Mutex
 	deadline   time.Time
@@ -47,18 +49,19 @@ func (ui *uiRegistry) acceptSelect(session context.Context, client *uiClient, re
 		row = req.Text
 	}
 	a := &selectAction{
-		id:        "a-" + rand.Text(),
-		requestID: req.RequestID,
-		owner:     client.uid,
-		queryID:   req.QueryID,
-		producer:  req.Plugin,
-		handler:   req.Plugin,
-		resultID:  row,
-		action:    req.Action,
-		client:    client,
-		received:  time.Now(),
-		timeout:   ui.actionTimeout,
-		done:      make(chan struct{}),
+		id:            "a-" + rand.Text(),
+		requestID:     req.RequestID,
+		owner:         client.uid,
+		queryID:       req.QueryID,
+		producer:      req.Plugin,
+		handler:       req.Plugin,
+		resultID:      row,
+		action:        req.Action,
+		wantsProgress: slices.Contains(req.UIFeatures, wire.MsgActionProgress),
+		client:        client,
+		received:      time.Now(),
+		timeout:       ui.actionTimeout,
+		done:          make(chan struct{}),
 	}
 	a.deadline = a.received.Add(a.timeout)
 	if err := client.send(&wire.SelectAck{Type: "ok", ActionID: a.id, RequestID: a.requestID}); err != nil {
@@ -115,11 +118,27 @@ func (a *selectAction) beginDispatch() bool {
 	return true
 }
 
+func (a *selectAction) progress(message string) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if !a.dispatched || !a.pendingLocked() {
+		return false
+	}
+	a.deadline = time.Now().Add(a.timeout)
+	a.timer.Reset(a.timeout)
+	if a.wantsProgress {
+		// Serialize queue insertion with completion so progress cannot follow
+		// the final. The peer writer, not this goroutine, performs the write.
+		_ = a.client.send(&wire.ActionProgress{Type: wire.MsgActionProgress, ActionID: a.id, RequestID: a.requestID, Message: message})
+	}
+	return true
+}
+
 func (a *selectAction) expire() {
 	a.mu.Lock()
-	if a.terminal {
+	if a.terminal || time.Now().Before(a.deadline) {
 		a.mu.Unlock()
-		return
+		return // a progress frame already reset this timer
 	}
 	a.failLocked("Action deadline expired.")
 }

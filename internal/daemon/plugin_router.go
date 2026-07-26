@@ -254,7 +254,11 @@ func handlePluginConn(ctx context.Context, conn peerConn, registry *pluginRegist
 					return
 				}
 			}
-
+		case wire.MsgActionProgress:
+			var progress wire.ActionProgress
+			if json.Unmarshal(raw, &progress) == nil {
+				session.progress(progress)
+			}
 		}
 	}
 }
