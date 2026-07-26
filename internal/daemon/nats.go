@@ -30,6 +30,7 @@ type daemonBus struct {
 	cancel   context.CancelFunc
 	mu       sync.Mutex
 	sessions sync.WaitGroup
+	calls    map[string]pluginCall // unclaimed calls, guarded by mu
 }
 
 // Port zero disables the TCP listener; Unix adapters use in-process NATS.
@@ -57,7 +58,12 @@ func startNATS(parent context.Context, port int, token string) (*daemonBus, erro
 		return nil, err
 	}
 	ctx, cancel := context.WithCancel(parent)
-	return &daemonBus{server: broker, conn: conn, ctx: ctx, cancel: cancel}, nil
+	b := &daemonBus{server: broker, conn: conn, ctx: ctx, cancel: cancel, calls: make(map[string]pluginCall)}
+	if _, err := conn.Subscribe(execPrefix+"*", b.handlePluginCall); err != nil {
+		b.close()
+		return nil, err
+	}
+	return b, nil
 }
 
 func (b *daemonBus) listenNative(ui, plugin func(peerConn)) error {

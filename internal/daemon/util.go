@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/mithrel-dots/tarragon/internal/plugins"
 	"github.com/mithrel-dots/tarragon/internal/wire"
@@ -33,6 +34,7 @@ func invokeOnCallQuery(ctx context.Context, p *plugins.Plugin, query string) (js
 		return nil, err
 	}
 	cmd := exec.CommandContext(ctx, entry, "tarragon", "query", query)
+	cmd.WaitDelay = time.Second // Descendants may keep stdout/stderr open after cancellation.
 	cmd.Env = onCallEnv(p)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -66,6 +68,7 @@ func invokeOnCallSelect(ctx context.Context, p *plugins.Plugin, resultID, action
 	}
 
 	cmd := exec.CommandContext(ctx, entry, args...)
+	cmd.WaitDelay = time.Second
 	cmd.Env = onCallEnv(p)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout

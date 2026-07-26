@@ -2,11 +2,17 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/mithrel-dots/tarragon/internal/plugins"
+	"github.com/mithrel-dots/tarragon/internal/wire"
 )
 
 func writeScript(t *testing.T, dir, name, body string) string {
@@ -31,6 +37,54 @@ if [[ "$1" == "tarragon" && "$2" == "query" ]]; then echo "{\"ok\":true,\"echo\"
 	}
 	if string(out) != `{"ok":true,"echo":"abc"}` {
 		t.Fatalf("unexpected output: %s", string(out))
+	}
+}
+
+func TestExecutionResponderReportsOversizedReply(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	b := testBus(t, ctx)
+	dir := t.TempDir()
+	writeScript(t, dir, "large", "#!/bin/sh\nhead -c 8388609 /dev/zero\n")
+	p := &plugins.Plugin{Dir: dir, Config: plugins.PluginConfig{Entrypoint: "large"}}
+	if _, err := b.callPlugin(ctx, p, wire.UIRequest{Type: "query"}); err == nil || !strings.Contains(err.Error(), wire.ErrMessageTooLarge.Error()) {
+		t.Fatalf("expected payload error, got %v", err)
+	}
+}
+
+func TestExecutionResponderCancelsRunningQuery(t *testing.T) {
+	b := testBus(t, context.Background())
+	dir := t.TempDir()
+	pidFile := filepath.Join(dir, "pid")
+	t.Setenv("PLUGIN_PID_FILE", pidFile)
+	writeScript(t, dir, "slow", "#!/bin/sh\necho $$ > \"$PLUGIN_PID_FILE\"\nexec sleep 15\n")
+	p := &plugins.Plugin{Dir: dir, Config: plugins.PluginConfig{Entrypoint: "slow"}}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := b.callPlugin(ctx, p, wire.UIRequest{Type: "query"})
+		done <- err
+	}()
+	var pid int
+	for pid == 0 {
+		data, _ := os.ReadFile(pidFile)
+		pid, _ = strconv.Atoi(strings.TrimSpace(string(data)))
+		if ctx.Err() != nil {
+			t.Fatal("plugin did not start")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected query cancellation, got %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for !errors.Is(syscall.Kill(pid, 0), syscall.ESRCH) {
+		if time.Now().After(deadline) {
+			t.Fatal("cancelled plugin still running")
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 
