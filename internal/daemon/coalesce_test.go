@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net"
@@ -78,6 +79,43 @@ func TestSupersedeOnlyMatchingQueryStream(t *testing.T) {
 type stalledConn struct{ net.Conn }
 
 func (stalledConn) SetWriteDeadline(time.Time) error { return nil }
+
+func TestUIWriterCoalescesOnlyBetweenControlMessages(t *testing.T) {
+	server, reader := net.Pipe()
+	defer reader.Close()
+	r := newUIRegistry()
+	c := &uiClient{conn: stalledConn{server}, clientID: "ui"}
+	r.add(c)
+	defer r.remove(c)
+	r.publish(1) // The writer cannot drain more until the reader starts.
+	for i := range 300 {
+		r.publish(&wire.UpdateMessage{Type: "update", QueryID: "a", Payload: []byte{byte(i % 100)}})
+		r.publish(&wire.UpdateMessage{Type: "update", QueryID: "b", Payload: []byte{byte(i % 100)}})
+	}
+	r.publish(2)
+	r.publish(&wire.UpdateMessage{Type: "update", QueryID: "a", Payload: []byte{100}})
+	sc := wire.NewScanner(reader)
+	_ = reader.SetReadDeadline(time.Now().Add(time.Second))
+	control := func(want int) {
+		t.Helper()
+		var got int
+		if err := wire.ReadMsg(sc, &got); err != nil || got != want {
+			t.Fatalf("control %d: got %d, %v", want, got, err)
+		}
+	}
+	snapshot := func(id string, last byte) {
+		t.Helper()
+		var u wire.UpdateMessage
+		if err := wire.ReadMsg(sc, &u); err != nil || u.QueryID != id || !bytes.Equal(u.Payload, []byte{last}) {
+			t.Fatalf("snapshot %s: %+v, %v", id, u, err)
+		}
+	}
+	control(1)
+	snapshot("a", 99)
+	snapshot("b", 99)
+	control(2)
+	snapshot("a", 100)
+}
 
 func TestStalledUIIsIndependentOfOtherClients(t *testing.T) {
 	r := newUIRegistry()

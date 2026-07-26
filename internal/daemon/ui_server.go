@@ -27,9 +27,12 @@ type uiClient struct {
 	out      chan any
 	done     chan struct{}
 	stopOnce sync.Once
+	queueMu  sync.Mutex
+	pending  map[string]*queuedSnapshot
 }
 
 type writeBarrier chan struct{}
+type queuedSnapshot struct{ latest *wire.UpdateMessage }
 
 func (c *uiClient) stop() {
 	c.stopOnce.Do(func() {
@@ -39,6 +42,20 @@ func (c *uiClient) stop() {
 }
 
 func (c *uiClient) send(msg any) error {
+	c.queueMu.Lock()
+	defer c.queueMu.Unlock()
+	if update, ok := msg.(*wire.UpdateMessage); ok {
+		if slot := c.pending[update.QueryID]; slot != nil {
+			slot.latest = update
+			return nil
+		}
+		slot := &queuedSnapshot{latest: update}
+		c.pending[update.QueryID] = slot
+		msg = slot
+	} else {
+		// A control reply or flush barrier must not be overtaken by a later update.
+		clear(c.pending)
+	}
 	select {
 	case c.out <- msg:
 		return nil
@@ -49,6 +66,16 @@ func (c *uiClient) send(msg any) error {
 		c.stop()
 		return net.ErrClosed
 	}
+}
+
+func (c *uiClient) takeSnapshot(slot *queuedSnapshot) *wire.UpdateMessage {
+	c.queueMu.Lock()
+	defer c.queueMu.Unlock()
+	update := slot.latest
+	if c.pending[update.QueryID] == slot {
+		delete(c.pending, update.QueryID)
+	}
+	return update
 }
 
 // uiRegistry tracks active UI clients.
@@ -66,6 +93,7 @@ func newUIRegistry() *uiRegistry {
 
 func (r *uiRegistry) add(c *uiClient) {
 	c.out = make(chan any, 128)
+	c.pending = make(map[string]*queuedSnapshot)
 	c.done = make(chan struct{})
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -80,6 +108,9 @@ func (r *uiRegistry) add(c *uiClient) {
 			case <-c.done:
 				return
 			case msg := <-c.out:
+				if slot, ok := msg.(*queuedSnapshot); ok {
+					msg = c.takeSnapshot(slot)
+				}
 				if barrier, ok := msg.(writeBarrier); ok {
 					close(barrier)
 					continue
