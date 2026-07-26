@@ -4,12 +4,13 @@ Disclaimer: This documentation was created with the help of an AI assistant. It 
 
 The daemon routes UI traffic through embedded NATS. Use the Unix socket adapter for NDJSON, or connect to the broker directly.
 
-### Native NATS session
+## Native NATS session
 
 1. Enable the [loopback listener](../README.md#core-architecture) and connect with the configured token. Give the token only to trusted local clients: it grants access to the whole bus.
 2. Send an empty NATS request to `tarragon.ui.open` (plugins use `tarragon.plugin.open`). The plain-text reply is a session subject, `tarragon.session.<id>`.
-3. Subscribe to `<session>.out` before publishing to `<session>.in`. Each message carries one JSON envelope, with the same fields as the socket protocol below.
-4. Send an empty message on `.in` every 30 seconds when idle. Send the literal `close` to end the session. On a `close` reply, disconnect, or 90 seconds without input, open a new session before sending more requests.
+3. Check that the reply starts with `tarragon.session.`, then subscribe to `<session>.out`. Flush the subscription before sending your first query. Publish `{"type":"query","text":"hello"}` to `<session>.in` (a publish, not a NATS request). Each JSON envelope is one NATS message.
+4. Read the `ack` on `.out`, then follow `update` messages for its `query_id`. Base64-decode `payload`, parse the JSON, and replace the displayed list. The query is complete when no entry in `plugins` is `pending`.
+5. Send an empty message on `.in` every 30 seconds when idle. Send the literal `close` to end the session. On a `close` reply, disconnect, or 90 seconds without input, open a new session before sending more requests.
 
 ## Responsibilities of a UI
 
@@ -19,12 +20,7 @@ The daemon routes UI traffic through embedded NATS. Use the Unix socket adapter 
 - Use per-plugin query state metadata to show which plugins are still pending, returned no entries, or failed.
 - Optionally support a `detach` control to ask the daemon to purge your aggregates when the UI exits.
 
-## Endpoints
-
-- UI ↔ Daemon (single bidirectional connection): resolved by the daemon at
-  startup (see "Socket Location" below).
-
-### Socket Location
+## Unix socket adapter
 
 The daemon resolves the UI socket path at startup, in order:
 
@@ -39,7 +35,7 @@ removes a stale leftover socket file if one is present. UI clients should
 implement the same resolution order (or read `TARRAGON_UI_SOCKET` directly)
 rather than hardcoding a path.
 
-## Minimal Flow
+### Socket query flow
 
 1) Connect to the resolved UI Unix socket path (see above).
 2) For each input:
@@ -96,7 +92,7 @@ NDJSON framing means each message is exactly one JSON object on one line, termin
 
 - Concurrency: Multiple queries can run concurrently on the same connection.
 - Snapshots: Each update contains the full current aggregate. One update can include several plugin responses; use the `plugins` map rather than counting messages to detect completion.
-- Backpressure: Keep reading while rendering. If a UI falls behind the bounded outgoing queue or times out on a write, the daemon disconnects that UI. Reconnect and resend the active query to resume.
+- Backpressure: Keep reading while rendering. The daemon replaces queued snapshots for the same query with newer ones. If the writer's bounded queue fills or a socket write times out, that session closes. After a disconnect or NATS slow-consumer error, open a new session and resend the active query; snapshots are not replayed.
 - Plugin progress: the aggregate snapshot includes a `plugins` map keyed by stable plugin ID. UIs can render pending/empty/error states and compute pending elapsed time from `started_at_unix_ms`.
 
 ### Lifecycle-aware availability
@@ -110,17 +106,18 @@ When consuming daemon status metadata:
 
 ## Message Shapes
 
-- Query (UI → Daemon, NDJSON line):
+- Query (UI → Daemon):
   - `{ "type": "query", "client_id": "<string>", "text": "<input>" }`
-- Detach (UI → Daemon, NDJSON line):
+- Detach (UI → Daemon):
   - `{ "type": "detach", "client_id": "<string>" }`
-- Ack (Daemon → UI, NDJSON line):
+- Ack (Daemon → UI):
   - `{ "type": "ack", "query_id": "<id>" }`
-- Update (Daemon → UI, NDJSON line):
+- Update (Daemon → UI):
   - `{ "type": "update", "query_id": "<id>", "payload": "<base64-encoded AggregateSnapshot JSON>" }`
   - `payload` is Tarragon's Go `[]byte` field, which `encoding/json` marshals as a
     standard base64 string, **not** an inline JSON object. Base64-decode it
     first, then parse the decoded bytes as JSON to get the AggregateSnapshot.
+- Error (Daemon → UI): `{"type":"error","query_id":"<id>","error":"..."}`. An encoded envelope, including base64, can be at most 8 MiB. If a snapshot exceeds that limit, the UI receives this error instead of that update; the session stays open.
 - AggregateSnapshot (after base64-decoding `payload`):
   - `{"query_id":"<id>","input":"<input>","started_at_unix_ms":<epoch-ms>,"results":{"<plugin>":{"elapsed_ms":<float>,"data":<plugin JSON>}, ...},"plugins":{"<plugin>":{"state":"pending|done|empty|error","count":<int>,"elapsed_ms":<float>,"error":"<message>"}},"list":[...]}`
 
@@ -186,6 +183,7 @@ func resolveUISocketPath() string {
 
 conn, _ := net.Dial("unix", resolveUISocketPath())
 scanner := bufio.NewScanner(conn)
+scanner.Buffer(make([]byte, 64*1024), (8<<20)+1)
 
 query, _ := json.Marshal(map[string]any{"type":"query","client_id":"cli-1","text":"hello"})
 conn.Write(append(query, '\n'))

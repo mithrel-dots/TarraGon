@@ -7,7 +7,7 @@ A highly extensible automation and interaction framework with a language-agnosti
 ## Core Purpose
 
 - **Primary**: Provide a fast, lightweight core that aggregates and routes requests/responses between plugins and external frontends (CLI, GUI, or custom).
-- **Secondary**: Enable easy plugin development in any language through a well-defined IPC protocol (Unix Domain Sockets + NDJSON), supporting rich use-cases like:
+- **Secondary**: Enable plugin development in any language using JSON messages over NATS or a Unix socket adapter, supporting use cases like:
   - application launching (one of the original use cases)
   - calculations and unit conversions
   - web/API integrations
@@ -26,6 +26,8 @@ Every daemon starts an embedded NATS broker. [Frontends](docs/ui.md) and [persis
 
 No separate NATS service is required. To connect a native client, set `nats_tcp = true` and supply `TARRAGON_NATS_TOKEN` to the daemon and client. The listener defaults to `127.0.0.1:4222` (`nats_port`). Leave TCP off to use only the compatibility sockets; their traffic still goes through NATS.
 
+Restart the daemon after changing listener settings. `run_ipc` controls only `ui.sock`. Native clients need no Unix socket support, but the daemon still requires Unix sockets for its plugin listener.
+
 ### How a suggestion reaches the UI
 
 1. **Route.** The daemon returns a `query_id`. A matching prefix targets one plugin; an unprefixed query goes to all eligible plugins.
@@ -33,17 +35,6 @@ No separate NATS service is required. To connect a native client, set `nats_tcp 
 3. **Display.** The daemon ranks the results so far and sends a [full snapshot](docs/ui.md#message-shapes). The UI replaces its list without waiting for every plugin.
 
 **Ranking.** SQLite records how often and how recently you select each result. The daemon caches these scores at startup and refreshes them after each selection. By default, ranking blends 70% plugin score with 30% selection history (`frecency_weight`).
-
-### UDS, NATS and combined transports
-
-The following are [benchmark paths](#plugin-benchmarking). Direct UDS is a comparison baseline; the daemon always uses the broker.
-
-| Path | How messages travel |
-| --- | --- |
-| Direct UDS (`uds`) | Plugin and UI exchange NDJSON directly with the core over Unix sockets. |
-| Native NATS (`nats-tcp`) | Plugin and UI publish and subscribe through an embedded broker over loopback TCP. |
-| Combined (`nats-uds-bridge`) | A Unix socket carries native NATS bytes unchanged to the broker. |
-| Combined (`uds-adapter`) | An adapter translates between NDJSON lines on a Unix socket and NATS messages. |
 
 To rebuild the diagram, install [D2](https://d2lang.com/tour/install/), edit the [source](docs/diagrams/architecture.d2), and run `just diagram`.
 
@@ -87,9 +78,16 @@ Benchmarks run from a source checkout; they are not included in the installed `t
 
 - `just bench` connects to a running daemon like an external frontend, sends queries through the UI socket, and prints plugin latency results as a table.
 - `just bench ipc` runs a separate suggestion-delivery experiment. It starts its own core, persistent fixture plugin processes, and headless UI. No running daemon or installed plugins are needed.
-- `just bench ipc --matrix --samples 2000 --warmup 200 --rounds 3` measures the [direct, native NATS, and combined transport paths](#uds-nats-and-combined-transports).
+- `just bench ipc --matrix --samples 2000 --warmup 200 --rounds 3` compares the transport paths below.
 - For congestion, try `just bench ipc --plugins 50 --burst 8 --samples 80 --warmup 16 --rounds 3`. Each plugin returns one small suggestion per query. The UI sends each burst back-to-back, then waits for every plugin's suggestion for every query before starting the next burst. Use `--burst 1` at the same plugin count as a control. Both flags default to 1.
 - The table reports mean/p50/p95/p99 in microseconds for plugin encode to core decode, aggregation (including contention), outbound update to UI decode, and end to end. The UI times the first appearance of each `(query, plugin)` in cumulative snapshots. `Query->first` and `Query->all` start at UI query send; `Queries/s` measures completed queries over the elapsed UI measurement window. Startup, warmup, and rendering are excluded. A missing or mismatched suggestion fails the run.
+
+| Benchmark path | How messages travel |
+| --- | --- |
+| Direct UDS (`uds`) | NDJSON over Unix sockets to the fixture core, bypassing NATS for comparison. |
+| Native NATS (`nats-tcp`) | NATS messages over loopback TCP. |
+| Unix bridge (`nats-uds-bridge`) | Native NATS bytes forwarded unchanged over a Unix socket. |
+| Unix adapter (`uds-adapter`) | NDJSON on a Unix socket translated to and from NATS messages. |
 
 ### Plugin Installation & Security
 - **Bundled plugin sources**: First-party bundled plugins live in `plugins/`.

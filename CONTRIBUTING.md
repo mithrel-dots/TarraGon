@@ -32,7 +32,7 @@ Testing & benchmarks
 - `just test-cover`: Generate a coverage report.
 - `just bench`: Run the plugin benchmark against a running daemon.
 - `just bench ipc`: Run the isolated transport benchmark. Both recipes use `go run ./tools/bench` from the checkout.
-- `just bench ipc --matrix`: Compare direct UDS with nine [NATS transport combinations](README.md#uds-nats-and-combined-transports). The benchmark starts its own broker.
+- `just bench ipc --matrix`: Compare direct UDS with nine [NATS transport combinations](README.md#plugin-benchmarking). The benchmark starts its own broker.
 - `just go-bench`: Run Go-level benchmark functions.
 
 Linting & formatting
