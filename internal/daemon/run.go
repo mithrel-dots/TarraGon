@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -63,12 +64,9 @@ func RunDaemon() error {
 	// Start plugin listener BEFORE spawning plugin processes, so the
 	// socket is ready to accept connections when plugins start.
 	reqOut, registry := startPluginRouter(ctx, store)
-	port := 0
-	if viper.GetBool("nats_tcp") {
-		port = viper.GetInt("nats_port")
-		if port < 1 || port > 65535 {
-			return fmt.Errorf("nats_port must be between 1 and 65535")
-		}
+	port, err := natsListenPort()
+	if err != nil {
+		return err
 	}
 	bus, err := startNATS(ctx, port, os.Getenv("TARRAGON_NATS_TOKEN"))
 	if err != nil {
@@ -105,6 +103,18 @@ func RunDaemon() error {
 	<-ctx.Done()
 	log.Println("Daemon shutting down.")
 	return nil
+}
+
+func natsListenPort() (int, error) {
+	if !viper.GetBool("nats_tcp") {
+		return 0, nil
+	}
+	raw := viper.GetString("nats_port")
+	port, err := strconv.Atoi(raw)
+	if err != nil || port < 1 || port > 65535 {
+		return 0, fmt.Errorf("nats_port must be an integer between 1 and 65535, got %q", raw)
+	}
+	return port, nil
 }
 
 // pluginStopTimeout resolves the configured plugin shutdown grace period,

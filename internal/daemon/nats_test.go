@@ -13,6 +13,7 @@ import (
 	"github.com/mithrel-dots/tarragon/internal/plugins"
 	"github.com/mithrel-dots/tarragon/internal/wire"
 	"github.com/nats-io/nats.go"
+	"github.com/spf13/viper"
 )
 
 func testBus(t testing.TB, ctx context.Context) *daemonBus {
@@ -23,6 +24,17 @@ func testBus(t testing.TB, ctx context.Context) *daemonBus {
 	}
 	t.Cleanup(b.close)
 	return b
+}
+
+func TestNativeListenerRejectsInvalidPorts(t *testing.T) {
+	defer viper.Reset()
+	viper.Set("nats_tcp", true)
+	for _, raw := range []any{0, -1, 65536, 1.5, true, "invalid"} {
+		viper.Set("nats_port", raw)
+		if port, err := natsListenPort(); err == nil {
+			t.Errorf("accepted %v as port %d", raw, port)
+		}
+	}
 }
 
 // A socket-only exchange must also be observable on the broker. A working
