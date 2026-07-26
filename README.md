@@ -20,31 +20,32 @@ Plugins can be invoked directly or contextually, and can expose commands, values
 
 ## Core Architecture
 
-The running daemon uses Unix domain sockets (UDS). A frontend attaches to `ui.sock`; persistent plugins connect to `plugins.sock`. Both sockets carry newline-delimited JSON (NDJSON). On-call plugins instead receive a command-line invocation and return JSON on stdout.
+Every daemon starts an embedded NATS broker. [Frontends](docs/ui.md) and [persistent plugins](docs/plugins.md) can keep using `ui.sock` and `plugins.sock`: the adapters translate each JSON line into a NATS message and translate replies back. On-call plugins keep their command-line interface; an execution adapter carries their requests and results over NATS.
 
-![Frontends send queries to the TarraGon core, which gathers plugin replies and streams ranked snapshots. SQLite selection history feeds the ranking cache. Dashed routes show how the benchmark connects equivalent UI and plugin fixtures through embedded NATS.](docs/diagrams/architecture.svg)
+![Native clients and compatibility adapters exchange messages with the daemon core through embedded NATS. The core ranks plugin results using SQLite selection history.](docs/diagrams/architecture.svg)
 
-**Solid lines** trace the running daemon. **Dashed lines** trace the IPC benchmark: fixtures take the place of the UI and plugins, and the benchmark runs the same aggregation code in its own process.
+No separate NATS service is required. To connect a native client, set `nats_tcp = true` and supply `TARRAGON_NATS_TOKEN` to the daemon and client. The listener defaults to `127.0.0.1:4222` (`nats_port`). Leave TCP off to use only the compatibility sockets; their traffic still goes through NATS.
 
 ### How a suggestion reaches the UI
 
-1. **Dispatch.** The [daemon router](internal/daemon/ui_server.go) acknowledges the query with a `query_id` and publishes an initial snapshot with the target plugins marked `pending`. A matching prefix selects one plugin and is stripped before dispatch. An unprefixed query fans out to eligible general-suggestion plugins.
-2. **Gather.** As each plugin replies, the [query store](internal/daemon/aggregate.go) normalizes its JSON into result items and replaces that plugin’s previous batch for the same `query_id`. Other plugins’ items stay in the snapshot. The daemon tracks each target as `pending`, `done`, `empty`, or `error`.
-3. **Publish.** One publisher per query combines replies that arrive while it is busy, ranks the accumulated items, and queues a full `update` for each connected UI. The frontend base64-decodes the [snapshot payload](docs/ui.md#message-shapes) and replaces its displayed list for that `query_id`. The first plugin’s suggestions can appear while other plugins are still pending.
+1. **Route.** The daemon returns a `query_id`. A matching prefix targets one plugin; an unprefixed query goes to all eligible plugins.
+2. **Merge.** The daemon normalizes each reply and replaces only that plugin’s results for the query.
+3. **Display.** The daemon ranks the results so far and sends a [full snapshot](docs/ui.md#message-shapes). The UI replaces its list without waiting for every plugin.
 
-**Frecency and ranking.** On `select`, the daemon asynchronously increments the selection count and records the last selection time for the `(plugin ID, result ID)` pair in SQLite. The file defaults to `$XDG_STATE_HOME/tarragon/tarragon.db` (normally `~/.local/state/tarragon/tarragon.db`); `db_path` overrides it.
-
-At startup and after a selection write, the daemon [computes frecency](internal/db/db.go) as `selection count × exp(−0.1 × days since last selection)` and refreshes an in-memory cache. Ranking reads the cache on each snapshot. With the default `frecency_weight` of `0.3`, the final score is `0.7 × plugin score + 0.3 × cached frecency`.
+**Ranking.** SQLite records how often and how recently you select each result. The daemon caches these scores at startup and refreshes them after each selection. By default, ranking blends 70% plugin score with 30% selection history (`frecency_weight`).
 
 ### UDS, NATS and combined transports
 
-The [IPC benchmark](#plugin-benchmarking) measures two connections: **plugin → benchmark core** carries a suggestion; **benchmark core → UI** carries a ranked snapshot. Its query store is transient and never opens the user’s frecency DB.
+The following are [benchmark paths](#plugin-benchmarking). Direct UDS is a comparison baseline; the daemon always uses the broker.
 
-- **Direct UDS (`uds`):** the plugin writes a response as one NDJSON line. The core reads it directly and writes the cumulative update to the UI’s Unix socket.
-- **Native NATS (`nats-tcp`):** the plugin publishes JSON on `bench.<plugin>.out` over loopback TCP. The embedded Core NATS broker delivers it to the benchmark core’s in-process subscription. After aggregation, the core publishes to `bench.ui.in`, which the UI subscribes to. Queries and plugin requests travel the other way on `bench.ui.out` and `bench.<plugin>.in`.
-- **Combined (UDS + NATS):** `nats-uds-bridge` carries native NATS protocol bytes over a Unix socket and forwards them unchanged to the broker’s in-process connection. `uds-adapter` lets a peer keep speaking NDJSON: it publishes one NATS message per socket line and restores the newline in the reverse direction. With `--matrix`, each connection independently uses `nats-tcp`, `nats-uds-bridge`, or `uds-adapter`: nine broker-backed pairings plus the separate `uds`/`uds` baseline.
+| Path | How messages travel |
+| --- | --- |
+| Direct UDS (`uds`) | Plugin and UI exchange NDJSON directly with the core over Unix sockets. |
+| Native NATS (`nats-tcp`) | Plugin and UI publish and subscribe through an embedded broker over loopback TCP. |
+| Combined (`nats-uds-bridge`) | A Unix socket carries native NATS bytes unchanged to the broker. |
+| Combined (`uds-adapter`) | An adapter translates between NDJSON lines on a Unix socket and NATS messages. |
 
-To regenerate the SVG locally, edit the [diagram source](docs/diagrams/architecture.d2) and run `just diagram` with the [D2 CLI](https://d2lang.com/tour/install/) installed. The source selects the Dagre layout.
+To rebuild the diagram, install [D2](https://d2lang.com/tour/install/), edit the [source](docs/diagrams/architecture.d2), and run `just diagram`.
 
 ---
 
@@ -70,7 +71,7 @@ Use **open** to search a plugin by its prefix, **enable** or **disable** to chan
 ### Plugin System
 - **Integrated Suggestions**: Seamlessly blends suggestions from eligible plugins, including bundled plugins for installed applications and other local tasks.
 - **Language Agnostic**: Plugins are external executables or scripts.
-- **Persistent Processes & IPC**: For responsiveness, plugins providing real-time suggestions typically run as persistent processes managed by the launcher daemon, communicating via efficient IPC (Unix Domain Sockets + NDJSON). TCP-related config exists as a future-facing placeholder, but the current daemon starts Unix socket IPC only. This avoids per-keystroke lag.
+- **Persistent plugins** stay running between queries and stream suggestions over the broker.
 - **Plugin Lifecycle Modes**: Plugins declare their required lifecycle:
     - `daemon`: Runs persistently alongside the launcher daemon (e.g., clipboard manager).
     - `on_demand_persistent`: Started when first needed for a query and kept running afterward.

@@ -8,8 +8,8 @@ import (
 var daemonCmd = &cobra.Command{
 	Use:   "daemon",
 	Short: "Run the Tarragon daemon",
-	Run: func(cmd *cobra.Command, args []string) {
-		daemon.RunDaemon()
+	RunE: func(cmd *cobra.Command, args []string) error {
+		return daemon.RunDaemon()
 	},
 }
 

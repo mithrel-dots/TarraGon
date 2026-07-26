@@ -1,7 +1,6 @@
 package daemon
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"net"
@@ -29,9 +28,9 @@ func TestUIServer_AckAndUpdateOverUDS(t *testing.T) {
 	store := newAggregateStore(10, "global", nil, 0.3)
 	uiReg := newUIRegistry()
 	reqOut := make(chan pluginRequest, 16)
-	plugReg := &pluginRegistry{conns: map[string]net.Conn{}, scanners: map[string]*bufio.Scanner{}}
+	plugReg := &pluginRegistry{}
 
-	go startUIServer(ctx, mgr, reqOut, plugReg, store, uiReg, nil)
+	testUIListener(t, ctx, mgr, reqOut, plugReg, store, uiReg, nil)
 
 	deadline := time.Now().Add(3 * time.Second)
 	var conn net.Conn
@@ -110,13 +109,13 @@ func TestUIServer_SelectAndDetachAck(t *testing.T) {
 	store := newAggregateStore(10, "global", database, 0.3)
 	uiReg := newUIRegistry()
 	reqOut := make(chan pluginRequest, 16)
-	plugReg := &pluginRegistry{conns: map[string]net.Conn{}, scanners: map[string]*bufio.Scanner{}}
+	plugReg := &pluginRegistry{}
 
 	c1, c2 := net.Pipe()
 	plugReg.set("plug_connected", c1, wire.NewScanner(c1))
 	defer func() { _ = c2.Close() }()
 
-	go startUIServer(ctx, mgr, reqOut, plugReg, store, uiReg, database)
+	testUIListener(t, ctx, mgr, reqOut, plugReg, store, uiReg, database)
 
 	deadline := time.Now().Add(3 * time.Second)
 	var conn net.Conn
@@ -206,9 +205,9 @@ func TestUIServer_StatusIncludesPluginSourceMetadata(t *testing.T) {
 	store := newAggregateStore(10, "global", nil, 0.3)
 	uiReg := newUIRegistry()
 	reqOut := make(chan pluginRequest, 16)
-	plugReg := &pluginRegistry{conns: map[string]net.Conn{}, scanners: map[string]*bufio.Scanner{}}
+	plugReg := &pluginRegistry{}
 
-	go startUIServer(ctx, mgr, reqOut, plugReg, store, uiReg, nil)
+	testUIListener(t, ctx, mgr, reqOut, plugReg, store, uiReg, nil)
 
 	deadline := time.Now().Add(3 * time.Second)
 	var conn net.Conn
@@ -270,9 +269,9 @@ func TestUIServer_OnCallSelectInvokesCLI(t *testing.T) {
 	store := newAggregateStore(10, "global", nil, 0.3)
 	uiReg := newUIRegistry()
 	reqOut := make(chan pluginRequest, 16)
-	plugReg := &pluginRegistry{conns: map[string]net.Conn{}, scanners: map[string]*bufio.Scanner{}}
+	plugReg := &pluginRegistry{}
 
-	go startUIServer(ctx, mgr, reqOut, plugReg, store, uiReg, nil)
+	testUIListener(t, ctx, mgr, reqOut, plugReg, store, uiReg, nil)
 
 	deadline := time.Now().Add(3 * time.Second)
 	var conn net.Conn
@@ -371,7 +370,7 @@ func TestUIServer_ReloadDiscoversNewPlugins(t *testing.T) {
 	store := newAggregateStore(10, "global", nil, 0.3)
 	uiReg := newUIRegistry()
 	reqOut := make(chan pluginRequest, 8)
-	plugReg := &pluginRegistry{conns: map[string]net.Conn{}, scanners: map[string]*bufio.Scanner{}}
+	plugReg := &pluginRegistry{}
 
 	serverConn, clientConn := net.Pipe()
 	defer func() { _ = clientConn.Close() }()
@@ -439,7 +438,7 @@ func TestUIServer_RestartReportsPerPluginOutcome(t *testing.T) {
 	store := newAggregateStore(10, "global", nil, 0.3)
 	uiReg := newUIRegistry()
 	reqOut := make(chan pluginRequest, 8)
-	plugReg := &pluginRegistry{conns: map[string]net.Conn{}, scanners: map[string]*bufio.Scanner{}}
+	plugReg := &pluginRegistry{}
 
 	serverConn, clientConn := net.Pipe()
 	defer func() { _ = clientConn.Close() }()
@@ -514,7 +513,7 @@ func TestUIServer_RestartTargetsSinglePlugin(t *testing.T) {
 	store := newAggregateStore(10, "global", nil, 0.3)
 	uiReg := newUIRegistry()
 	reqOut := make(chan pluginRequest, 8)
-	plugReg := &pluginRegistry{conns: map[string]net.Conn{}, scanners: map[string]*bufio.Scanner{}}
+	plugReg := &pluginRegistry{}
 
 	serverConn, clientConn := net.Pipe()
 	defer func() { _ = clientConn.Close() }()
@@ -550,7 +549,7 @@ func TestUIServer_RestartUnknownPluginFails(t *testing.T) {
 	store := newAggregateStore(10, "global", nil, 0.3)
 	uiReg := newUIRegistry()
 	reqOut := make(chan pluginRequest, 8)
-	plugReg := &pluginRegistry{conns: map[string]net.Conn{}, scanners: map[string]*bufio.Scanner{}}
+	plugReg := &pluginRegistry{}
 
 	serverConn, clientConn := net.Pipe()
 	defer func() { _ = clientConn.Close() }()
@@ -590,7 +589,7 @@ func TestDispatchQuery_GlobalRespectsGeneralSuggestionEligibility(t *testing.T) 
 	store.create("q-global", "cli", "hello")
 	uiReg := newUIRegistry()
 	reqOut := make(chan pluginRequest, 16)
-	plugReg := &pluginRegistry{conns: map[string]net.Conn{}, scanners: map[string]*bufio.Scanner{}}
+	plugReg := &pluginRegistry{}
 
 	for _, name := range []string{"daemon_general", "daemon_no_general", "daemon_require_prefix", "ondemand_general", "ondemand_no_general"} {
 		srv, cli := net.Pipe()
@@ -601,6 +600,7 @@ func TestDispatchQuery_GlobalRespectsGeneralSuggestionEligibility(t *testing.T) 
 		plugReg.set(name, srv, wire.NewScanner(srv))
 	}
 
+	plugReg.bus = testBus(t, ctx)
 	dispatchQuery(ctx, "hello", "q-global", mgr, reqOut, plugReg, store, uiReg, false, "")
 
 	routed := map[string]bool{}
@@ -651,7 +651,7 @@ func TestDispatchQuery_ExplicitTargetBypassesGeneralEligibility(t *testing.T) {
 	store.create("q-target", "cli", "query")
 	uiReg := newUIRegistry()
 	reqOut := make(chan pluginRequest, 16)
-	plugReg := &pluginRegistry{conns: map[string]net.Conn{}, scanners: map[string]*bufio.Scanner{}}
+	plugReg := &pluginRegistry{}
 
 	for _, name := range []string{"target", "other"} {
 		srv, cli := net.Pipe()
@@ -702,7 +702,7 @@ func TestDispatchQuery_PartialPrefixDoesNotFanOutToGeneralPlugins(t *testing.T) 
 	store.create("q-partial", "cli", "@a")
 	uiReg := newUIRegistry()
 	reqOut := make(chan pluginRequest, 16)
-	plugReg := &pluginRegistry{conns: map[string]net.Conn{}, scanners: map[string]*bufio.Scanner{}}
+	plugReg := &pluginRegistry{}
 	srv, cli := net.Pipe()
 	t.Cleanup(func() {
 		_ = srv.Close()

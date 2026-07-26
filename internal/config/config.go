@@ -33,10 +33,12 @@ type ConfigOption struct {
 // GetConfigOptions returns the default configuration options
 func GetConfigOptions() []ConfigOption {
 	return []ConfigOption{
+		{Key: "nats_tcp", Value: false, Comment: "Expose embedded NATS on loopback TCP (requires TARRAGON_NATS_TOKEN)"},
+		{Key: "nats_port", Value: 4222, Comment: "Loopback port for the embedded NATS server"},
 		{
 			Key:     "run_tcp",
 			Value:   false,
-			Comment: "Reserved for future TCP server support; current daemon uses Unix sockets",
+			Comment: "Reserved; use nats_tcp for native NATS clients",
 		},
 		{
 			Key:     "run_ipc",

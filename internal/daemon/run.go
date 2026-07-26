@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
@@ -16,8 +17,8 @@ import (
 )
 
 // RunDaemon composes the daemon services and blocks until shutdown.
-func RunDaemon() {
-	ctx, cancel := context.WithCancel(context.Background())
+func RunDaemon() error {
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
 	pluginDir := plugins.DefaultDir()
@@ -31,14 +32,6 @@ func RunDaemon() {
 		log.Printf("Plugin override error: %v", err)
 	}
 	defer mgr.StopAll()
-
-	sigs := make(chan os.Signal, 1)
-	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		<-sigs
-		log.Println("Shutdown signal received.")
-		cancel()
-	}()
 
 	// Aggregates store with configurable limit
 	maxAgg := viper.GetInt("max_aggregates")
@@ -69,9 +62,39 @@ func RunDaemon() {
 
 	// Start plugin listener BEFORE spawning plugin processes, so the
 	// socket is ready to accept connections when plugins start.
-	reqOut, registry := startPluginListener(ctx, store, ui)
+	reqOut, registry := startPluginRouter(ctx, store)
+	port := 0
+	if viper.GetBool("nats_tcp") {
+		port = viper.GetInt("nats_port")
+		if port < 1 || port > 65535 {
+			return fmt.Errorf("nats_port must be between 1 and 65535")
+		}
+	}
+	bus, err := startNATS(ctx, port, os.Getenv("TARRAGON_NATS_TOKEN"))
+	if err != nil {
+		return fmt.Errorf("start NATS: %w", err)
+	}
+	defer bus.close()
+	registry.bus = bus
+	handleUI := func(conn peerConn) { handleUIClient(ctx, conn, mgr, reqOut, registry, store, ui, database) }
+	handlePlugin := func(conn peerConn) { handlePluginConn(ctx, conn, registry, store, ui) }
+	if port != 0 {
+		if err := bus.listenNative(handleUI, handlePlugin); err != nil {
+			return err
+		}
+		log.Printf("[NATS] listening on 127.0.0.1:%d", port)
+	}
+	ln, err := bus.listenUnix(wire.ResolvePluginsSocketPath(), handlePlugin)
+	if err != nil {
+		return err
+	}
+	defer ln.Close()
 	if viper.GetBool("run_ipc") {
-		go startUIServer(ctx, mgr, reqOut, registry, store, ui, database)
+		uiListener, err := bus.listenUnix(wire.ResolveUISocketPath(), handleUI)
+		if err != nil {
+			return err
+		}
+		defer uiListener.Close()
 	}
 
 	// Now start persistent plugin processes; the listener is already up.
@@ -81,6 +104,7 @@ func RunDaemon() {
 
 	<-ctx.Done()
 	log.Println("Daemon shutting down.")
+	return nil
 }
 
 // pluginStopTimeout resolves the configured plugin shutdown grace period,

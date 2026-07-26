@@ -4,9 +4,11 @@ This guide explains how plugins integrate with the Tarragon daemon today.
 
 Plugins declare a lifecycle in `plugin.toml`, and Tarragon runs them according to that lifecycle:
 
-1. `daemon`: a persistent process speaking NDJSON over a Unix Domain Socket.
+1. `daemon`: a persistent process connected through NATS or the Unix socket adapter.
 2. `on_demand_persistent`: a persistent process that Tarragon starts on first use, then keeps running until the daemon shuts down or the plugin is stopped.
 3. `on_call`: an ephemeral CLI plugin invoked as `entrypoint tarragon <subcommand>`.
+
+**Native NATS:** open a [session](ui.md#native-nats-session) on `tarragon.plugin.open`. Subscribe to `.out` for requests, then send your usual `hello` and responses on `.in`. Existing socket plugins need no changes.
 
 ## Directory Layout and Install
 

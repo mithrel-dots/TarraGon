@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"log"
-	"net"
 	"sort"
 	"sync"
 	"time"
@@ -16,16 +15,17 @@ import (
 
 // pluginRegistry tracks connected plugins by name.
 type pluginRegistry struct {
+	bus      *daemonBus
 	mu       sync.RWMutex
-	conns    map[string]net.Conn
+	conns    map[string]peerConn
 	scanners map[string]*bufio.Scanner
 }
 
-func (r *pluginRegistry) set(name string, conn net.Conn, scanner *bufio.Scanner) {
+func (r *pluginRegistry) set(name string, conn peerConn, scanner *bufio.Scanner) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.conns == nil {
-		r.conns = make(map[string]net.Conn)
+		r.conns = make(map[string]peerConn)
 	}
 	if r.scanners == nil {
 		r.scanners = make(map[string]*bufio.Scanner)
@@ -37,7 +37,7 @@ func (r *pluginRegistry) set(name string, conn net.Conn, scanner *bufio.Scanner)
 	r.scanners[name] = scanner
 }
 
-func (r *pluginRegistry) remove(name string, conn net.Conn) {
+func (r *pluginRegistry) remove(name string, conn peerConn) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.conns[name] != conn {
@@ -67,7 +67,7 @@ func (r *pluginRegistry) Names() []string {
 	return names
 }
 
-func (r *pluginRegistry) getConn(name string) (net.Conn, bool) {
+func (r *pluginRegistry) getConn(name string) (peerConn, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	c, ok := r.conns[name]
@@ -84,35 +84,8 @@ type pluginRequest struct {
 	msgType  string
 }
 
-func startPluginListener(ctx context.Context, store *aggregateStore, ui *uiRegistry) (chan<- pluginRequest, *pluginRegistry) {
-	socketPath := wire.ResolvePluginsSocketPath()
-	ln, err := wire.ListenUnix(socketPath)
-	if err != nil {
-		log.Fatalf("[PLUGINS] Failed to listen on %s: %v", socketPath, err)
-	}
-	go func() {
-		<-ctx.Done()
-		_ = ln.Close()
-		_ = wire.CleanupSocket(socketPath)
-	}()
-
-	log.Printf("[PLUGINS] listening on %s", socketPath)
-	registry := &pluginRegistry{conns: make(map[string]net.Conn), scanners: make(map[string]*bufio.Scanner)}
-
-	go func() {
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				if ctx.Err() != nil {
-					return
-				}
-				log.Printf("[PLUGINS] accept error: %v", err)
-				continue
-			}
-			go handlePluginConn(ctx, conn, registry, store, ui)
-		}
-	}()
-
+func startPluginRouter(ctx context.Context, store *aggregateStore) (chan<- pluginRequest, *pluginRegistry) {
+	registry := &pluginRegistry{}
 	reqChan := make(chan pluginRequest, 256)
 	go func() {
 		for {
@@ -166,7 +139,7 @@ func startPluginListener(ctx context.Context, store *aggregateStore, ui *uiRegis
 	return reqChan, registry
 }
 
-func handlePluginConn(ctx context.Context, conn net.Conn, registry *pluginRegistry, store *aggregateStore, ui *uiRegistry) {
+func handlePluginConn(ctx context.Context, conn peerConn, registry *pluginRegistry, store *aggregateStore, ui *uiRegistry) {
 	scanner := wire.NewScanner(conn)
 	var hello wire.PluginHello
 	if err := wire.ReadMsg(scanner, &hello); err != nil {

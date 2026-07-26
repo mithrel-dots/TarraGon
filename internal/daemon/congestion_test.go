@@ -40,7 +40,7 @@ func benchmarkDaemonDelivery(b *testing.B, stream string, interval time.Duration
 	defer cancel()
 	store := NewTransientQueryStore()
 	ui := newUIRegistry()
-	requests, registry := startPluginListener(ctx, store, ui)
+	requests, registry := testPluginListener(b, ctx, store, ui)
 	manager := plugins.NewManager(dir)
 	var sent sync.Map
 	var streamDispatches atomic.Int64
@@ -74,7 +74,7 @@ func benchmarkDaemonDelivery(b *testing.B, stream string, interval time.Duration
 			}
 		}()
 	}
-	go startUIServer(ctx, manager, requests, registry, store, ui, nil)
+	testUIListener(b, ctx, manager, requests, registry, store, ui, nil)
 	c, err := dialUnixWithRetry(wire.ResolveUISocketPath(), 3*time.Second)
 	if err != nil {
 		b.Fatal(err)

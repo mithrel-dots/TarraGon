@@ -2,11 +2,18 @@
 
 Disclaimer: This documentation was created with the help of an AI assistant. It may contain inaccuracies or omissions; please validate details and test in your environment.
 
-This guide explains how to build a UI that talks to the Tarragon daemon over a Unix Domain Socket using NDJSON framing.
+The daemon routes UI traffic through embedded NATS. Use the Unix socket adapter for NDJSON, or connect to the broker directly.
+
+### Native NATS session
+
+1. Enable the [loopback listener](../README.md#core-architecture) and connect with the configured token. Give the token only to trusted local clients: it grants access to the whole bus.
+2. Send an empty NATS request to `tarragon.ui.open` (plugins use `tarragon.plugin.open`). The plain-text reply is a session subject, `tarragon.session.<id>`.
+3. Subscribe to `<session>.out` before publishing to `<session>.in`. Each message carries one JSON envelope, with the same fields as the socket protocol below.
+4. Send an empty message on `.in` every 30 seconds when idle. Send the literal `close` to end the session. On a `close` reply, disconnect, or 90 seconds without input, open a new session before sending more requests.
 
 ## Responsibilities of a UI
 
-- Create a single persistent bidirectional Unix Domain Socket connection to the daemon.
+- Keep one session open, either over NATS or the socket adapter.
 - Send queries and read acknowledgements/updates on that same connection.
 - Render the latest aggregate snapshot per active query.
 - Use per-plugin query state metadata to show which plugins are still pending, returned no entries, or failed.

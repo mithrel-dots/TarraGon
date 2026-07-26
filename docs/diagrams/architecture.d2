@@ -37,7 +37,6 @@ classes: {
   hub: {style: {stroke-width: 2; font-size: 25; font-color: "#EFF5FB"}}
   hub-detail: {shape: text; style: {font-size: 18; font-color: "#EFF5FB"}}
   runtime: {style: {font-size: 16; italic: false}}
-  benchmark: {style: {stroke-dash: 5; font-size: 16; italic: false}}
 }
 
 frontend: UDS frontends {
@@ -46,13 +45,13 @@ frontend: UDS frontends {
 }
 nats_ui: Native NATS UI {
   class: card
-  role: Benchmark fixture {class: detail}
+  role: Loopback TCP {class: detail}
 }
 
 broker: Embedded NATS {
   class: [card; hub]
   style: {fill: "#123B38"; stroke: "#239D92"}
-  transport: "IPC benchmark · fixture traffic only\nNative: NATS over loopback TCP\nCombined: bridge or adapt over UDS" {class: hub-detail}
+  transport: "Always started by the daemon\nRoutes requests and replies" {class: hub-detail}
 }
 core: Daemon core {
   class: [card; hub]
@@ -66,7 +65,7 @@ adapter: UDS plugin adapter {
 }
 nats_plugin: Native NATS plugin {
   class: card
-  role: Benchmark fixture {class: detail}
+  role: Loopback TCP {class: detail}
 }
 persistent: Persistent plugins {
   class: card
@@ -81,18 +80,11 @@ frecency: "SQLite frecency DB\nCount + last selection time" {
   style: {font-size: 19; stroke-width: 1}
 }
 
-# Dashed connections stand in for the equivalent endpoint on a benchmark fixture.
-frontend <-> broker: UDS frontend adapter {class: benchmark}
-nats_ui <-> broker: TCP or UDS byte bridge {class: benchmark}
-frontend <-> core: "ui.sock · NDJSON\n↓ query / select   ↑ snapshot" {class: runtime}
-broker <-> core: "in-process\nshared aggregation code" {class: benchmark}
-core <-> persistent: {
-  class: runtime
-  source-arrowhead.label: suggestions
-  target-arrowhead.label: requests
-}
+frontend <-> broker: "ui.sock adapter\n↓ query / select   ↑ snapshot" {class: runtime}
+nats_ui <-> broker: native NATS {class: runtime}
+broker <-> core: in-process NATS {class: runtime}
 core <-> frecency: "↓ record selection\n↑ refresh in-memory scores" {class: runtime}
-core <-> on_call: "↓ exec   ↑ JSON stdout" {class: runtime}
-broker <-> adapter: {class: benchmark}
-adapter <-> persistent: {class: benchmark}
-broker <-> nats_plugin: native NATS {class: benchmark}
+broker <-> on_call: "execution adapter\n↓ exec   ↑ JSON stdout" {class: runtime}
+broker <-> adapter: {class: runtime}
+adapter <-> persistent: {class: runtime}
+broker <-> nats_plugin: native NATS {class: runtime}

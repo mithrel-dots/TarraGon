@@ -22,7 +22,7 @@ var querySeq uint64
 
 // uiClient tracks a connected UI.
 type uiClient struct {
-	conn     net.Conn
+	conn     peerConn
 	clientID string
 	out      chan any
 	done     chan struct{}
@@ -126,33 +126,7 @@ func (r *uiRegistry) publish(msg any) {
 
 func (r *uiRegistry) publishSnapshot(msg *wire.UpdateMessage, _ []string) { r.publish(msg) }
 
-func startUIServer(ctx context.Context, mgr *plugins.Manager, reqOut chan<- pluginRequest, pluginsReg *pluginRegistry, store *aggregateStore, ui *uiRegistry, frecencyDB *db.DB) {
-	socketPath := wire.ResolveUISocketPath()
-	ln, err := wire.ListenUnix(socketPath)
-	if err != nil {
-		log.Fatalf("[UI] failed to listen on %s: %v", socketPath, err)
-	}
-	go func() {
-		<-ctx.Done()
-		_ = ln.Close()
-		_ = wire.CleanupSocket(socketPath)
-	}()
-	log.Printf("[UI] listening on %s", socketPath)
-
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			log.Printf("[UI] accept error: %v", err)
-			continue
-		}
-		go handleUIClient(ctx, conn, mgr, reqOut, pluginsReg, store, ui, frecencyDB)
-	}
-}
-
-func handleUIClient(ctx context.Context, conn net.Conn, mgr *plugins.Manager, reqOut chan<- pluginRequest, pluginsReg *pluginRegistry, store *aggregateStore, ui *uiRegistry, frecencyDB *db.DB) {
+func handleUIClient(ctx context.Context, conn peerConn, mgr *plugins.Manager, reqOut chan<- pluginRequest, pluginsReg *pluginRegistry, store *aggregateStore, ui *uiRegistry, frecencyDB *db.DB) {
 	scanner := wire.NewScanner(conn)
 	uid := fmt.Sprintf("ui-%d-%d", time.Now().UnixNano(), atomicAdd(&querySeq, 1))
 	client := &uiClient{conn: conn, clientID: uid}
@@ -253,8 +227,12 @@ func handleUIClient(ctx context.Context, conn net.Conn, mgr *plugins.Manager, re
 
 				if ok && snapCfg.Enabled && snapCfg.Lifecycle == plugins.LifecycleOnCall && selectedID != "" {
 					pctx, cancel := context.WithTimeout(ctx, 3*time.Second)
-					resp, err := invokeOnCallSelect(pctx, &plugins.Plugin{Dir: snapDir, Config: snapCfg}, selectedID, parsed.Action)
+					data, err := pluginsReg.bus.callPlugin(pctx, &plugins.Plugin{Dir: snapDir, Config: snapCfg}, wire.UIRequest{Type: wire.MsgSelect, ResultID: selectedID, Action: parsed.Action})
 					cancel()
+					var resp wire.SelectResponse
+					if err == nil {
+						err = json.Unmarshal(data, &resp)
+					}
 					if err != nil {
 						resp = wire.SelectResponse{Type: wire.MsgSelectResponse, Success: false, Message: err.Error()}
 					}
@@ -422,7 +400,7 @@ func dispatchQuery(ctx context.Context, queryText, qid string, mgr *plugins.Mana
 		}
 		t0 := time.Now()
 		pctx, cancel := context.WithTimeout(queryCtx, 3*time.Second)
-		raw, err := invokeOnCallQuery(pctx, &plugins.Plugin{Dir: snap.dir, Config: snap.cfg}, queryText)
+		raw, err := pluginsReg.bus.callPlugin(pctx, &plugins.Plugin{Dir: snap.dir, Config: snap.cfg}, wire.UIRequest{Type: "query", Text: queryText})
 		cancel()
 		if err != nil {
 			raw = json.RawMessage([]byte(fmt.Sprintf(`{"error":"%s"}`, escapeJSONString(err.Error()))))

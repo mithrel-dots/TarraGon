@@ -1,7 +1,6 @@
 package daemon
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"net"
@@ -56,7 +55,7 @@ func TestHandlePluginConn_SelectResponseBroadcastsToUI(t *testing.T) {
 	pluginSrv, pluginCli := net.Pipe()
 	defer func() { _ = pluginCli.Close() }()
 
-	registry := &pluginRegistry{conns: map[string]net.Conn{}, scanners: map[string]*bufio.Scanner{}}
+	registry := &pluginRegistry{}
 
 	done := make(chan *wire.SelectResponse, 1)
 	go func() {
@@ -91,7 +90,7 @@ func TestPluginListener_SendSelectRequestShape(t *testing.T) {
 
 	store := newAggregateStore(10, "global", nil, 0.3)
 	uiReg := newUIRegistry()
-	reqOut, reg := startPluginListener(ctx, store, uiReg)
+	reqOut, reg := testPluginListener(t, ctx, store, uiReg)
 
 	conn, err := dialUnixWithRetry(wire.ResolvePluginsSocketPath(), 2*time.Second)
 	if err != nil {

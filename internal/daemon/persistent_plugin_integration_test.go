@@ -26,7 +26,7 @@ func TestPersistentPluginE2E(t *testing.T) {
 
 	store := newAggregateStore(10, "global", nil, 0.3)
 	uiReg := newUIRegistry()
-	reqOut, plugReg := startPluginListener(ctx, store, uiReg)
+	reqOut, plugReg := testPluginListener(t, ctx, store, uiReg)
 
 	const pluginName = "plug_persistent"
 	mgr := plugins.NewManager("-")
@@ -38,7 +38,7 @@ func TestPersistentPluginE2E(t *testing.T) {
 		RequirePrefix:   false,
 	}}
 
-	go startUIServer(ctx, mgr, reqOut, plugReg, store, uiReg, nil)
+	testUIListener(t, ctx, mgr, reqOut, plugReg, store, uiReg, nil)
 
 	pluginReqCh := make(chan wire.PluginRequest, 1)
 	pluginErrCh := make(chan error, 1)
@@ -79,6 +79,15 @@ func TestPersistentPluginE2E(t *testing.T) {
 	}
 	defer func() { _ = uiConn.Close() }()
 
+	// A successful socket dial is not a completed plugin hello. Wait for
+	// registration before issuing the query that expects this plugin.
+	registrationDeadline := time.Now().Add(3 * time.Second)
+	for !plugReg.isConnected(pluginName) {
+		if time.Now().After(registrationDeadline) {
+			t.Fatal("plugin did not register")
+		}
+		time.Sleep(time.Millisecond)
+	}
 	if err := wire.WriteMsg(uiConn, &wire.UIRequest{Type: "query", ClientID: "ui-e2e", Text: "hello world"}); err != nil {
 		t.Fatalf("write ui query: %v", err)
 	}
