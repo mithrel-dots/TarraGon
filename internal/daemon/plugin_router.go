@@ -1,10 +1,10 @@
 package daemon
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"log"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -15,37 +15,55 @@ import (
 
 // pluginRegistry tracks connected plugins by name.
 type pluginRegistry struct {
-	bus      *daemonBus
-	mu       sync.RWMutex
-	conns    map[string]peerConn
-	scanners map[string]*bufio.Scanner
+	bus        *daemonBus
+	manager    *plugins.Manager
+	resume     chan *pluginSession
+	mu         sync.RWMutex
+	conns      map[string]*pluginSession
+	registered chan struct{} // closed at the next hello, if callers are waiting
 }
 
-func (r *pluginRegistry) set(name string, conn peerConn, scanner *bufio.Scanner) {
+func (r *pluginRegistry) set(name string, conn peerConn) *pluginSession {
+	s := &pluginSession{name: name, conn: conn, inFlight: make(map[string]*selectAction)}
+	if r.manager != nil {
+		r.manager.RLock()
+		if p := r.manager.Plugins[name]; p != nil {
+			s.tagged = slices.Contains(p.Config.Capabilities, "action_id")
+		}
+		r.manager.RUnlock()
+	}
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if r.conns == nil {
-		r.conns = make(map[string]peerConn)
+		r.conns = make(map[string]*pluginSession)
 	}
-	if r.scanners == nil {
-		r.scanners = make(map[string]*bufio.Scanner)
+	old := r.conns[name]
+	var actions []*selectAction
+	if old != nil {
+		actions = old.retire()
 	}
-	if old, ok := r.conns[name]; ok {
-		_ = old.Close()
+	r.conns[name] = s
+	if r.registered != nil {
+		close(r.registered)
+		r.registered = nil
 	}
-	r.conns[name] = conn
-	r.scanners[name] = scanner
+	r.mu.Unlock()
+	if old != nil {
+		old.close(actions)
+	}
+	return s
 }
 
 func (r *pluginRegistry) remove(name string, conn peerConn) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.conns[name] != conn {
+	s := r.conns[name]
+	if s == nil || s.conn != conn {
+		r.mu.Unlock()
 		return // the restarted plugin already registered a new connection
 	}
-	_ = conn.Close()
+	actions := s.retire()
 	delete(r.conns, name)
-	delete(r.scanners, name)
+	r.mu.Unlock()
+	s.close(actions)
 }
 
 func (r *pluginRegistry) isConnected(name string) bool {
@@ -68,64 +86,95 @@ func (r *pluginRegistry) Names() []string {
 }
 
 func (r *pluginRegistry) getConn(name string) (peerConn, bool) {
+	s := r.session(name)
+	if s == nil {
+		return nil, false
+	}
+	return s.conn, true
+}
+
+func (r *pluginRegistry) session(name string) *pluginSession {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	c, ok := r.conns[name]
-	return c, ok
+	return r.conns[name]
+}
+
+// Wait for an on-demand child's hello, bounded by the query or action
+// lifetime. Subscribe under the registry lock so a fast hello cannot be lost.
+func (r *pluginRegistry) waitConn(ctx context.Context, name string, done <-chan struct{}) (peerConn, bool) {
+	for {
+		r.mu.Lock()
+		if session := r.conns[name]; session != nil {
+			r.mu.Unlock()
+			return session.conn, true
+		}
+		if r.registered == nil {
+			r.registered = make(chan struct{})
+		}
+		registered := r.registered
+		r.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return nil, false
+		case <-done:
+			return nil, false
+		case <-registered:
+		}
+	}
 }
 
 // Requests routed to plugins.
 type pluginRequest struct {
-	name     string
-	queryID  string
-	text     string
-	resultID string
-	action   string
-	msgType  string
+	name         string
+	queryID      string
+	text         string
+	conn         peerConn
+	selectAction *selectAction
 }
 
 func startPluginRouter(ctx context.Context, store *aggregateStore) (chan<- pluginRequest, *pluginRegistry) {
-	registry := &pluginRegistry{}
+	registry := &pluginRegistry{resume: make(chan *pluginSession)}
 	reqChan := make(chan pluginRequest, 256)
+	writeReady := func(s *pluginSession) {
+		if err := s.writeReady(); err != nil {
+			log.Printf("[PLUGINS] send select to %s failed: %v", s.name, err)
+			registry.remove(s.name, s.conn)
+		}
+	}
 	go func() {
 		for {
 			select {
 			case <-ctx.Done():
 				return
+			case s := <-registry.resume:
+				writeReady(s)
 			case req := <-reqChan:
-				conn, ok := registry.getConn(req.name)
-				if !ok {
+				s := registry.session(req.name)
+				if s == nil || s.conn != req.conn {
+					if req.selectAction != nil {
+						req.selectAction.fail("Plugin connection no longer available.")
+					}
 					log.Printf("[PLUGINS] drop request: plugin %s not connected", req.name)
 					continue
 				}
-				msgType := req.msgType
-				if msgType == "" {
-					msgType = wire.MsgRequest
+				if req.selectAction != nil {
+					s.enqueue(req.selectAction)
+					writeReady(s)
+					continue
 				}
-				if msgType == wire.MsgRequest {
-					q := store.query(req.queryID)
-					if q == nil || q.ctx.Err() != nil {
-						continue // evicted or superseded while queued
-					}
-					q.mu.Lock()
-					if q.started == nil {
-						q.started = make(map[string]time.Time)
-					}
-					q.started[req.name] = time.Now()
-					q.mu.Unlock()
+				conn := s.conn
+				q := store.query(req.queryID)
+				if q == nil || q.ctx.Err() != nil {
+					continue // evicted or superseded while queued
 				}
+				q.mu.Lock()
+				if q.started == nil {
+					q.started = make(map[string]time.Time)
+				}
+				q.started[req.name] = time.Now()
+				q.mu.Unlock()
 				_ = conn.SetWriteDeadline(time.Now().Add(100 * time.Millisecond))
-				var err error
-				if msgType == wire.MsgSelect {
-					err = wire.WriteMsg(conn, &wire.SelectRequest{
-						Type:     wire.MsgSelect,
-						QueryID:  req.queryID,
-						ResultID: req.resultID,
-						Action:   req.action,
-					})
-				} else {
-					err = wire.WriteMsg(conn, &wire.PluginRequest{Type: msgType, QueryID: req.queryID, Text: req.text})
-				}
+				err := wire.WriteMsg(conn, &wire.PluginRequest{Type: wire.MsgRequest, QueryID: req.queryID, Text: req.text})
 				_ = conn.SetWriteDeadline(time.Time{})
 				if err != nil {
 					log.Printf("[PLUGINS] send to %s failed: %v", req.name, err)
@@ -153,7 +202,7 @@ func handlePluginConn(ctx context.Context, conn peerConn, registry *pluginRegist
 		return
 	}
 
-	registry.set(hello.Name, conn, scanner)
+	session := registry.set(hello.Name, conn)
 	log.Printf("[PLUGINS] plugin connected: %s", hello.Name)
 
 	defer func() {
@@ -198,10 +247,14 @@ func handlePluginConn(ctx context.Context, conn peerConn, registry *pluginRegist
 			if json.Unmarshal(raw, &resp) != nil {
 				continue
 			}
-			if resp.Type == "" {
-				resp.Type = wire.MsgSelectResponse
+			if session.final(resp) {
+				select {
+				case registry.resume <- session:
+				case <-ctx.Done():
+					return
+				}
 			}
-			ui.publish(&resp)
+
 		}
 	}
 }

@@ -293,16 +293,28 @@ func TestShutdownReleasesBlockedSelect(t *testing.T) {
 	defer other.Close()
 	defer plugin.Close()
 	registry := &pluginRegistry{}
-	registry.set("p", plugin, wire.NewScanner(plugin))
+	registry.set("p", plugin)
+	manager := plugins.NewManager(t.TempDir())
+	manager.Plugins["p"] = &plugins.Plugin{Config: plugins.PluginConfig{
+		ID: "p", Name: "p", Enabled: true, Lifecycle: plugins.LifecycleDaemon,
+	}}
 	requests := make(chan pluginRequest)
 	done := make(chan struct{})
 	store := NewTransientQueryStore()
+	ui := newUIRegistry(store)
 	go func() {
 		defer close(done)
-		handleUIClient(ctx, server, nil, requests, registry, store, newUIRegistry(store), nil)
+		handleUIClient(ctx, server, manager, requests, registry, store, ui, nil)
 	}()
 	if err := wire.WriteMsg(client, wire.UIRequest{Type: "select", Plugin: "p", QueryID: "q", ResultID: "r"}); err != nil {
 		t.Fatal(err)
+	}
+	if err := client.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	var ack wire.SelectAck
+	if err := wire.ReadMsg(wire.NewScanner(client), &ack); err != nil || ack.Type != "ok" || ack.ActionID == "" {
+		t.Fatalf("expected select admission before shutdown: %+v (%v)", ack, err)
 	}
 	cancel()
 	select {

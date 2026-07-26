@@ -50,6 +50,30 @@ func (b *daemonBus) callPlugin(ctx context.Context, plugin *plugins.Plugin, req 
 	return response.Data, nil
 }
 
+func (b *daemonBus) callPluginAction(ctx context.Context, plugin *plugins.Plugin, a *selectAction) {
+	ctx, cancel := context.WithTimeout(ctx, a.timeout)
+	defer cancel()
+	if !a.onTerminal(cancel) {
+		return
+	}
+
+	if !a.beginDispatch() {
+		return
+	}
+	data, err := b.callPlugin(ctx, plugin, wire.UIRequest{
+		Type: wire.MsgSelect, ResultID: a.resultID, Action: a.action,
+	})
+	var response wire.SelectResponse
+	if err == nil {
+		err = json.Unmarshal(data, &response)
+	}
+	if err != nil {
+		a.fail(err.Error())
+		return
+	}
+	a.finish(response.Success, response.Message)
+}
+
 func (b *daemonBus) handlePluginCall(msg *nats.Msg) {
 	b.mu.Lock()
 	call, ok := b.calls[msg.Subject]

@@ -92,9 +92,10 @@ func publishOverview(mgr *plugins.Manager, reg *pluginRegistry, store *aggregate
 	store.SubmitResponse(plugins.OverviewID, wire.PluginResponse{QueryID: qid, Data: data}, float64(time.Since(start).Microseconds())/1000, ui.publishSnapshot)
 }
 
-func (ui *uiRegistry) selectOverview(ctx context.Context, mgr *plugins.Manager, reg *pluginRegistry, id, action string) (string, error) {
+func (ui *uiRegistry) selectOverview(ctx context.Context, mgr *plugins.Manager, reg *pluginRegistry, a *selectAction) (string, bool, error) {
 	ui.management.Lock()
 	defer ui.management.Unlock()
+	id, action := a.resultID, a.action
 	var target wire.PluginInfo
 	var available bool
 	for _, p := range pluginStatus(mgr, reg).Plugins {
@@ -106,17 +107,25 @@ func (ui *uiRegistry) selectOverview(ctx context.Context, mgr *plugins.Manager, 
 		}
 	}
 	if !available {
-		return "", errors.New("plugins overview is disabled")
+		msg := "plugins overview is disabled"
+		a.notRun(msg)
+		return "", false, errors.New(msg)
 	}
 	if target.ID == "" {
-		return "", fmt.Errorf("unknown plugin %q", id)
+		msg := fmt.Sprintf("unknown plugin %q", id)
+		a.notRun(msg)
+		return "", false, errors.New(msg)
+	}
+	if !a.beginDispatch() {
+		return "", false, errors.New("action expired")
 	}
 	if action == "" || action == "details" {
-		return overviewDescription(target), nil
+		return overviewDescription(target), false, nil
 	}
 	if id == plugins.OverviewID {
-		return "", errors.New("the built-in overview cannot manage itself")
+		return "", false, errors.New("the built-in overview cannot manage itself")
 	}
+
 	switch action {
 	case "enable", "disable":
 		enabled := action == "enable"
@@ -124,32 +133,32 @@ func (ui *uiRegistry) selectOverview(ctx context.Context, mgr *plugins.Manager, 
 			return config.WritePluginOverride(id, map[string]any{"enabled": enabled})
 		})
 		if err != nil {
-			return "", err
+			return "", true, err
 		}
 		mgr.RLock()
 		effective := mgr.Plugins[id].Config.Enabled
 		mgr.RUnlock()
 		if effective != enabled {
-			return "", fmt.Errorf("saved setting for %s, but a higher-precedence override takes priority", id)
+			return "", true, fmt.Errorf("saved setting for %s, but a higher-precedence override takes priority", id)
 		}
 		if enabled {
-			return id + " enabled", nil
+			return id + " enabled", true, nil
 		}
-		return id + " disabled", nil
+		return id + " disabled", true, nil
 	case "restart":
 		if !canRestart(target) {
-			return "", fmt.Errorf("%s has no enabled persistent process to restart", id)
+			return "", true, fmt.Errorf("%s has no enabled persistent process to restart", id)
 		}
 		resp := restartPlugins(ctx, mgr, id)
 		if len(resp.Results) == 0 {
-			return "", errors.New(resp.Message)
+			return "", true, errors.New(resp.Message)
 		}
 		r := resp.Results[0]
 		if !resp.Success || r.Status == plugins.RestartStatusSkipped {
-			return "", fmt.Errorf("%s: %s", id, r.Message)
+			return "", true, fmt.Errorf("%s: %s", id, r.Message)
 		}
-		return strings.TrimSpace(fmt.Sprintf("%s: %s %s", id, r.Status, r.Message)), nil
+		return strings.TrimSpace(fmt.Sprintf("%s: %s %s", id, r.Status, r.Message)), true, nil
 	default:
-		return "", fmt.Errorf("unknown plugins action %q", action)
+		return "", false, fmt.Errorf("unknown plugins action %q", action)
 	}
 }

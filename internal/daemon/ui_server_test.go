@@ -99,6 +99,9 @@ func TestUIServer_SelectAndDetachAck(t *testing.T) {
 	defer cancel()
 
 	mgr := plugins.NewManager("-")
+	mgr.Plugins["plug_connected"] = &plugins.Plugin{Config: plugins.PluginConfig{
+		ID: "plug_connected", Name: "plug_connected", Enabled: true, Lifecycle: plugins.LifecycleDaemon,
+	}}
 	dir := t.TempDir()
 	database, openErr := db.Open(filepath.Join(dir, "frecency.db"))
 	if openErr != nil {
@@ -112,7 +115,7 @@ func TestUIServer_SelectAndDetachAck(t *testing.T) {
 	plugReg := &pluginRegistry{}
 
 	c1, c2 := net.Pipe()
-	plugReg.set("plug_connected", c1, wire.NewScanner(c1))
+	plugReg.set("plug_connected", c1)
 	defer func() { _ = c2.Close() }()
 
 	testUIListener(t, ctx, mgr, reqOut, plugReg, store, uiReg, database)
@@ -146,7 +149,8 @@ func TestUIServer_SelectAndDetachAck(t *testing.T) {
 
 	select {
 	case msg := <-reqOut:
-		if msg.name != "plug_connected" || msg.queryID != "q-1" || msg.msgType != wire.MsgSelect || msg.resultID != "id-123" || msg.action != "open" {
+		a := msg.selectAction
+		if msg.name != "plug_connected" || a == nil || a.queryID != "q-1" || a.resultID != "id-123" || a.action != "open" {
 			t.Fatalf("unexpected forwarded select: %+v", msg)
 		}
 	case <-time.After(time.Second):
@@ -597,7 +601,7 @@ func TestDispatchQuery_GlobalRespectsGeneralSuggestionEligibility(t *testing.T) 
 			_ = srv.Close()
 			_ = cli.Close()
 		})
-		plugReg.set(name, srv, wire.NewScanner(srv))
+		plugReg.set(name, srv)
 	}
 
 	plugReg.bus = testBus(t, ctx)
@@ -659,7 +663,7 @@ func TestDispatchQuery_ExplicitTargetBypassesGeneralEligibility(t *testing.T) {
 			_ = srv.Close()
 			_ = cli.Close()
 		})
-		plugReg.set(name, srv, wire.NewScanner(srv))
+		plugReg.set(name, srv)
 	}
 
 	dispatchQuery(ctx, "query", "q-target", mgr, reqOut, plugReg, store, uiReg, true, "target")
@@ -708,7 +712,7 @@ func TestDispatchQuery_PartialPrefixDoesNotFanOutToGeneralPlugins(t *testing.T) 
 		_ = srv.Close()
 		_ = cli.Close()
 	})
-	plugReg.set("general", srv, wire.NewScanner(srv))
+	plugReg.set("general", srv)
 
 	dispatchQuery(ctx, "@a", "q-partial", mgr, reqOut, plugReg, store, uiReg, true, "")
 

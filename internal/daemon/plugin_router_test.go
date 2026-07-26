@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mithrel-dots/tarragon/internal/plugins"
 	"github.com/mithrel-dots/tarragon/internal/wire"
 )
 
@@ -17,8 +18,7 @@ func TestPluginRegistryBasic(t *testing.T) {
 	}
 	c1, c2 := net.Pipe()
 	defer func() { _ = c2.Close() }()
-	s := wire.NewScanner(c1)
-	r.set("p1", c1, s)
+	r.set("p1", c1)
 	if !r.isConnected("p1") {
 		t.Fatalf("expected connected")
 	}
@@ -28,7 +28,7 @@ func TestPluginRegistryBasic(t *testing.T) {
 	}
 	restarted, peer := net.Pipe()
 	defer peer.Close()
-	r.set("p1", restarted, wire.NewScanner(restarted))
+	r.set("p1", restarted)
 	r.remove("p1", c1)
 	if conn, _ := r.getConn("p1"); conn != restarted {
 		t.Fatal("old connection removed the restarted plugin")
@@ -39,49 +39,23 @@ func TestPluginRegistryBasic(t *testing.T) {
 	}
 }
 
-func TestHandlePluginConn_SelectResponseBroadcastsToUI(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+func TestHandlePluginConn_DropsUnsolicitedSelectResponse(t *testing.T) {
+	f := persistentFixture(t, false, time.Second)
+	plugin := persistentPlugin(t, f, "p")
+	owner, observer := f.connectUI(t, f.requests), f.connectUI(t, f.requests)
+	plugin.reply(t, "", "unsolicited", true)
+	plugin.readBarrier(t)
+	owner.expectStatus(t)
+	observer.expectStatus(t)
 
-	store := newAggregateStore(10, "global", nil, 0.3)
-	uiReg := newUIRegistry(store)
-
-	uiSrv, uiCli := net.Pipe()
-	defer func() { _ = uiCli.Close() }()
-	client := &uiClient{conn: uiSrv, clientID: "u1"}
-	uiReg.add(client)
-	defer uiReg.remove(client)
-
-	pluginSrv, pluginCli := net.Pipe()
-	defer func() { _ = pluginCli.Close() }()
-
-	registry := &pluginRegistry{}
-
-	done := make(chan *wire.SelectResponse, 1)
-	go func() {
-		s := wire.NewScanner(uiCli)
-		var resp wire.SelectResponse
-		_ = wire.ReadMsg(s, &resp)
-		done <- &resp
-	}()
-
-	go handlePluginConn(ctx, pluginSrv, registry, store, uiReg)
-
-	if err := wire.WriteMsg(pluginCli, &wire.PluginHello{Type: wire.MsgHello, Name: "plug1"}); err != nil {
-		t.Fatalf("write hello: %v", err)
+	a := owner.selectRow(t, click("clicked"))
+	plugin.expectSelect(t, "clicked", "")
+	plugin.reply(t, "", "executed", true)
+	if resp := owner.outcome(t, a, true, ""); resp.Message != "executed" {
+		t.Fatal(resp)
 	}
-	if err := wire.WriteMsg(pluginCli, &wire.SelectResponse{Type: wire.MsgSelectResponse, Success: true, Message: "executed"}); err != nil {
-		t.Fatalf("write select_response: %v", err)
-	}
-
-	select {
-	case resp := <-done:
-		if resp.Type != wire.MsgSelectResponse || !resp.Success || resp.Message != "executed" {
-			t.Fatalf("unexpected select response: %+v", resp)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timeout waiting for select response")
-	}
+	observer.expectStatus(t)
+	owner.expectStatus(t)
 }
 
 func TestPluginListener_SendSelectRequestShape(t *testing.T) {
@@ -115,8 +89,13 @@ func TestPluginListener_SendSelectRequestShape(t *testing.T) {
 	// for a result the UI already showed must still reach the plugin.
 	store.startQuery(ctx, "q-123", "ui", "old", "session", "search")
 	store.startQuery(ctx, "q-124", "ui", "new", "session", "search")
-	reqOut <- pluginRequest{name: "plug_select", queryID: "q-123", text: "old"}
-	reqOut <- pluginRequest{name: "plug_select", queryID: "q-123", resultID: "r-42", action: "open", msgType: wire.MsgSelect}
+	registered, _ := reg.getConn("plug_select")
+	reqOut <- pluginRequest{name: "plug_select", queryID: "q-123", text: "old", conn: registered}
+	mgr := plugins.NewManager("")
+	mgr.Plugins["plug_select"] = &plugins.Plugin{Config: plugins.PluginConfig{Enabled: true, Lifecycle: plugins.LifecycleDaemon}}
+	server, ui := admissionSocket(t)
+	go handleUIClient(ctx, server, mgr, reqOut, reg, store, uiReg, nil)
+	ui.selectRow(t, wire.UIRequest{Plugin: "plug_select", QueryID: "q-123", ResultID: "r-42", Action: "open"})
 
 	var raw map[string]json.RawMessage
 	if err := wire.ReadMsg(scanner, &raw); err != nil {
@@ -131,5 +110,8 @@ func TestPluginListener_SendSelectRequestShape(t *testing.T) {
 
 	if typ != wire.MsgSelect || qid != "q-123" || rid != "r-42" || action != "open" {
 		t.Fatalf("unexpected select request payload: type=%q query_id=%q result_id=%q action=%q", typ, qid, rid, action)
+	}
+	if _, tagged := raw["action_id"]; tagged {
+		t.Fatal("legacy select carried an action_id")
 	}
 }

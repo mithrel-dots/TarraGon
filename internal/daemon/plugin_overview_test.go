@@ -37,6 +37,13 @@ func TestPluginOverviewOverUIConnection(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "plugin.toml"), []byte(manifest), 0600); err != nil {
 		t.Fatal(err)
 	}
+	broken := filepath.Join(root, "broken")
+	if err := os.Mkdir(broken, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(broken, "plugin.toml"), []byte("name='Broken'\nenabled=false\nlifecycle_mode='daemon'\nentrypoint='missing'\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
 	mgr := plugins.NewManager(root)
 	if err := mgr.Discover(); err != nil {
 		t.Fatal(err)
@@ -140,11 +147,8 @@ func TestPluginOverviewOverUIConnection(t *testing.T) {
 	selectAction("example", "restart", false)
 	results()
 	selectAction("plugins", "disable", false)
-	results()
 	selectAction("", "restart", false)
-	results()
 	selectAction("ghost", "enable", false)
-	results()
 	selectAction("example", "uninstall", false)
 
 	dropIns := filepath.Join(root, "tarragon.d")
@@ -159,6 +163,16 @@ func TestPluginOverviewOverUIConnection(t *testing.T) {
 	}
 	if rows := results(); len(rows) != 1 || rows[0].ID != "example" || !strings.Contains(rows[0].Description, "disabled") {
 		t.Fatalf("drop-in did not remain effective: %+v", rows)
+	}
+	query(":plugins broken")
+	if rows := results(); len(rows) != 1 || !strings.Contains(rows[0].Description, "disabled") {
+		t.Fatalf("unexpected broken plugin before enabling: %+v", rows)
+	}
+	if msg := selectAction("broken", "enable", false); !strings.Contains(msg, "failed to start") {
+		t.Fatalf("lost the partial failure: %q", msg)
+	}
+	if rows := results(); len(rows) != 1 || rows[0].ID != "broken" || !strings.Contains(rows[0].Description, "enabled, disconnected") {
+		t.Fatalf("effective saved state missing after failed startup: %+v", rows)
 	}
 }
 

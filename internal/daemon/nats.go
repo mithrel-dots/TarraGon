@@ -14,6 +14,7 @@ import (
 	"github.com/mithrel-dots/tarragon/internal/wire"
 	"github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go"
+	"golang.org/x/sys/unix"
 )
 
 // Both core handlers read one JSON line at a time and write complete frames.
@@ -69,7 +70,7 @@ func (b *daemonBus) listenNative(ui, plugin func(peerConn)) error {
 				return
 			}
 			base := newSessionID()
-			if err := b.startSession(base, true, handler); err != nil {
+			if err := b.startSession(base, nil, handler); err != nil {
 				_ = m.Respond([]byte("error: cannot open session"))
 				return
 			}
@@ -94,7 +95,7 @@ func (b *daemonBus) close() {
 
 func newSessionID() string { return "tarragon.session." + rand.Text() }
 
-func (b *daemonBus) startSession(base string, native bool, handle func(peerConn)) error {
+func (b *daemonBus) startSession(base string, socket *net.UnixConn, handle func(peerConn)) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if err := b.ctx.Err(); err != nil {
@@ -105,7 +106,7 @@ func (b *daemonBus) startSession(base string, native bool, handle func(peerConn)
 		return err
 	}
 	ctx, cancel := context.WithCancel(b.ctx)
-	p := &subjectPeer{bus: b.conn, inbox: sub, out: base + ".out", ctx: ctx, cancel: cancel, native: native}
+	p := &subjectPeer{bus: b.conn, inbox: sub, out: base + ".out", ctx: ctx, cancel: cancel, socket: socket}
 	b.sessions.Add(1)
 	go func() {
 		defer b.sessions.Done()
@@ -123,7 +124,7 @@ type subjectPeer struct {
 	out      string
 	ctx      context.Context
 	cancel   context.CancelFunc
-	native   bool
+	socket   *net.UnixConn // nil for a native session
 	line     bytes.Buffer
 	writeMu  sync.Mutex
 	deadline time.Time
@@ -133,7 +134,7 @@ func (p *subjectPeer) Read(dst []byte) (int, error) {
 	for p.line.Len() == 0 {
 		ctx := p.ctx
 		var cancel context.CancelFunc
-		if p.native {
+		if p.socket == nil {
 			ctx, cancel = context.WithTimeout(ctx, 90*time.Second)
 		}
 		msg, err := p.inbox.NextMsgWithContext(ctx)
@@ -148,6 +149,9 @@ func (p *subjectPeer) Read(dst []byte) (int, error) {
 		}
 		if bytes.Equal(msg.Data, []byte("close")) {
 			return 0, io.EOF
+		}
+		if p.socket != nil && bytes.Equal(msg.Data, []byte("eof")) {
+			return 0, unixInputEOF{p.socket}
 		}
 		if err := json.Compact(&p.line, msg.Data); err != nil {
 			return 0, err
@@ -192,7 +196,7 @@ func (p *subjectPeer) Close() error {
 
 // Translate both directions, including a Unix half-close: finish pending
 // replies before closing the socket, as required by the CLI control commands.
-func (b *daemonBus) adaptUnix(conn net.Conn, handler func(peerConn)) {
+func (b *daemonBus) adaptUnix(conn *net.UnixConn, handler func(peerConn)) {
 	defer conn.Close()
 	base := newSessionID()
 	sub, err := b.conn.SubscribeSync(base + ".out")
@@ -200,7 +204,7 @@ func (b *daemonBus) adaptUnix(conn net.Conn, handler func(peerConn)) {
 		return
 	}
 	defer sub.Unsubscribe()
-	if err := b.startSession(base, false, handler); err != nil {
+	if err := b.startSession(base, conn, handler); err != nil {
 		return
 	}
 	done := make(chan struct{})
@@ -219,17 +223,41 @@ func (b *daemonBus) adaptUnix(conn net.Conn, handler func(peerConn)) {
 		}
 	}()
 	scanner := wire.NewScanner(conn)
+	end := "eof"
 	for scanner.Scan() {
 		// Raw controls belong to the subject protocol, never to a Unix peer.
-		if !json.Valid(scanner.Bytes()) {
-			break
-		}
-		if err := b.conn.Publish(base+".in", scanner.Bytes()); err != nil {
+		if !json.Valid(scanner.Bytes()) || b.conn.Publish(base+".in", scanner.Bytes()) != nil {
+			end = "close"
 			break
 		}
 	}
-	_ = b.conn.Publish(base+".in", []byte("close"))
+	if scanner.Err() != nil {
+		end = "close"
+	}
+	_ = b.conn.Publish(base+".in", []byte(end))
 	<-done
+}
+
+type unixInputEOF struct{ socket *net.UnixConn }
+
+func (unixInputEOF) Error() string { return "Unix socket input ended" }
+
+// POLLHUP distinguishes a full disconnect from CloseWrite. RawConn.Read
+// sleeps in Go's netpoller until hangup or until the adapter closes the socket.
+func (e unixInputEOF) waitForDisconnect() {
+	raw, err := e.socket.SyscallConn()
+	if err != nil {
+		return
+	}
+	_ = raw.Read(func(fd uintptr) bool {
+		fds := []unix.PollFd{{Fd: int32(fd)}}
+		for {
+			n, err := unix.Poll(fds, 0)
+			if err != unix.EINTR {
+				return n != 0 || err != nil
+			}
+		}
+	})
 }
 
 func (b *daemonBus) listenUnix(path string, handle func(peerConn)) (net.Listener, error) {
@@ -245,7 +273,7 @@ func (b *daemonBus) listenUnix(path string, handle func(peerConn)) (net.Listener
 			if err != nil {
 				return
 			}
-			go b.adaptUnix(conn, handle)
+			go b.adaptUnix(conn.(*net.UnixConn), handle)
 		}
 	}()
 	return ln, nil

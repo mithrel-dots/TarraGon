@@ -64,6 +64,7 @@ func RunDaemon() error {
 	// Start plugin listener BEFORE spawning plugin processes, so the
 	// socket is ready to accept connections when plugins start.
 	reqOut, registry := startPluginRouter(ctx, store)
+	registry.manager = mgr
 	port, err := natsListenPort()
 	if err != nil {
 		return err

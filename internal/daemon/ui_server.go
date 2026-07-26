@@ -29,6 +29,7 @@ type uiClient struct {
 	out      chan any
 	done     chan struct{}
 	stopOnce sync.Once
+	actions  sync.WaitGroup // terminal replies not yet queued
 	queueMu  sync.Mutex
 	pending  map[string]*queuedSnapshot
 }
@@ -92,13 +93,17 @@ type uiRegistry struct {
 	store   *aggregateStore
 	// Serialize config changes through the resulting process stops/starts,
 	// without holding the query path's manager lock while waiting for exit.
-	management sync.Mutex
+	management    sync.Mutex
+	actionTimeout time.Duration
+	actionSlots   chan struct{}
 }
 
 func newUIRegistry(store *aggregateStore) *uiRegistry {
 	return &uiRegistry{
-		clients: make(map[string]*uiClient),
-		store:   store,
+		clients:       make(map[string]*uiClient),
+		store:         store,
+		actionTimeout: 3 * time.Second,
+		actionSlots:   make(chan struct{}, 256),
 	}
 }
 
@@ -172,19 +177,13 @@ func (r *uiRegistry) remove(c *uiClient) {
 	c.stop()
 }
 
-func (r *uiRegistry) publish(msg any) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	for _, c := range r.clients {
-		_ = c.send(msg)
-	}
-}
-
 func handleUIClient(ctx context.Context, conn peerConn, mgr *plugins.Manager, reqOut chan<- pluginRequest, pluginsReg *pluginRegistry, store *aggregateStore, ui *uiRegistry, frecencyDB *db.DB) {
 	scanner := wire.NewScanner(conn)
 	client := &uiClient{conn: conn}
 	ui.add(client)
 	uid := client.uid
+	session, endSession := context.WithCancel(ctx)
+	defer endSession()
 	stopOnShutdown := context.AfterFunc(ctx, client.stop)
 	defer stopOnShutdown()
 	defer ui.remove(client)
@@ -199,9 +198,15 @@ func handleUIClient(ctx context.Context, conn peerConn, mgr *plugins.Manager, re
 
 		var parsed wire.UIRequest
 		if err := wire.ReadMsg(scanner, &parsed); err != nil {
+			if eof, ok := err.(unixInputEOF); ok {
+				go func() {
+					eof.waitForDisconnect()
+					endSession()
+				}()
+				client.actions.Wait()
+				err = io.EOF
+			}
 			if err == io.EOF {
-				// A client may close its write half after a control request.
-				// Deliver the replies already accepted by its writer first.
 				flushed := make(writeBarrier)
 				if client.send(flushed) == nil {
 					select {
@@ -223,79 +228,13 @@ func handleUIClient(ctx context.Context, conn peerConn, mgr *plugins.Manager, re
 			_ = client.send(map[string]any{"type": "ok"})
 			continue
 		case "select":
-			selectedID := parsed.ID
-			if selectedID == "" {
-				selectedID = parsed.ResultID
+			a := ui.acceptSelect(session, client, parsed)
+			if a != nil {
+				if frecencyDB != nil && a.producer != "" && a.resultID != "" {
+					go recordSelect(frecencyDB, store, a.producer, a.resultID)
+				}
+				ui.routeSelect(ctx, mgr, pluginsReg, reqOut, a)
 			}
-			if selectedID == "" {
-				selectedID = parsed.Text
-			}
-			if frecencyDB != nil && parsed.Plugin != "" && selectedID != "" {
-				go func(plugin, id string) {
-					if err := frecencyDB.RecordSelection(context.Background(), plugin, id); err != nil {
-						log.Printf("[UI] failed to record selection %s:%s: %v", plugin, id, err)
-						return
-					}
-					if err := store.RefreshFrecencyCache(context.Background()); err != nil {
-						log.Printf("[UI] failed to refresh frecency cache: %v", err)
-					}
-				}(parsed.Plugin, selectedID)
-			}
-			if parsed.Plugin == plugins.OverviewID {
-				if err := client.send(map[string]any{"type": "ok"}); err != nil {
-					return
-				}
-				msg, err := ui.selectOverview(ctx, mgr, pluginsReg, selectedID, parsed.Action)
-				if err != nil {
-					msg = err.Error()
-				}
-				_ = client.send(&wire.SelectResponse{Type: wire.MsgSelectResponse, Success: err == nil, Message: msg})
-				switch parsed.Action {
-				case "enable", "disable", "restart":
-					// Re-read effective state even when starting the process failed
-					// after its configuration was successfully changed.
-					if q := store.query(parsed.QueryID); q != nil && q.session == uid {
-						if target, filter, ok := resolvePrefixTarget(q.Input, mgr); ok && target == plugins.OverviewID {
-							publishOverview(mgr, pluginsReg, store, ui, parsed.QueryID, filter)
-						}
-					}
-				}
-				continue
-			}
-			if parsed.Plugin != "" && parsed.QueryID != "" && pluginsReg.isConnected(parsed.Plugin) {
-				select {
-				case reqOut <- pluginRequest{name: parsed.Plugin, queryID: parsed.QueryID, resultID: selectedID, action: parsed.Action, msgType: wire.MsgSelect}:
-				case <-ctx.Done():
-					return
-				case <-client.done:
-					return
-				}
-			} else if parsed.Plugin != "" {
-				mgr.RLock()
-				plug, ok := mgr.Plugins[parsed.Plugin]
-				var snapDir string
-				var snapCfg plugins.PluginConfig
-				if ok {
-					snapDir = plug.Dir
-					snapCfg = plug.Config
-				}
-				mgr.RUnlock()
-
-				if ok && snapCfg.Enabled && snapCfg.Lifecycle == plugins.LifecycleOnCall && selectedID != "" {
-					pctx, cancel := context.WithTimeout(ctx, 3*time.Second)
-					data, err := pluginsReg.bus.callPlugin(pctx, &plugins.Plugin{Dir: snapDir, Config: snapCfg}, wire.UIRequest{Type: wire.MsgSelect, ResultID: selectedID, Action: parsed.Action})
-					cancel()
-					var resp wire.SelectResponse
-					if err == nil {
-						err = json.Unmarshal(data, &resp)
-					}
-					if err != nil {
-						resp = wire.SelectResponse{Type: wire.MsgSelectResponse, Success: false, Message: err.Error()}
-					}
-					_ = client.send(&resp)
-				}
-			}
-			_ = client.send(map[string]any{"type": "ok"})
 			continue
 		case "status":
 			_ = client.send(pluginStatus(mgr, pluginsReg))
@@ -428,9 +367,9 @@ func dispatchQuery(ctx context.Context, queryText, qid string, mgr *plugins.Mana
 			}
 		}
 
-		if pluginsReg.isConnected(snap.name) {
+		if conn, ok := pluginsReg.getConn(snap.name); ok {
 			select {
-			case reqOut <- pluginRequest{name: snap.name, queryID: qid, text: queryText}:
+			case reqOut <- pluginRequest{name: snap.name, queryID: qid, text: queryText, conn: conn}:
 			case <-queryCtx.Done():
 				return
 			}
