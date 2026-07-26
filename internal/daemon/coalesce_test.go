@@ -80,6 +80,28 @@ type stalledConn struct{ net.Conn }
 
 func (stalledConn) SetWriteDeadline(time.Time) error { return nil }
 
+func TestOversizedSnapshotReportsQueryErrorAndKeepsSession(t *testing.T) {
+	server, reader := net.Pipe()
+	defer reader.Close()
+	_ = reader.SetReadDeadline(time.Now().Add(5 * time.Second))
+	reg := newUIRegistry()
+	client := &uiClient{conn: stalledConn{server}, clientID: "ui"}
+	reg.add(client)
+	defer reg.remove(client)
+	// Base64 expansion pushes the encoded envelope over the limit.
+	reg.publish(&wire.UpdateMessage{Type: "update", QueryID: "q", Payload: make([]byte, wire.MaxMessageSize*3/4)})
+	reg.publish(&wire.AckMessage{Type: "ack", QueryID: "next"})
+	scanner := wire.NewScanner(reader)
+	var response map[string]string
+	if err := wire.ReadMsg(scanner, &response); err != nil || response["query_id"] != "q" || response["type"] != "error" || response["error"] != wire.ErrMessageTooLarge.Error() {
+		t.Fatalf("oversize response: %v, %v", response, err)
+	}
+	var ack wire.AckMessage
+	if err := wire.ReadMsg(scanner, &ack); err != nil || ack.QueryID != "next" {
+		t.Fatalf("next reply: %+v, %v", ack, err)
+	}
+}
+
 func TestUIWriterCoalescesOnlyBetweenControlMessages(t *testing.T) {
 	server, reader := net.Pipe()
 	defer reader.Close()

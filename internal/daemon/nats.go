@@ -39,7 +39,7 @@ func startNATS(parent context.Context, port int, token string) (*daemonBus, erro
 	}
 	broker, err := server.NewServer(&server.Options{
 		Host: "127.0.0.1", Port: port, DontListen: port == 0, Authorization: token,
-		NoSigs: true, NoLog: true, MaxPayload: 8 << 20,
+		NoSigs: true, NoLog: true, MaxPayload: wire.MaxMessageSize,
 	})
 	if err != nil {
 		return nil, err

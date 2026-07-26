@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -72,6 +73,21 @@ func TestWriteReadMsgRoundTrip(t *testing.T) {
 
 	if err := ReadMsg(s, &out); err != io.EOF {
 		t.Fatalf("expected EOF, got %v", err)
+	}
+}
+
+func TestMessageSizeBoundary(t *testing.T) {
+	value := strings.Repeat("x", MaxMessageSize-2) // two JSON quotes
+	var buf bytes.Buffer
+	if err := WriteMsg(&buf, value); err != nil {
+		t.Fatal(err)
+	}
+	var got string
+	if err := ReadMsg(NewScanner(&buf), &got); err != nil || got != value {
+		t.Fatalf("maximum-size message did not round trip: %v", err)
+	}
+	if err := WriteMsg(&buf, value+"x"); err != ErrMessageTooLarge || buf.Len() != 0 {
+		t.Fatalf("oversized write: %d bytes, %v", buf.Len(), err)
 	}
 }
 

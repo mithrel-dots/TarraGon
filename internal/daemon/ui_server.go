@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -116,7 +117,15 @@ func (r *uiRegistry) add(c *uiClient) {
 					continue
 				}
 				_ = c.conn.SetWriteDeadline(time.Now().Add(100 * time.Millisecond))
-				if err := wire.WriteMsg(c.conn, msg); err != nil {
+				err := wire.WriteMsg(c.conn, msg)
+				if errors.Is(err, wire.ErrMessageTooLarge) {
+					reply := map[string]string{"type": "error", "error": err.Error()}
+					if update, ok := msg.(*wire.UpdateMessage); ok {
+						reply["query_id"] = update.QueryID
+					}
+					err = wire.WriteMsg(c.conn, reply)
+				}
+				if err != nil {
 					return
 				}
 			}

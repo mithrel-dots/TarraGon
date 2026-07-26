@@ -210,7 +210,10 @@ type PluginResponse struct {
 	Data    json.RawMessage `json:"data"`
 }
 
-const maxNDJSONLineSize = 1 << 20 // 1MB
+// MaxMessageSize limits one encoded JSON envelope, excluding the Unix newline.
+const MaxMessageSize = 8 << 20
+
+var ErrMessageTooLarge = errors.New("message exceeds the 8 MiB payload limit")
 
 // WriteMsg marshals v as JSON and writes it as a single NDJSON line.
 //
@@ -220,6 +223,9 @@ func WriteMsg(w io.Writer, v any) error {
 	b, err := json.Marshal(v)
 	if err != nil {
 		return err
+	}
+	if len(b) > MaxMessageSize {
+		return ErrMessageTooLarge
 	}
 
 	if _, err := w.Write(append(b, '\n')); err != nil {
@@ -239,10 +245,10 @@ func ReadMsg(scanner *bufio.Scanner, v any) error {
 	return io.EOF
 }
 
-// NewScanner creates a scanner configured for NDJSON with 1MB max line size.
+// NewScanner reserves one additional byte for the NDJSON delimiter.
 func NewScanner(r io.Reader) *bufio.Scanner {
 	scanner := bufio.NewScanner(r)
-	scanner.Buffer(make([]byte, 0, 64*1024), maxNDJSONLineSize)
+	scanner.Buffer(make([]byte, 0, 64*1024), MaxMessageSize+1)
 	return scanner
 }
 
