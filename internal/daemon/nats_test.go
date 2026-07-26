@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"net"
 	"path/filepath"
 	"strings"
@@ -34,12 +35,16 @@ func TestBrokerCarriesUnixAndNativeRequests(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer b.close()
-	registry := &pluginRegistry{bus: b}
 	ui := newUIRegistry()
 	store := NewTransientQueryStore()
+	requests, registry := startPluginRouter(b.ctx, store)
+	registry.bus = b
 	manager := plugins.NewManager(t.TempDir())
-	handleUI := func(c peerConn) { handleUIClient(ctx, c, manager, nil, registry, store, ui, nil) }
-	handlePlugin := func(c peerConn) { handlePluginConn(ctx, c, registry, store, ui) }
+	manager.Plugins["native"] = &plugins.Plugin{Config: plugins.PluginConfig{
+		Name: "native", Enabled: true, ProvidesGeneral: true, Lifecycle: plugins.LifecycleDaemon,
+	}}
+	handleUI := func(c peerConn) { handleUIClient(b.ctx, c, manager, requests, registry, store, ui, nil) }
+	handlePlugin := func(c peerConn) { handlePluginConn(b.ctx, c, registry, store, ui) }
 	if err := b.listenNative(handleUI, handlePlugin); err != nil {
 		t.Fatal(err)
 	}
@@ -85,7 +90,8 @@ func TestBrokerCarriesUnixAndNativeRequests(t *testing.T) {
 		t.Fatalf("unexpected routes %s → %s", request.Subject, reply.Subject)
 	}
 
-	for _, role := range []string{"ui", "plugin"} {
+	openSession := func(role string) (string, *nats.Subscription) {
+		t.Helper()
 		open, err := client.RequestWithContext(ctx, "tarragon."+role+".open", nil)
 		if err != nil {
 			t.Fatal(err)
@@ -95,27 +101,64 @@ func TestBrokerCarriesUnixAndNativeRequests(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		payload := `{"type":"status"}`
-		if role == "plugin" {
-			payload = `{"type":"hello","name":"native"}`
-		}
-		if err := client.Publish(base+".in", []byte(payload)); err != nil {
+		return base + ".in", sub
+	}
+	receive := func(sub *nats.Subscription, v any) {
+		t.Helper()
+		msg, err := sub.NextMsgWithContext(ctx)
+		if err != nil {
 			t.Fatal(err)
 		}
-		if role == "ui" {
-			if _, err := sub.NextMsgWithContext(ctx); err != nil {
-				t.Fatal(err)
-			}
-		} else {
-			for !registry.isConnected("native") {
-				select {
-				case <-ctx.Done():
-					t.Fatal("native plugin did not register")
-				case <-time.After(time.Millisecond):
-				}
-			}
+		if err := json.Unmarshal(msg.Data, v); err != nil {
+			t.Fatal(err)
 		}
-		if err := client.Publish(base+".in", []byte("close")); err != nil {
+	}
+	pluginIn, pluginOut := openSession("plugin")
+	if err := client.Publish(pluginIn, []byte(`{"type":"hello","name":"native"}`)); err != nil {
+		t.Fatal(err)
+	}
+	for !registry.isConnected("native") {
+		select {
+		case <-ctx.Done():
+			t.Fatal("native plugin did not register")
+		case <-time.After(time.Millisecond):
+		}
+	}
+	uiIn, uiOut := openSession("ui")
+	if err := client.Publish(uiIn, []byte(`{"type":"query","text":"hello"}`)); err != nil {
+		t.Fatal(err)
+	}
+	var ack wire.AckMessage
+	receive(uiOut, &ack)
+	var req wire.PluginRequest
+	receive(pluginOut, &req)
+	if ack.Type != "ack" || ack.QueryID == "" || req.QueryID != ack.QueryID || req.Text != "hello" {
+		t.Fatalf("ack %+v, plugin request %+v", ack, req)
+	}
+	data, err := json.Marshal(wire.PluginResponse{Type: wire.MsgResponse, QueryID: req.QueryID, Data: json.RawMessage(`{"id":"match","label":"Hello"}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Publish(pluginIn, data); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		var update wire.UpdateMessage
+		receive(uiOut, &update)
+		var snap aggregate
+		if err := json.Unmarshal(update.Payload, &snap); err != nil || update.Type != "update" || update.QueryID != ack.QueryID {
+			t.Fatalf("invalid update for %s: %v", update.QueryID, err)
+		}
+		if snap.Plugins["native"].State == "pending" {
+			continue
+		}
+		if snap.Plugins["native"].State != "done" || len(snap.List) != 1 || snap.List[0].ID != "match" || snap.List[0].Plugin != "native" {
+			t.Fatalf("unexpected final snapshot: %+v", snap)
+		}
+		break
+	}
+	for _, in := range []string{uiIn, pluginIn} {
+		if err := client.Publish(in, []byte("close")); err != nil {
 			t.Fatal(err)
 		}
 	}
