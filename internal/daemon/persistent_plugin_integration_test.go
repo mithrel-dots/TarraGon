@@ -25,7 +25,7 @@ func TestPersistentPluginE2E(t *testing.T) {
 	defer cancel()
 
 	store := newAggregateStore(10, "global", nil, 0.3)
-	uiReg := newUIRegistry()
+	uiReg := newUIRegistry(store)
 	reqOut, plugReg := testPluginListener(t, ctx, store, uiReg)
 
 	const pluginName = "plug_persistent"

@@ -44,7 +44,7 @@ func TestHandlePluginConn_SelectResponseBroadcastsToUI(t *testing.T) {
 	defer cancel()
 
 	store := newAggregateStore(10, "global", nil, 0.3)
-	uiReg := newUIRegistry()
+	uiReg := newUIRegistry(store)
 
 	uiSrv, uiCli := net.Pipe()
 	defer func() { _ = uiCli.Close() }()
@@ -89,7 +89,7 @@ func TestPluginListener_SendSelectRequestShape(t *testing.T) {
 	defer cancel()
 
 	store := newAggregateStore(10, "global", nil, 0.3)
-	uiReg := newUIRegistry()
+	uiReg := newUIRegistry(store)
 	reqOut, reg := testPluginListener(t, ctx, store, uiReg)
 
 	conn, err := dialUnixWithRetry(wire.ResolvePluginsSocketPath(), 2*time.Second)

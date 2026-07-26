@@ -2,10 +2,19 @@ package daemon
 
 import "github.com/mithrel-dots/tarragon/internal/wire"
 
-// publishToUI forwards an update to all connected UI clients.
-func publishToUI(reg *uiRegistry, qid string, payload []byte) {
-	if reg == nil {
+// Keep query removal ordered with the enqueue: once detach has been
+// acknowledged, a publisher finishing an old encode cannot queue its result.
+func (r *uiRegistry) publishSnapshot(msg *wire.UpdateMessage, _ []string) {
+	r.store.mu.RLock()
+	defer r.store.mu.RUnlock()
+	q := r.store.byID[msg.QueryID]
+	if q == nil {
 		return
 	}
-	reg.publish(&wire.UpdateMessage{Type: "update", QueryID: qid, Payload: payload})
+	r.mu.RLock()
+	client := r.clients[q.session]
+	r.mu.RUnlock()
+	if client != nil {
+		_ = client.send(msg)
+	}
 }

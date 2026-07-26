@@ -65,9 +65,9 @@ type aggregateStore struct {
 	frecencyCacheMu sync.RWMutex
 	frecencyCache   map[string]float64
 
-	order    []string
-	byID     map[string]*queryState
-	byClient map[string]map[string]struct{}
+	order   []string
+	byID    map[string]*queryState
+	byOwner map[string]map[string]struct{}
 }
 
 // NewTransientQueryStore provides the daemon's normal aggregation pipeline
@@ -102,7 +102,7 @@ func newAggregateStore(limit int, orderingMode string, frecencyDB *db.DB, frecen
 		frecencyW:     frecencyWeight,
 		frecencyCache: make(map[string]float64),
 		byID:          make(map[string]*queryState),
-		byClient:      make(map[string]map[string]struct{}),
+		byOwner:       make(map[string]map[string]struct{}),
 	}
 	if err := s.RefreshFrecencyCache(context.Background()); err != nil {
 		log.Printf("[AGG] initial frecency cache refresh failed: %v", err)
@@ -135,7 +135,7 @@ func (s *aggregateStore) frecencyScoresSnapshot() map[string]float64 {
 }
 
 func (s *aggregateStore) create(qid, client, input string) {
-	s.startQuery(context.Background(), qid, client, input, "", "")
+	s.startQuery(context.Background(), qid, client, input, client, "")
 }
 
 func (s *aggregateStore) startQuery(ctx context.Context, qid, client, input, session, stream string) {
@@ -144,16 +144,15 @@ func (s *aggregateStore) startQuery(ctx context.Context, qid, client, input, ses
 	if _, ok := s.byID[qid]; ok {
 		return
 	}
-	var cancel context.CancelFunc
 	if stream != "" {
-		for id, q := range s.byID {
-			if q.stream == stream && q.session == session {
+		for id := range s.byOwner[session] {
+			if s.byID[id].stream == stream {
 				s.removeLocked(id)
 				break
 			}
 		}
-		ctx, cancel = context.WithCancel(ctx)
 	}
+	ctx, cancel := context.WithCancel(ctx)
 	if s.limit > 0 && len(s.byID) >= s.limit {
 		s.removeLocked(s.order[0])
 	}
@@ -167,10 +166,10 @@ func (s *aggregateStore) startQuery(ctx context.Context, qid, client, input, ses
 		Created:         time.Now(),
 	}}
 	s.order = append(s.order, qid)
-	if s.byClient[client] == nil {
-		s.byClient[client] = make(map[string]struct{})
+	if s.byOwner[session] == nil {
+		s.byOwner[session] = make(map[string]struct{})
 	}
-	s.byClient[client][qid] = struct{}{}
+	s.byOwner[session][qid] = struct{}{}
 }
 
 func (s *aggregateStore) removeLocked(id string) {
@@ -179,22 +178,12 @@ func (s *aggregateStore) removeLocked(id string) {
 		q.cancel()
 	}
 	delete(s.byID, id)
-	delete(s.byClient[q.Client], id)
-	if len(s.byClient[q.Client]) == 0 {
-		delete(s.byClient, q.Client)
+	delete(s.byOwner[q.session], id)
+	if len(s.byOwner[q.session]) == 0 {
+		delete(s.byOwner, q.session)
 	}
 	i := slices.Index(s.order, id)
 	s.order = slices.Delete(s.order, i, i+1)
-}
-
-func (s *aggregateStore) removeStreams(session string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for id, q := range s.byID {
-		if q.stream != "" && q.session == session {
-			s.removeLocked(id)
-		}
-	}
 }
 
 func (s *aggregateStore) query(qid string) *queryState {
@@ -538,13 +527,10 @@ func applyFrecency(item wire.ResultItem, frecencyScores map[string]float64, weig
 	return item
 }
 
-func (s *aggregateStore) removeByClient(client string) int {
+func (s *aggregateStore) removeByOwner(uid string) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	set := s.byClient[client]
-	if set == nil {
-		return 0
-	}
+	set := s.byOwner[uid]
 	removed := len(set)
 	for qid := range set {
 		s.removeLocked(qid)

@@ -47,7 +47,7 @@ func BenchmarkAggregateFanout(b *testing.B) {
 					}
 				}
 				s.WaitForPublications()
-				s.removeByClient("ui")
+				s.removeByOwner("ui")
 			}
 		})
 	}
@@ -203,12 +203,12 @@ func TestAggregateStoreEvictsOldest(t *testing.T) {
 	}
 }
 
-func TestAggregateStoreRemoveByClient(t *testing.T) {
+func TestAggregateStoreRemoveByOwner(t *testing.T) {
 	s := newAggregateStore(10, "global", nil, 0.3)
-	s.create("q1", "cliA", "x")
-	s.create("q2", "cliA", "y")
-	s.create("q3", "cliB", "z")
-	n := s.removeByClient("cliA")
+	s.startQuery(t.Context(), "q1", "cli", "x", "a", "")
+	s.startQuery(t.Context(), "q2", "other label", "y", "a", "")
+	s.startQuery(t.Context(), "q3", "cli", "z", "b", "")
+	n := s.removeByOwner("a")
 	if n != 2 {
 		t.Fatalf("expected removed 2, got %d", n)
 	}

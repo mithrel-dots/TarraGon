@@ -1,61 +1,32 @@
 package daemon
 
 import (
-	"bufio"
 	"net"
 	"testing"
+	"time"
 
 	"github.com/mithrel-dots/tarragon/internal/wire"
 )
 
-func TestUIRegistryPublish(t *testing.T) {
-	c1, c2 := net.Pipe()
-	defer func() { _ = c2.Close() }()
+func TestPublishSnapshotRequiresLiveQueryAndOwner(t *testing.T) {
+	store := NewTransientQueryStore()
+	reg := newUIRegistry(store)
+	server, reader := net.Pipe()
+	defer reader.Close()
+	_ = reader.SetReadDeadline(time.Now().Add(time.Second))
+	client := &uiClient{conn: server, clientID: "cli"}
+	reg.add(client)
+	defer reg.remove(client)
 
-	r := newUIRegistry()
-	client := &uiClient{conn: c1, clientID: "u1"}
-	r.add(client)
-	defer r.remove(client)
-
-	done := make(chan *wire.UpdateMessage, 1)
-	go func() {
-		s := wire.NewScanner(bufio.NewReader(c2))
-		var upd wire.UpdateMessage
-		_ = wire.ReadMsg(s, &upd)
-		done <- &upd
-	}()
-
-	r.publish(&wire.UpdateMessage{Type: "update", QueryID: "q1", Payload: []byte(`{"x":1}`)})
-	upd := <-done
-	if upd.Type != "update" || upd.QueryID != "q1" || string(upd.Payload) != `{"x":1}` {
-		t.Fatalf("unexpected update: %+v", upd)
+	store.startQuery(t.Context(), "old", "cli", "", client.uid, "")
+	store.removeByOwner(client.uid)
+	store.startQuery(t.Context(), "missing-owner", "cli", "", "disconnected", "")
+	store.startQuery(t.Context(), "current", "cli", "", client.uid, "")
+	for _, qid := range []string{"old", "missing-owner", "current"} {
+		reg.publishSnapshot(&wire.UpdateMessage{Type: "update", QueryID: qid, Payload: []byte(`{"x":1}`)}, []string{"producer"})
 	}
-}
-
-func TestUIRegistryPublishSelectResponse(t *testing.T) {
-	c1, c2 := net.Pipe()
-	defer func() { _ = c2.Close() }()
-
-	r := newUIRegistry()
-	client := &uiClient{conn: c1, clientID: "u1"}
-	r.add(client)
-	defer r.remove(client)
-
-	done := make(chan *wire.SelectResponse, 1)
-	go func() {
-		s := wire.NewScanner(bufio.NewReader(c2))
-		var resp wire.SelectResponse
-		_ = wire.ReadMsg(s, &resp)
-		done <- &resp
-	}()
-
-	r.publish(&wire.SelectResponse{Type: wire.MsgSelectResponse, Success: true, Message: "ok"})
-	resp := <-done
-	if resp.Type != wire.MsgSelectResponse || !resp.Success || resp.Message != "ok" {
-		t.Fatalf("unexpected select response: %+v", resp)
+	var update wire.UpdateMessage
+	if err := wire.ReadMsg(wire.NewScanner(reader), &update); err != nil || update.QueryID != "current" || string(update.Payload) != `{"x":1}` {
+		t.Fatalf("expected only the live owner's snapshot, got %+v, %v", update, err)
 	}
-}
-
-func TestPublishToUINilRegistry(t *testing.T) {
-	publishToUI(nil, "q1", []byte(`{}`))
 }

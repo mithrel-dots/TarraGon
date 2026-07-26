@@ -26,7 +26,7 @@ func TestUIServer_AckAndUpdateOverUDS(t *testing.T) {
 	mgr.Plugins[plugName] = &plugins.Plugin{Dir: dir, Config: plugins.PluginConfig{Name: plugName, Entrypoint: filepath.Base(entry), Enabled: true, Lifecycle: plugins.LifecycleOnCall, ProvidesGeneral: true}}
 
 	store := newAggregateStore(10, "global", nil, 0.3)
-	uiReg := newUIRegistry()
+	uiReg := newUIRegistry(store)
 	reqOut := make(chan pluginRequest, 16)
 	plugReg := &pluginRegistry{}
 
@@ -107,7 +107,7 @@ func TestUIServer_SelectAndDetachAck(t *testing.T) {
 	t.Cleanup(func() { _ = database.Close() })
 
 	store := newAggregateStore(10, "global", database, 0.3)
-	uiReg := newUIRegistry()
+	uiReg := newUIRegistry(store)
 	reqOut := make(chan pluginRequest, 16)
 	plugReg := &pluginRegistry{}
 
@@ -203,7 +203,7 @@ func TestUIServer_StatusIncludesPluginSourceMetadata(t *testing.T) {
 	}}
 
 	store := newAggregateStore(10, "global", nil, 0.3)
-	uiReg := newUIRegistry()
+	uiReg := newUIRegistry(store)
 	reqOut := make(chan pluginRequest, 16)
 	plugReg := &pluginRegistry{}
 
@@ -267,7 +267,7 @@ func TestUIServer_OnCallSelectInvokesCLI(t *testing.T) {
 	mgr.Plugins[plugName] = &plugins.Plugin{Dir: dir, Config: plugins.PluginConfig{Name: plugName, Entrypoint: filepath.Base(entry), Enabled: true, Lifecycle: plugins.LifecycleOnCall}}
 
 	store := newAggregateStore(10, "global", nil, 0.3)
-	uiReg := newUIRegistry()
+	uiReg := newUIRegistry(store)
 	reqOut := make(chan pluginRequest, 16)
 	plugReg := &pluginRegistry{}
 
@@ -368,7 +368,7 @@ func TestUIServer_ReloadDiscoversNewPlugins(t *testing.T) {
 	}
 
 	store := newAggregateStore(10, "global", nil, 0.3)
-	uiReg := newUIRegistry()
+	uiReg := newUIRegistry(store)
 	reqOut := make(chan pluginRequest, 8)
 	plugReg := &pluginRegistry{}
 
@@ -436,7 +436,7 @@ func TestUIServer_RestartReportsPerPluginOutcome(t *testing.T) {
 	}
 
 	store := newAggregateStore(10, "global", nil, 0.3)
-	uiReg := newUIRegistry()
+	uiReg := newUIRegistry(store)
 	reqOut := make(chan pluginRequest, 8)
 	plugReg := &pluginRegistry{}
 
@@ -511,7 +511,7 @@ func TestUIServer_RestartTargetsSinglePlugin(t *testing.T) {
 	}
 
 	store := newAggregateStore(10, "global", nil, 0.3)
-	uiReg := newUIRegistry()
+	uiReg := newUIRegistry(store)
 	reqOut := make(chan pluginRequest, 8)
 	plugReg := &pluginRegistry{}
 
@@ -547,7 +547,7 @@ func TestUIServer_RestartUnknownPluginFails(t *testing.T) {
 
 	mgr := plugins.NewManager(t.TempDir())
 	store := newAggregateStore(10, "global", nil, 0.3)
-	uiReg := newUIRegistry()
+	uiReg := newUIRegistry(store)
 	reqOut := make(chan pluginRequest, 8)
 	plugReg := &pluginRegistry{}
 
@@ -587,7 +587,7 @@ func TestDispatchQuery_GlobalRespectsGeneralSuggestionEligibility(t *testing.T) 
 
 	store := newAggregateStore(10, "global", nil, 0.3)
 	store.create("q-global", "cli", "hello")
-	uiReg := newUIRegistry()
+	uiReg := newUIRegistry(store)
 	reqOut := make(chan pluginRequest, 16)
 	plugReg := &pluginRegistry{}
 
@@ -649,7 +649,7 @@ func TestDispatchQuery_ExplicitTargetBypassesGeneralEligibility(t *testing.T) {
 
 	store := newAggregateStore(10, "global", nil, 0.3)
 	store.create("q-target", "cli", "query")
-	uiReg := newUIRegistry()
+	uiReg := newUIRegistry(store)
 	reqOut := make(chan pluginRequest, 16)
 	plugReg := &pluginRegistry{}
 
@@ -700,7 +700,7 @@ func TestDispatchQuery_PartialPrefixDoesNotFanOutToGeneralPlugins(t *testing.T) 
 
 	store := newAggregateStore(10, "global", nil, 0.3)
 	store.create("q-partial", "cli", "@a")
-	uiReg := newUIRegistry()
+	uiReg := newUIRegistry(store)
 	reqOut := make(chan pluginRequest, 16)
 	plugReg := &pluginRegistry{}
 	srv, cli := net.Pipe()

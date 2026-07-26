@@ -59,7 +59,7 @@ func RunDaemon() error {
 		}()
 	}
 	store := newAggregateStore(maxAgg, orderingMode, database, frecencyWeight)
-	ui := newUIRegistry()
+	ui := newUIRegistry(store)
 
 	// Start plugin listener BEFORE spawning plugin processes, so the
 	// socket is ready to accept connections when plugins start.

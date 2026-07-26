@@ -19,11 +19,12 @@ import (
 	"github.com/mithrel-dots/tarragon/internal/wire"
 )
 
-var querySeq uint64
+var querySeq atomic.Uint64
 
 // uiClient tracks a connected UI.
 type uiClient struct {
 	conn     peerConn
+	uid      string
 	clientID string
 	out      chan any
 	done     chan struct{}
@@ -45,6 +46,11 @@ func (c *uiClient) stop() {
 func (c *uiClient) send(msg any) error {
 	c.queueMu.Lock()
 	defer c.queueMu.Unlock()
+	select {
+	case <-c.done:
+		return net.ErrClosed
+	default:
+	}
 	if update, ok := msg.(*wire.UpdateMessage); ok {
 		if slot := c.pending[update.QueryID]; slot != nil {
 			slot.latest = update
@@ -83,25 +89,27 @@ func (c *uiClient) takeSnapshot(slot *queuedSnapshot) *wire.UpdateMessage {
 type uiRegistry struct {
 	mu      sync.RWMutex
 	clients map[string]*uiClient
+	store   *aggregateStore
 	// Serialize config changes through the resulting process stops/starts,
 	// without holding the query path's manager lock while waiting for exit.
 	management sync.Mutex
 }
 
-func newUIRegistry() *uiRegistry {
-	return &uiRegistry{clients: make(map[string]*uiClient)}
+func newUIRegistry(store *aggregateStore) *uiRegistry {
+	return &uiRegistry{
+		clients: make(map[string]*uiClient),
+		store:   store,
+	}
 }
 
 func (r *uiRegistry) add(c *uiClient) {
+	c.uid = fmt.Sprintf("ui-%d", querySeq.Add(1))
 	c.out = make(chan any, 128)
 	c.pending = make(map[string]*queuedSnapshot)
 	c.done = make(chan struct{})
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	if old, ok := r.clients[c.clientID]; ok && old != c {
-		old.stop()
-	}
-	r.clients[c.clientID] = c
+	r.clients[c.uid] = c
+	r.mu.Unlock()
 	go func() {
 		defer r.remove(c)
 		for {
@@ -133,26 +141,10 @@ func (r *uiRegistry) add(c *uiClient) {
 	}()
 }
 
-func (r *uiRegistry) updateClientID(c *uiClient, newID string) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.clients[c.clientID] != c {
-		return
-	}
-	delete(r.clients, c.clientID)
-	c.clientID = newID
-	if old, ok := r.clients[newID]; ok && old != c {
-		old.stop()
-	}
-	r.clients[newID] = c
-}
-
 func (r *uiRegistry) remove(c *uiClient) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.clients[c.clientID] == c {
-		delete(r.clients, c.clientID)
-	}
+	delete(r.clients, c.uid)
+	r.mu.Unlock()
 	c.stop()
 }
 
@@ -164,17 +156,15 @@ func (r *uiRegistry) publish(msg any) {
 	}
 }
 
-func (r *uiRegistry) publishSnapshot(msg *wire.UpdateMessage, _ []string) { r.publish(msg) }
-
 func handleUIClient(ctx context.Context, conn peerConn, mgr *plugins.Manager, reqOut chan<- pluginRequest, pluginsReg *pluginRegistry, store *aggregateStore, ui *uiRegistry, frecencyDB *db.DB) {
 	scanner := wire.NewScanner(conn)
-	uid := fmt.Sprintf("ui-%d-%d", time.Now().UnixNano(), atomicAdd(&querySeq, 1))
-	client := &uiClient{conn: conn, clientID: uid}
+	client := &uiClient{conn: conn}
 	ui.add(client)
+	uid := client.uid
 	stopOnShutdown := context.AfterFunc(ctx, client.stop)
 	defer stopOnShutdown()
 	defer ui.remove(client)
-	defer store.removeStreams(uid)
+	defer store.removeByOwner(uid)
 
 	for {
 		select {
@@ -199,17 +189,13 @@ func handleUIClient(ctx context.Context, conn peerConn, mgr *plugins.Manager, re
 			return
 		}
 
-		if parsed.ClientID != "" && parsed.ClientID != client.clientID {
-			ui.updateClientID(client, parsed.ClientID)
+		if parsed.ClientID != "" {
+			client.clientID = parsed.ClientID
 		}
 
 		switch parsed.Type {
 		case "detach":
-			targetClient := parsed.ClientID
-			if targetClient == "" {
-				targetClient = client.clientID
-			}
-			_ = store.removeByClient(targetClient)
+			store.removeByOwner(uid)
 			_ = client.send(map[string]any{"type": "ok"})
 			continue
 		case "select":
@@ -282,7 +268,7 @@ func handleUIClient(ctx context.Context, conn peerConn, mgr *plugins.Manager, re
 					if err != nil {
 						resp = wire.SelectResponse{Type: wire.MsgSelectResponse, Success: false, Message: err.Error()}
 					}
-					ui.publish(&resp)
+					_ = client.send(&resp)
 				}
 			}
 			_ = client.send(map[string]any{"type": "ok"})
@@ -317,13 +303,8 @@ func handleUIClient(ctx context.Context, conn peerConn, mgr *plugins.Manager, re
 		if input == "" {
 			continue
 		}
-		clientID := client.clientID
-		if parsed.ClientID != "" {
-			clientID = parsed.ClientID
-		}
-
-		qid := fmt.Sprintf("q-%d-%d", time.Now().UnixNano(), atomicAdd(&querySeq, 1))
-		store.startQuery(ctx, qid, clientID, input, uid, parsed.QueryStream)
+		qid := fmt.Sprintf("q-%d-%d", time.Now().UnixNano(), querySeq.Add(1))
+		store.startQuery(ctx, qid, client.clientID, input, uid, parsed.QueryStream)
 		if err := client.send(&wire.AckMessage{Type: "ack", QueryID: qid}); err != nil {
 			return
 		}
@@ -375,7 +356,7 @@ func dispatchQuery(ctx context.Context, queryText, qid string, mgr *plugins.Mana
 		targets = append(targets, snap.name)
 	}
 	if snap, ok := store.setExpectedPlugins(qid, targets); ok {
-		ui.publish(&wire.UpdateMessage{Type: "update", QueryID: qid, Payload: snap})
+		ui.publishSnapshot(&wire.UpdateMessage{Type: "update", QueryID: qid, Payload: snap}, nil)
 	}
 	if targetName == plugins.OverviewID && len(targets) == 1 {
 		publishOverview(mgr, pluginsReg, store, ui, qid, queryText)
@@ -470,9 +451,6 @@ func startsWithRoutingPrefix(input string) bool {
 	symbol := strings.TrimSpace(plugins.PrefixSymbol())
 	return symbol != "" && strings.HasPrefix(text, symbol)
 }
-
-// atomicAdd wraps sync/atomic.AddUint64 for clarity.
-func atomicAdd(ptr *uint64, delta uint64) uint64 { return atomic.AddUint64(ptr, delta) }
 
 func resolvePrefixTarget(input string, mgr *plugins.Manager) (string, string, bool) {
 	text := strings.TrimSpace(input)

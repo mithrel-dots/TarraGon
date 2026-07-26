@@ -39,7 +39,7 @@ func benchmarkDaemonDelivery(b *testing.B, stream string, interval time.Duration
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	store := NewTransientQueryStore()
-	ui := newUIRegistry()
+	ui := newUIRegistry(store)
 	requests, registry := testPluginListener(b, ctx, store, ui)
 	manager := plugins.NewManager(dir)
 	var sent sync.Map

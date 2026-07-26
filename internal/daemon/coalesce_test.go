@@ -68,9 +68,9 @@ func TestSupersedeOnlyMatchingQueryStream(t *testing.T) {
 			t.Fatalf("cancelled unrelated query %s", id)
 		}
 	}
-	s.removeStreams("one")
-	if s.query("other-ui") == nil || s.query("independent") == nil || s.query("new") != nil {
-		t.Fatal("stream disconnect affected the wrong queries")
+	s.removeByOwner("one")
+	if s.query("other-ui") == nil || s.query("independent") != nil || s.query("new") != nil || s.query("other-box") != nil {
+		t.Fatal("disconnect affected the wrong queries")
 	}
 }
 
@@ -84,13 +84,15 @@ func TestOversizedSnapshotReportsQueryErrorAndKeepsSession(t *testing.T) {
 	server, reader := net.Pipe()
 	defer reader.Close()
 	_ = reader.SetReadDeadline(time.Now().Add(5 * time.Second))
-	reg := newUIRegistry()
+	store := NewTransientQueryStore()
+	reg := newUIRegistry(store)
 	client := &uiClient{conn: stalledConn{server}, clientID: "ui"}
 	reg.add(client)
 	defer reg.remove(client)
+	store.startQuery(t.Context(), "q", "ui", "", client.uid, "")
 	// Base64 expansion pushes the encoded envelope over the limit.
-	reg.publish(&wire.UpdateMessage{Type: "update", QueryID: "q", Payload: make([]byte, wire.MaxMessageSize*3/4)})
-	reg.publish(&wire.AckMessage{Type: "ack", QueryID: "next"})
+	reg.publishSnapshot(&wire.UpdateMessage{Type: "update", QueryID: "q", Payload: make([]byte, wire.MaxMessageSize*3/4)}, nil)
+	_ = client.send(&wire.AckMessage{Type: "ack", QueryID: "next"})
 	scanner := wire.NewScanner(reader)
 	var response map[string]string
 	if err := wire.ReadMsg(scanner, &response); err != nil || response["query_id"] != "q" || response["type"] != "error" || response["error"] != wire.ErrMessageTooLarge.Error() {
@@ -105,17 +107,20 @@ func TestOversizedSnapshotReportsQueryErrorAndKeepsSession(t *testing.T) {
 func TestUIWriterCoalescesOnlyBetweenControlMessages(t *testing.T) {
 	server, reader := net.Pipe()
 	defer reader.Close()
-	r := newUIRegistry()
+	r := newUIRegistry(NewTransientQueryStore())
 	c := &uiClient{conn: stalledConn{server}, clientID: "ui"}
 	r.add(c)
 	defer r.remove(c)
-	r.publish(1) // The writer cannot drain more until the reader starts.
+	_ = c.send(1) // The writer cannot drain more until the reader starts.
 	for i := range 300 {
-		r.publish(&wire.UpdateMessage{Type: "update", QueryID: "a", Payload: []byte{byte(i % 100)}})
-		r.publish(&wire.UpdateMessage{Type: "update", QueryID: "b", Payload: []byte{byte(i % 100)}})
+		_ = c.send(&wire.UpdateMessage{Type: "update", QueryID: "a", Payload: []byte{byte(i % 100)}})
+		_ = c.send(&wire.UpdateMessage{Type: "update", QueryID: "b", Payload: []byte{byte(i % 100)}})
 	}
-	r.publish(2)
-	r.publish(&wire.UpdateMessage{Type: "update", QueryID: "a", Payload: []byte{100}})
+	_ = c.send(&wire.SelectResponse{Type: wire.MsgSelectResponse, Success: true})
+	_ = c.send(&wire.UpdateMessage{Type: "update", QueryID: "a", Payload: []byte{100}})
+	flushed := make(writeBarrier)
+	_ = c.send(flushed)
+	_ = c.send(&wire.UpdateMessage{Type: "update", QueryID: "a", Payload: []byte{101}})
 	sc := wire.NewScanner(reader)
 	_ = reader.SetReadDeadline(time.Now().Add(time.Second))
 	control := func(want int) {
@@ -135,12 +140,22 @@ func TestUIWriterCoalescesOnlyBetweenControlMessages(t *testing.T) {
 	control(1)
 	snapshot("a", 99)
 	snapshot("b", 99)
-	control(2)
+	var terminal wire.SelectResponse
+	if err := wire.ReadMsg(sc, &terminal); err != nil || terminal.Type != wire.MsgSelectResponse || !terminal.Success {
+		t.Fatalf("terminal: %+v, %v", terminal, err)
+	}
 	snapshot("a", 100)
+	snapshot("a", 101)
+	select {
+	case <-flushed:
+	default:
+		t.Fatal("last snapshot overtook the flush barrier")
+	}
 }
 
 func TestStalledUIIsIndependentOfOtherClients(t *testing.T) {
-	r := newUIRegistry()
+	store := NewTransientQueryStore()
+	r := newUIRegistry(store)
 	blocked, unread := net.Pipe()
 	defer unread.Close()
 	slow := &uiClient{conn: stalledConn{blocked}, clientID: "slow"}
@@ -151,15 +166,18 @@ func TestStalledUIIsIndependentOfOtherClients(t *testing.T) {
 	fast := &uiClient{conn: server, clientID: "fast"}
 	r.add(fast)
 	defer r.remove(fast)
+	store.startQuery(t.Context(), "fast-query", "", "", fast.uid, "")
 	// No reader on the slow connection. The healthy client's frames must
 	// still arrive in order, without waiting for that writer to time out.
 	scanner := wire.NewScanner(reader)
 	_ = reader.SetReadDeadline(time.Now().Add(time.Second))
 	for i := range cap(slow.out) + 3 {
-		r.publish(i)
-		var got int
-		if err := wire.ReadMsg(scanner, &got); err != nil || got != i {
-			t.Fatalf("read frame %d: got %d, error %v", i, got, err)
+		_ = slow.send(i)
+		payload := []byte{byte(i)}
+		r.publishSnapshot(&wire.UpdateMessage{Type: "update", QueryID: "fast-query", Payload: payload}, nil)
+		var got wire.UpdateMessage
+		if err := wire.ReadMsg(scanner, &got); err != nil || got.QueryID != "fast-query" || !bytes.Equal(got.Payload, payload) {
+			t.Fatalf("read frame %d: got %+v, error %v", i, got, err)
 		}
 	}
 	select {

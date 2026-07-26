@@ -71,8 +71,8 @@ func TestBrokerCarriesUnixAndNativeRequests(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer b.close()
-	ui := newUIRegistry()
 	store := NewTransientQueryStore()
+	ui := newUIRegistry(store)
 	requests, registry := startPluginRouter(b.ctx, store)
 	registry.bus = b
 	manager := plugins.NewManager(t.TempDir())
@@ -107,13 +107,37 @@ func TestBrokerCarriesUnixAndNativeRequests(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer socket.Close()
-	_ = socket.SetDeadline(time.Now().Add(3 * time.Second))
-	if err := wire.WriteMsg(socket, wire.UIRequest{Type: "status"}); err != nil {
-		t.Fatal(err)
+	deadline, _ := ctx.Deadline()
+	_ = socket.SetDeadline(deadline)
+	type peer struct {
+		send func(any)
+		read func(any)
 	}
-	if !wire.NewScanner(socket).Scan() {
-		t.Fatal("no socket status reply")
+	scanner := wire.NewScanner(socket)
+	unix := peer{
+		send: func(v any) {
+			t.Helper()
+			if err := wire.WriteMsg(socket, v); err != nil {
+				t.Fatal(err)
+			}
+		},
+		read: func(v any) {
+			t.Helper()
+			if err := wire.ReadMsg(scanner, v); err != nil {
+				t.Fatal(err)
+			}
+		},
 	}
+	status := func(p peer) {
+		t.Helper()
+		p.send(wire.UIRequest{Type: "status", ClientID: "cli"})
+		var reply wire.StatusResponse
+		p.read(&reply)
+		if reply.Type != "status" {
+			t.Fatalf("expected status, received %q", reply.Type)
+		}
+	}
+	status(unix)
 	request, err := watch.NextMsgWithContext(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -126,7 +150,7 @@ func TestBrokerCarriesUnixAndNativeRequests(t *testing.T) {
 		t.Fatalf("unexpected routes %s → %s", request.Subject, reply.Subject)
 	}
 
-	openSession := func(role string) (string, *nats.Subscription) {
+	openSession := func(role string) (peer, func()) {
 		t.Helper()
 		open, err := client.RequestWithContext(ctx, "tarragon."+role+".open", nil)
 		if err != nil {
@@ -137,22 +161,48 @@ func TestBrokerCarriesUnixAndNativeRequests(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		return base + ".in", sub
-	}
-	receive := func(sub *nats.Subscription, v any) {
-		t.Helper()
-		msg, err := sub.NextMsgWithContext(ctx)
-		if err != nil {
+		if err := client.Flush(); err != nil {
 			t.Fatal(err)
 		}
-		if err := json.Unmarshal(msg.Data, v); err != nil {
-			t.Fatal(err)
+		next := func() []byte {
+			t.Helper()
+			msg, err := sub.NextMsgWithContext(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return msg.Data
+		}
+		send := func(data []byte) {
+			t.Helper()
+			if err := client.Publish(base+".in", data); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return peer{
+			send: func(v any) {
+				t.Helper()
+				data, err := json.Marshal(v)
+				if err != nil {
+					t.Fatal(err)
+				}
+				send(data)
+			},
+			read: func(v any) {
+				t.Helper()
+				if err := json.Unmarshal(next(), v); err != nil {
+					t.Fatal(err)
+				}
+			},
+		}, func() {
+			t.Helper()
+			send([]byte("close"))
+			if got := string(next()); got != "close" {
+				t.Fatalf("expected session close, got %s", got)
+			}
 		}
 	}
-	pluginIn, pluginOut := openSession("plugin")
-	if err := client.Publish(pluginIn, []byte(`{"type":"hello","name":"native"}`)); err != nil {
-		t.Fatal(err)
-	}
+	plugin, _ := openSession("plugin")
+	plugin.send(wire.PluginHello{Type: wire.MsgHello, Name: "native"})
 	for !registry.isConnected("native") {
 		select {
 		case <-ctx.Done():
@@ -160,44 +210,78 @@ func TestBrokerCarriesUnixAndNativeRequests(t *testing.T) {
 		case <-time.After(time.Millisecond):
 		}
 	}
-	uiIn, uiOut := openSession("ui")
-	if err := client.Publish(uiIn, []byte(`{"type":"query","text":"hello"}`)); err != nil {
-		t.Fatal(err)
-	}
-	var ack wire.AckMessage
-	receive(uiOut, &ack)
-	var req wire.PluginRequest
-	receive(pluginOut, &req)
-	if ack.Type != "ack" || ack.QueryID == "" || req.QueryID != ack.QueryID || req.Text != "hello" {
-		t.Fatalf("ack %+v, plugin request %+v", ack, req)
-	}
-	data, err := json.Marshal(wire.PluginResponse{Type: wire.MsgResponse, QueryID: req.QueryID, Data: json.RawMessage(`{"id":"match","label":"Hello"}`)})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := client.Publish(pluginIn, data); err != nil {
-		t.Fatal(err)
-	}
-	for {
+	native, closeNative := openSession("ui")
+	observer, _ := openSession("ui")
+	status(observer)
+	readSnapshot := func(p peer, qid, input, state string) aggregate {
+		t.Helper()
 		var update wire.UpdateMessage
-		receive(uiOut, &update)
+		p.read(&update)
 		var snap aggregate
-		if err := json.Unmarshal(update.Payload, &snap); err != nil || update.Type != "update" || update.QueryID != ack.QueryID {
-			t.Fatalf("invalid update for %s: %v", update.QueryID, err)
-		}
-		if snap.Plugins["native"].State == "pending" {
-			continue
-		}
-		if snap.Plugins["native"].State != "done" || len(snap.List) != 1 || snap.List[0].ID != "match" || snap.List[0].Plugin != "native" {
-			t.Fatalf("unexpected final snapshot: %+v", snap)
-		}
-		break
-	}
-	for _, in := range []string{uiIn, pluginIn} {
-		if err := client.Publish(in, []byte("close")); err != nil {
+		if err := json.Unmarshal(update.Payload, &snap); err != nil {
 			t.Fatal(err)
 		}
+		if update.Type != "update" || update.QueryID != qid || snap.QueryID != qid || snap.Input != input || snap.Plugins["native"].State != state {
+			t.Fatalf("want %s / %q / %s, received %s %+v", qid, input, state, update.Type, snap)
+		}
+		return snap
 	}
+	query := func(p peer, text, stream string) string {
+		t.Helper()
+		p.send(wire.UIRequest{Type: "query", Text: text, ClientID: "cli", QueryStream: stream})
+		var ack wire.AckMessage
+		p.read(&ack)
+		if ack.Type != "ack" || ack.QueryID == "" {
+			t.Fatalf("expected query ack, got %+v", ack)
+		}
+		readSnapshot(p, ack.QueryID, text, "pending")
+		var req wire.PluginRequest
+		plugin.read(&req)
+		if req.Type != wire.MsgRequest || req.QueryID != ack.QueryID || req.Text != text {
+			t.Fatalf("unexpected plugin request: %+v", req)
+		}
+		return req.QueryID
+	}
+	respond := func(qid, data string) {
+		plugin.send(wire.PluginResponse{Type: wire.MsgResponse, QueryID: qid, Data: json.RawMessage(data)})
+	}
+
+	// Hold replies until both peers have pending lists with the same label
+	// and stream. The third peer shares the native UI's broker connection.
+	unixQuery := query(unix, "unix query", "search")
+	nativeQuery := query(native, "hello", "search")
+	status(observer)
+	respond(nativeQuery, `{"id":"match","label":"Hello"}`)
+	respond(unixQuery, `[]`)
+	snap := readSnapshot(native, nativeQuery, "hello", "done")
+	if len(snap.List) != 1 || snap.List[0].ID != "match" || snap.List[0].Plugin != "native" {
+		t.Fatalf("unexpected native results: %+v", snap.List)
+	}
+	readSnapshot(unix, unixQuery, "unix query", "empty")
+
+	keep := query(unix, "still live", "")
+	detached := query(native, "detach me", "")
+	native.send(wire.UIRequest{Type: "detach", ClientID: "renamed"})
+	var ack wire.AckMessage
+	native.read(&ack)
+	if ack.Type != "ok" || store.query(detached) != nil || store.query(nativeQuery) != nil {
+		t.Fatalf("detach did not end the owner's queries: %+v", ack)
+	}
+	closed := query(native, "close me", "")
+	closeNative()
+	if store.query(closed) != nil {
+		t.Fatal("closed native session retained its non-stream query")
+	}
+	replacement, _ := openSession("ui")
+	status(replacement)
+	respond(detached, `["late detach reply"]`)
+	respond(closed, `["late close reply"]`)
+	respond(keep, `{"error":"offline"}`)
+	readSnapshot(unix, keep, "still live", "error")
+	store.WaitForPublications()
+	status(unix)
+	status(replacement)
+	status(observer)
 }
 
 func TestShutdownReleasesBlockedSelect(t *testing.T) {
@@ -212,9 +296,10 @@ func TestShutdownReleasesBlockedSelect(t *testing.T) {
 	registry.set("p", plugin, wire.NewScanner(plugin))
 	requests := make(chan pluginRequest)
 	done := make(chan struct{})
+	store := NewTransientQueryStore()
 	go func() {
 		defer close(done)
-		handleUIClient(ctx, server, nil, requests, registry, NewTransientQueryStore(), newUIRegistry(), nil)
+		handleUIClient(ctx, server, nil, requests, registry, store, newUIRegistry(store), nil)
 	}()
 	if err := wire.WriteMsg(client, wire.UIRequest{Type: "select", Plugin: "p", QueryID: "q", ResultID: "r"}); err != nil {
 		t.Fatal(err)

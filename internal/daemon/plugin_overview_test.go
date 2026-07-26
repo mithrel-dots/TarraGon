@@ -49,7 +49,8 @@ func TestPluginOverviewOverUIConnection(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		handleUIClient(ctx, server, mgr, nil, &pluginRegistry{}, NewTransientQueryStore(), newUIRegistry(), nil)
+		store := NewTransientQueryStore()
+		handleUIClient(ctx, server, mgr, nil, &pluginRegistry{}, store, newUIRegistry(store), nil)
 	}()
 	t.Cleanup(func() { cancel(); client.Close(); <-done })
 	_ = client.SetDeadline(time.Now().Add(5 * time.Second))
