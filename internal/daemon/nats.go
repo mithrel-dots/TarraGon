@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -35,9 +34,6 @@ type daemonBus struct {
 
 // Port zero disables the TCP listener; Unix adapters use in-process NATS.
 func startNATS(parent context.Context, port int, token string) (*daemonBus, error) {
-	if port != 0 && token == "" {
-		return nil, errors.New("set TARRAGON_NATS_TOKEN before enabling nats_tcp")
-	}
 	broker, err := server.NewServer(&server.Options{
 		Host: "127.0.0.1", Port: port, DontListen: port == 0, Authorization: token,
 		NoSigs: true, NoLog: true, MaxPayload: wire.MaxMessageSize,

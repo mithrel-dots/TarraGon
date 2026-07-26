@@ -24,7 +24,7 @@ Every daemon starts an embedded NATS broker. [Frontends](docs/ui.md) and [persis
 
 ![Native clients and compatibility adapters exchange messages with the daemon core through embedded NATS. The core ranks plugin results using SQLite selection history.](docs/diagrams/architecture.svg)
 
-No separate NATS service is required. To connect a native client, set `nats_tcp = true` and supply `TARRAGON_NATS_TOKEN` to the daemon and client. The listener defaults to `127.0.0.1:4222` (`nats_port`). Leave TCP off to use only the compatibility sockets; their traffic still goes through NATS.
+No separate NATS service is required. TCP is off by default. Set `nats_tcp = true` to connect native clients at `127.0.0.1:4222` (`nats_port`). Without a token, any process that can reach that loopback port has access to the whole bus. To require authentication, set a nonempty `TARRAGON_NATS_TOKEN` on the daemon and configure native clients with the same token.
 
 Restart the daemon after changing listener settings. `run_ipc` controls only `ui.sock`. Native clients need no Unix socket support, but the daemon still requires Unix sockets for its plugin listener.
 

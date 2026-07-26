@@ -6,7 +6,7 @@ The daemon routes UI traffic through embedded NATS. Use the Unix socket adapter 
 
 ## Native NATS session
 
-1. Enable the [loopback listener](../README.md#core-architecture) and connect with the configured token. Give the token only to trusted local clients: it grants access to the whole bus.
+1. Enable the [loopback listener](../README.md#core-architecture) and connect without credentials by default. If the daemon has a nonempty `TARRAGON_NATS_TOKEN`, supply that token when connecting.
 2. Send an empty NATS request to `tarragon.ui.open` (plugins use `tarragon.plugin.open`). The plain-text reply is a session subject, `tarragon.session.<id>`.
 3. Check that the reply starts with `tarragon.session.`, then subscribe to `<session>.out`. Flush the subscription before sending your first query. Publish `{"type":"query","text":"hello"}` to `<session>.in` (a publish, not a NATS request). Each JSON envelope is one NATS message.
 4. Read the `ack` on `.out`, then follow `update` messages for its `query_id`. Base64-decode `payload`, parse the JSON, and replace the displayed list. The query is complete when no entry in `plugins` is `pending`.

@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"path/filepath"
 	"strings"
@@ -37,12 +38,35 @@ func TestNativeListenerRejectsInvalidPorts(t *testing.T) {
 	}
 }
 
+func TestNativeListenerWithToken(t *testing.T) {
+	b, err := startNATS(t.Context(), -1, "test-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.close()
+	for _, token := range []string{"", "wrong-token"} {
+		client, err := nats.Connect(b.server.ClientURL(), nats.Token(token))
+		if err == nil {
+			client.Close()
+			t.Fatal("listener accepted a client without the configured token")
+		}
+		if !errors.Is(err, nats.ErrAuthorization) {
+			t.Fatalf("expected authorization error, got %v", err)
+		}
+	}
+	client, err := nats.Connect(b.server.ClientURL(), nats.Token("test-token"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.Close()
+}
+
 // A socket-only exchange must also be observable on the broker. A working
 // socket round trip alone would not catch an accidental direct-to-core path.
 func TestBrokerCarriesUnixAndNativeRequests(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	b, err := startNATS(ctx, -1, "test-token")
+	b, err := startNATS(ctx, -1, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -60,7 +84,7 @@ func TestBrokerCarriesUnixAndNativeRequests(t *testing.T) {
 	if err := b.listenNative(handleUI, handlePlugin); err != nil {
 		t.Fatal(err)
 	}
-	client, err := nats.Connect(b.server.ClientURL(), nats.Token("test-token"))
+	client, err := nats.Connect(b.server.ClientURL())
 	if err != nil {
 		t.Fatal(err)
 	}
