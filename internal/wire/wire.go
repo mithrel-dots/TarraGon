@@ -57,6 +57,7 @@ const (
 	MsgResponse       = "response"
 	MsgSelect         = "select"
 	MsgSelectResponse = "select_response"
+	MsgActionProgress = "action_progress"
 	MsgStatus         = "status"
 )
 
@@ -78,15 +79,32 @@ type Action struct {
 	Description string `json:"description,omitempty"`
 }
 
-// SelectResponse is sent from daemon to UI after executing a select action.
+// SelectResponse is the terminal outcome from a handler or from daemon to UI.
 type SelectResponse struct {
-	Type    string `json:"type"`    // "select_response"
-	Success bool   `json:"success"` // whether the action succeeded
-	Message string `json:"message,omitempty"`
+	Type      string `json:"type"`    // "select_response"
+	Success   bool   `json:"success"` // whether the action succeeded
+	Message   string `json:"message,omitempty"`
+	ActionID  string `json:"action_id,omitempty"`
+	RequestID string `json:"request_id,omitempty"`
+	Code      string `json:"code,omitempty"`
 }
 
-// UIRequest is sent from UI to daemon over REQ.
-// Type can be "query", "select", "detach", or "status".
+// SelectAck is sent to the owner before validation or dispatch.
+type SelectAck struct {
+	Type      string `json:"type"`
+	ActionID  string `json:"action_id"`
+	RequestID string `json:"request_id,omitempty"`
+}
+
+// ActionProgress is nonterminal and is delivered only to opted-in UIs.
+type ActionProgress struct {
+	Type      string `json:"type"`
+	ActionID  string `json:"action_id"`
+	RequestID string `json:"request_id,omitempty"`
+	Message   string `json:"message,omitempty"`
+}
+
+// UIRequest is a query, select or control request on a UI session.
 type UIRequest struct {
 	Type     string `json:"type"`
 	ClientID string `json:"client_id,omitempty"`
@@ -94,11 +112,13 @@ type UIRequest struct {
 	// New queries supersede older queries in this stream on the same connection.
 	QueryStream string `json:"query_stream,omitempty"`
 	// Optional fields for actions such as selection
-	QueryID  string `json:"query_id,omitempty"`
-	Plugin   string `json:"plugin,omitempty"`
-	ResultID string `json:"result_id,omitempty"`
-	Action   string `json:"action,omitempty"`
-	ID       string `json:"id,omitempty"` // backward compatibility alias for ResultID
+	QueryID    string   `json:"query_id,omitempty"`
+	Plugin     string   `json:"plugin,omitempty"`
+	ResultID   string   `json:"result_id,omitempty"`
+	Action     string   `json:"action,omitempty"`
+	ID         string   `json:"id,omitempty"` // backward compatibility alias for ResultID
+	RequestID  string   `json:"request_id,omitempty"`
+	UIFeatures []string `json:"ui_features,omitempty"`
 }
 
 // AckMessage is sent from daemon to UI after receiving a query.
@@ -201,6 +221,7 @@ type SelectRequest struct {
 	ResultID string `json:"result_id"`
 	Action   string `json:"action"`
 	QueryID  string `json:"query_id"`
+	ActionID string `json:"action_id,omitempty"`
 }
 
 // PluginResponse is sent from plugin to daemon.

@@ -125,20 +125,44 @@ func (r *uiRegistry) add(c *uiClient) {
 					continue
 				}
 				_ = c.conn.SetWriteDeadline(time.Now().Add(100 * time.Millisecond))
-				err := wire.WriteMsg(c.conn, msg)
-				if errors.Is(err, wire.ErrMessageTooLarge) {
-					reply := map[string]string{"type": "error", "error": err.Error()}
-					if update, ok := msg.(*wire.UpdateMessage); ok {
-						reply["query_id"] = update.QueryID
-					}
-					err = wire.WriteMsg(c.conn, reply)
-				}
-				if err != nil {
+				if err := writeUIFrame(c.conn, msg); err != nil {
 					return
 				}
 			}
 		}
 	}()
+}
+
+const oversizedActionMessage = "Action message exceeds the 8 MiB payload limit."
+
+func writeUIFrame(w io.Writer, msg any) error {
+	err := wire.WriteMsg(w, msg)
+	if !errors.Is(err, wire.ErrMessageTooLarge) {
+		return err
+	}
+	// The limit is checked before any bytes are written. A valid handler
+	// reply can exceed it after adding the owner's correlation fields.
+	switch m := msg.(type) {
+	case *wire.SelectResponse:
+		short := *m
+		short.Message = oversizedActionMessage
+		if short.Code == "completion_unknown" {
+			short.Message += " The effect may already have occurred."
+		}
+		if err := wire.WriteMsg(w, &short); !errors.Is(err, wire.ErrMessageTooLarge) {
+			return err
+		}
+		short.RequestID = ""
+		return wire.WriteMsg(w, &short)
+	case *wire.SelectAck:
+		return wire.WriteMsg(w, &wire.SelectAck{Type: m.Type, ActionID: m.ActionID})
+	case *wire.ActionProgress:
+		return nil // optional notification; the final can still be delivered
+	case *wire.UpdateMessage:
+		return wire.WriteMsg(w, map[string]string{"type": "error", "error": err.Error(), "query_id": m.QueryID})
+	default:
+		return wire.WriteMsg(w, map[string]string{"type": "error", "error": err.Error()})
+	}
 }
 
 func (r *uiRegistry) remove(c *uiClient) {
