@@ -21,10 +21,11 @@ type pluginCall struct {
 	ctx    context.Context
 	plugin *plugins.Plugin
 	action *selectAction
+	reaped chan struct{} // synchronous calls wait for a claimed invocation to finish
 }
 
 func (b *daemonBus) callPlugin(ctx context.Context, plugin *plugins.Plugin, req wire.UIRequest) (json.RawMessage, error) {
-	return b.requestPlugin(ctx, pluginCall{plugin: plugin}, req)
+	return b.requestPlugin(ctx, pluginCall{plugin: plugin, reaped: make(chan struct{})}, req)
 }
 
 // callPluginAction waits in the UI's dispatch goroutine. Completing the action
@@ -66,9 +67,14 @@ func (b *daemonBus) requestPlugin(ctx context.Context, call pluginCall, req wire
 		stop()
 		cancel()
 		b.mu.Lock()
+		_, unclaimed := b.calls[subject]
 		delete(b.calls, subject)
 		b.mu.Unlock()
-
+		if !unclaimed && call.reaped != nil {
+			// A refresh can dispatch as soon as the synchronous query returns.
+			// A claimed command must finish cmd.Wait before releasing that slot.
+			<-call.reaped
+		}
 	}()
 
 	response, err := b.conn.RequestWithContext(ctx, subject, data)
@@ -95,6 +101,9 @@ func (b *daemonBus) handlePluginCall(msg *nats.Msg) {
 	go func() {
 		defer b.sessions.Done()
 		result, err := b.runPluginCall(call, msg.Data)
+		if call.reaped != nil {
+			close(call.reaped)
+		}
 		response := nats.NewMsg(msg.Reply)
 		response.Data = result
 		if err != nil {

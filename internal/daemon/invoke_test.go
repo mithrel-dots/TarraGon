@@ -5,7 +5,6 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -55,9 +54,14 @@ func TestExecutionResponderReportsOversizedReply(t *testing.T) {
 func TestExecutionResponderCancelsRunningQuery(t *testing.T) {
 	b := testBus(t, context.Background())
 	dir := t.TempDir()
-	pidFile := filepath.Join(dir, "pid")
-	t.Setenv("PLUGIN_PID_FILE", pidFile)
-	writeScript(t, dir, "slow", "#!/bin/sh\necho $$ > \"$PLUGIN_PID_FILE\"\nexec sleep 15\n")
+	gate := openOnCallTestGate(t, dir)
+	writeScript(t, dir, "slow", `#!/bin/sh
+cd "${0%/*}" || exit 1
+# Hold stdout open so cmd.Wait cannot finish just because its child was killed.
+(read -r release < gate) &
+echo $$ > pid
+exec sleep 15
+`)
 	p := &plugins.Plugin{Dir: dir, Config: plugins.PluginConfig{Entrypoint: "slow"}}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -66,25 +70,25 @@ func TestExecutionResponderCancelsRunningQuery(t *testing.T) {
 		_, err := b.callPlugin(ctx, p, wire.UIRequest{Type: "query"})
 		done <- err
 	}()
-	var pid int
-	for pid == 0 {
-		data, _ := os.ReadFile(pidFile)
-		pid, _ = strconv.Atoi(strings.TrimSpace(string(data)))
-		if ctx.Err() != nil {
-			t.Fatal("plugin did not start")
-		}
-		time.Sleep(time.Millisecond)
-	}
+	pid := onCallChildPID(t, dir)
 	cancel()
-	if err := <-done; !errors.Is(err, context.Canceled) {
-		t.Fatalf("expected query cancellation, got %v", err)
-	}
 	deadline := time.Now().Add(2 * time.Second)
 	for !errors.Is(syscall.Kill(pid, 0), syscall.ESRCH) {
 		if time.Now().After(deadline) {
 			t.Fatal("cancelled plugin still running")
 		}
 		time.Sleep(time.Millisecond)
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("query returned before its claimed responder finished cmd.Wait: %v", err)
+	default:
+	}
+	if _, err := gate.WriteString("release\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected query cancellation, got %v", err)
 	}
 }
 
