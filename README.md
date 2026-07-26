@@ -30,11 +30,15 @@ Restart the daemon after changing listener settings. `run_ipc` controls only `ui
 
 ### How a suggestion reaches the UI
 
-1. **Route.** The daemon returns a `query_id`. A matching prefix targets one plugin; an unprefixed query goes to all eligible plugins.
+1. **Route.** The daemon returns a `query_id` to the frontend that asked. A matching prefix targets one plugin; an unprefixed query goes to all eligible plugins.
 2. **Merge.** The daemon normalizes each reply and replaces only that plugin’s results for the query.
-3. **Display.** The daemon ranks the results so far and sends a [full snapshot](docs/ui.md#message-shapes). The UI replaces its list without waiting for every plugin.
+3. **Display.** The daemon ranks the results so far and sends a [full snapshot](docs/ui.md#message-shapes) only to that Unix socket connection or native NATS session. The UI replaces its list without waiting for every plugin. Several plugin replies can appear in one snapshot.
 
-**Ranking.** SQLite records how often and how recently you select each result. The daemon caches these scores at startup and refreshes them after each selection. By default, ranking blends 70% plugin score with 30% selection history (`frecency_weight`).
+Two frontends can search and select concurrently, even with the same `client_id`. Each receives its own acknowledgements, updates and action outcomes. Two native sessions on one NATS connection are separate owners; broker access still allows subscribing to other subjects.
+
+**Ranking.** SQLite records how often and how recently you select each result. The daemon caches these scores at startup and refreshes them after each selection. By default, ranking blends 70% plugin score with 30% selection history (`frecency_weight`). In `global` order, equal blended scores break by ascending plugin ID, then by the plugin's original row order. In `grouped` order, groups rank by their best blended score, then by plugin ID; rows within each group keep their original order.
+
+**Selection.** A [select](docs/ui.md#selecting-a-result) gets an `ok` on receipt and one terminal `select_response` on the same open session. A plugin can [request a refresh](docs/plugins.md#refreshing-a-producers-results) of its own results on that query without re-running the action or the other producers. A plugin that just prints `["one","two"]` needs no new handshake, manifest capabilities or command-line arguments.
 
 To rebuild the diagram, install [D2](https://d2lang.com/tour/install/), edit the [source](docs/diagrams/architecture.d2), and run `just diagram`.
 
@@ -57,7 +61,7 @@ To rebuild the diagram, install [D2](https://d2lang.com/tour/install/), edit the
 ### Plugin Overview
 Type `@plugins` to browse plugins, including disabled ones. Filter by name or status with `@plugins calc` or `@plugins disabled`. Each row shows the plugin ID, effective prefix, lifecycle, and connection state. The overview is built into the daemon and uses your configured prefix symbol.
 
-Use **open** to search a plugin by its prefix, **enable** or **disable** to change its setting, and **restart** for persistent plugins. Changes use the same primary TOML overrides as `tarragon plugin config`; higher-priority drop-ins still apply. An on-demand plugin restarts on its next matching query.
+Use **open** to search a plugin by its prefix and **details** to inspect it. **Enable**, **disable** and **restart** refresh the overview using its original filter, even if an override was saved but startup failed. Changes use the same primary TOML overrides as `tarragon plugin config`; higher-priority drop-ins still apply. **Restart** applies to persistent plugins; an on-demand plugin starts again when next needed.
 
 ### Plugin System
 - **Integrated Suggestions**: Seamlessly blends suggestions from eligible plugins, including bundled plugins for installed applications and other local tasks.
@@ -65,7 +69,7 @@ Use **open** to search a plugin by its prefix, **enable** or **disable** to chan
 - **Persistent plugins** stay running between queries and stream suggestions over the broker.
 - **Plugin Lifecycle Modes**: Plugins declare their required lifecycle:
     - `daemon`: Runs persistently alongside the launcher daemon (e.g., clipboard manager).
-    - `on_demand_persistent`: Started when first needed for a query and kept running afterward.
+    - `on_demand_persistent`: Started when first needed for a query or selection and kept running afterward.
     - `on_call`: Executed per request (ephemeral process lifecycle).
 - **Fan-Out/Gather for Suggestions**: Input is broadcast to eligible plugins concurrently. Results are gathered asynchronously and displayed.
 - **Dispatch Controls**: `require_prefix` gates prefix-only plugins, while `provides_general_suggestions` is the general-suggestion eligibility contract for global/unprefixed fan-out.

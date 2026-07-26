@@ -8,7 +8,7 @@ Plugins declare a lifecycle in `plugin.toml`, and Tarragon runs them according t
 2. `on_demand_persistent`: a persistent process that Tarragon starts on first use, then keeps running until the daemon shuts down or the plugin is stopped.
 3. `on_call`: an ephemeral CLI plugin invoked as `entrypoint tarragon <subcommand>`.
 
-**Native NATS:** open a [session](ui.md#native-nats-session) on `tarragon.plugin.open`. Subscribe to `.out` for requests, then send your usual `hello` and responses on `.in`. Existing socket plugins need no changes.
+**Native NATS:** open a [session](ui.md#native-nats-session) on `tarragon.plugin.open`. Subscribe to the session's `.out` for requests and flush the subscription, then send your usual `hello` and responses on `.in`. Send one JSON envelope per NATS message. The same envelopes travel as NDJSON on `plugins.sock`. Neither transport adds a capability handshake: persistent plugins still register with `hello`, and on-call plugins need only argv and stdout.
 
 ## Directory Layout and Install
 
@@ -46,7 +46,7 @@ Restart re-reads manifests and config overrides first, so it also picks up plugi
 | Lifecycle | Status | Behavior |
 | --- | --- | --- |
 | `daemon` | `restarted` | process stopped and started again |
-| `on_demand_persistent` | `stopped` | stopped only; starts again on the next matching query |
+| `on_demand_persistent` | `stopped` | stopped only; starts again when next needed for a query or select |
 | `on_call` | `skipped` | no long-lived process to bounce |
 | any, disabled | `stopped` | stopped, not started |
 | unknown name | `error` | reported as not found |
@@ -139,8 +139,8 @@ file instead.
 
 Lifecycle modes:
 - `daemon`: started by the daemon at startup and kept running.
-- `on_demand_persistent`: started when a matching query needs the plugin and kept running afterward.
-- `on_call`: executed per request by running `entrypoint tarragon query <text>`.
+- `on_demand_persistent`: started when a matching query or select needs the plugin and kept running afterward. For a select the daemon waits for `hello` within the action deadline; the process lifetime is independent of that wait.
+- `on_call`: executed per query or select using the [CLI contract](#on-call-cli-contract).
 
 ## Dispatch Eligibility and Prefix Targeting
 
@@ -202,7 +202,9 @@ Protocol:
 
 NDJSON framing means each message is exactly one JSON object on one line, terminated by `\n`.
 
-The daemon measures latency and merges your response into the shared result snapshot. UIs also receive per-plugin query state metadata derived from dispatch/response events so they can show pending, empty, and error states while a query is still in flight.
+The daemon measures latency and merges your response into the snapshot for that `query_id`. Only the UI connection or native session that issued the query receives its updates. Its snapshot includes per-plugin states (`pending`, `done`, `empty`, `error`), and may combine several plugins' responses in one update.
+
+A persistent plugin may send more `response` frames for a retained query on the same connection. Each replaces that plugin's rows; an empty list clears them. If you opt into refresh, finish sending the old round's updates before requesting a replay. The first response after a refresh is dispatched counts as its answer: the wire carries no round number.
 
 Environment variables passed to plugins:
 - `TARRAGON_PLUGINS_ENDPOINT`: Unix socket path to connect to (for example, `/run/user/1000/tarragon/plugins.sock`).
@@ -249,11 +251,13 @@ while True:
     if not line:
         break
     msg = json.loads(line)
-    if msg.get("type") != "request":
+    if msg.get("type") == "request":
+        reply = {"type": "response", "query_id": msg["query_id"], "data": [msg["text"]]}
+    elif msg.get("type") == "select":
+        reply = {"type": "select_response", "success": True, "message": msg["result_id"]}
+    else:
         continue
-    qid, text = msg["query_id"], msg["text"]
-    data = {"echo": text}
-    s.sendall(json.dumps({"type": "response", "query_id": qid, "data": data}).encode() + b"\n")
+    s.sendall(json.dumps(reply).encode() + b"\n")
 ```
 
 ### Rust skeleton
@@ -271,12 +275,44 @@ let reader = BufReader::new(stream);
 writeln!(writer, r#"{{"type":"hello","name":"my_plugin"}}"#)?;
 
 for line in reader.lines() {
-    let line = line?;
-    // parse JSON {type:"request", query_id, text}
-    // build response {type:"response", query_id, data}
-    writeln!(writer, "{}", response_json)?;
+    let msg: serde_json::Value = serde_json::from_str(&line?)?;
+    let reply = match msg["type"].as_str() {
+        Some("request") => serde_json::json!({
+            "type": "response", "query_id": msg["query_id"], "data": [msg["text"]]
+        }),
+        Some("select") => serde_json::json!({
+            "type": "select_response", "success": true, "message": msg["result_id"]
+        }),
+        _ => continue,
+    };
+    writeln!(writer, "{}", reply)?;
 }
 ```
+
+## Persistent selects
+
+On either transport, the daemon sends `select` to the plugin that produced the row. Send **one final `select_response` per dispatched select**, on the same connection. A late reply still belongs to its original select. If you keep a query cache, the incoming `query_id` is the original ID when supplied. It can also be empty or refer to an evicted row; if you cannot act, reply with `success:false` and a useful `message`.
+
+With no `action_id` manifest capability, the exchange is unchanged:
+
+```text
+daemon → plugin  {"type":"select","query_id":"q1","result_id":"one","action":"mark"}
+plugin → daemon  {"type":"select_response","success":true,"message":"Marked"}
+```
+
+The daemon serializes selects across **all UIs** on that plugin connection; queries still flow. While one select is in flight, later selects wait in a bounded queue. Each deadline starts at receipt; an excess or expired entry is `not_run` and never reaches the plugin. If the in-flight select times out, its owner gets `completion_unknown`. The daemon quarantines that connection for selects: queued and new clicks get `not_run` until the daemon drains and discards the one late untagged final, or the connection is replaced (for example, via `@plugins` → **restart**). A successful query does not clear quarantine. Sending two finals risks acknowledging somebody else's click.
+
+To handle concurrent selects, declare `capabilities = ["action_id"]` in `plugin.toml` (retain any other capabilities). This promises that the plugin echoes the ID on every action reply. The daemon pins that capability at registration for the lifetime of the connection. Changing the manifest does not switch an open connection between modes.
+
+```text
+daemon → plugin  {"type":"select","query_id":"q1","result_id":"one","action":"mark","action_id":"a7"}
+plugin → daemon  {"type":"action_progress","action_id":"a7","message":"Applying"}
+plugin → daemon  {"type":"select_response","action_id":"a7","success":true,"message":"Marked"}
+```
+
+Tagged selects are also bounded; excess submissions get `not_run`. Tagged replies may finish out of order. The daemon matches **both** `action_id` and the dispatch connection; it drops untagged, unknown, wrong-connection, duplicate or late finals without falling back to an untagged match. `action_progress` is optional and non-final. Only matching progress for a pending action renews that action's inactivity deadline. Only a UI that requested `ui_features:["action_progress"]` on its select receives progress.
+
+On the UI side, the daemon sends `ok` for receipt (including rejected selects), then one terminal `select_response` to the originating peer while it remains connected. The daemon supplies `action_id` and echoes the UI's optional `request_id`; plugins do not choose the recipient. A definitive reply preserves the handler's `success` and `message`. When dispatch definitely did not occur, the daemon returns `success:false, code:"not_run"`; when delivery or completion is uncertain, it returns `success:false, code:"completion_unknown"`. The effect may already have happened; the action is never retried automatically.
 
 ## On-Call CLI Contract
 
@@ -287,14 +323,37 @@ $ my_plugin tarragon query "hello world"
 {"input":"hello world","variants":["HELLO WORLD","Hello World","world hello"]}
 ```
 
-- Query command: `entrypoint tarragon query <text>`
+- Query command: `entrypoint tarragon query "<text>"`
+  - the entire text is one argument, including spaces
   - stdout: one JSON payload (same shape rules as persistent plugin `data`)
   - non-zero exit: treated as plugin error
-- Select command: `entrypoint tarragon select <result-id> [action]`
+- Select command: `entrypoint tarragon select "<result-id>" [action]`
   - used when user executes a result action for this plugin
   - plugin should act based on `result-id` (on-call plugins are ephemeral and should not rely on in-memory query state)
-  - exit status controls success/failure
-  - optional stdout JSON: `{ "success": true|false, "message": "..." }`
+  - omit the action argument entirely when empty; no query or action correlation IDs are appended to argv
+  - exit zero with empty stdout means success; on a zero exit, optional stdout JSON can set `success` and `message`. A nonzero exit reports failure and is not proof that the action had no effect.
+
+For example, a script that prints `["one","two"]` on `query` and exits zero silently on `select` needs no manifest capabilities. `entrypoint tarragon query "two words"` gets a single text argument; selecting `one` without `query_id` or an action runs `entrypoint tarragon select "one"`.
+
+The UI can issue further requests while a select process runs. Failure to start the process gives `not_run`. Once started, the child can continue past the UI reply deadline under the daemon's longer process limit. The timeout gives the UI one `completion_unknown`; a late exit cannot send a second outcome or trigger a refresh. Query processes remain tied to their query request.
+
+If a select's encoded response exceeds the 8 MiB limit, the daemon shortens its message and preserves the reported outcome and any `refresh` instruction.
+
+## Refreshing a producer's results
+
+To show the effect of an action on the selected list, include a single `next` object on the final response. For an on-call select, print this to stdout and exit zero:
+
+```json
+{"success":true,"message":"Marked","next":{"type":"refresh"}}
+```
+
+A persistent handler puts the same `next` on its `select_response`, with `action_id` if it declared that capability. An action can explicitly request refresh even with `success:false`, for example if it changed some state before failing. To keep the list visible after success, give the offered row action `type:"keep_open"`.
+
+The daemon consumes `next`: it queues the action outcome, then sends only the **original producer** a query with the **original resolved text**, even if the prefix has since changed. The UI and persistent producer see the same `query_id` as before; an on-call producer receives the same query argv. Neither the select nor the other producers run again. A baseline UI just gets an ordinary full snapshot for the original query.
+
+Refresh requires a retained source query and row owned by the selecting UI, an enabled producer, and consent to replay. Asking to refresh your own result gives consent for that invocation. Declare `capabilities = ["replay"]` (alongside any existing capabilities) only if your queries are safe to repeat. Another handler cannot give consent for your plugin. A missing or ineligible source simply skips refresh; the original action outcome stands.
+
+For each `(query_id, producer)` only one query is outstanding. Multiple refresh requests during it schedule at most one follow-up after a definitive response or failure, if the source is still eligible. An ambiguous timeout does not permit a competing request with the same ID; the daemon waits for the old reply or connection retirement, or drops the state when the query goes away. Replies from a replaced connection are discarded. Old rows stay visible until replaced; return an explicit empty list to clear your rows. A transport error can mark your state `error` while retaining the last rows.
 
 ## Result Shape
 
@@ -370,7 +429,7 @@ Action types have these semantics:
 - `type: "keep_open"`: send a normal select request; the UI remains open after success.
 - `type: "query_replace"`: replace the query and submit it normally; the UI remains open.
 
-The UI should remain open when an action fails so the user can retry. The
+The UI should remain open when an action fails so the user can see the outcome. The
 `keep_open` type is a UI hint, and the UI may apply its own user-level policy.
 
 ## Makefile Specification (Required)

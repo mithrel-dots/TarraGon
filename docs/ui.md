@@ -2,14 +2,16 @@
 
 Disclaimer: This documentation was created with the help of an AI assistant. It may contain inaccuracies or omissions; please validate details and test in your environment.
 
-The daemon routes UI traffic through embedded NATS. Use the Unix socket adapter for NDJSON, or connect to the broker directly.
+The daemon routes UI traffic through embedded NATS. Use the Unix socket adapter for NDJSON, or connect to the broker directly. The application messages are the same on both transports; there is no UI capability handshake.
+
+Each Unix connection or native NATS session **owns** its queries and selects. Only that peer receives their acknowledgements, initial and later snapshots, action outcomes, and replies to its control requests. Two native sessions on the same NATS client connection are distinct owners. `client_id` is an optional, mutable label: reusing it neither takes over another session nor resumes a disconnected one. This is application routing; a trusted broker subscriber can still observe traffic on subjects it subscribes to.
 
 ## Native NATS session
 
 1. Enable the [loopback listener](../README.md#core-architecture) and connect without credentials by default. If the daemon has a nonempty `TARRAGON_NATS_TOKEN`, supply that token when connecting.
 2. Send an empty NATS request to `tarragon.ui.open` (plugins use `tarragon.plugin.open`). The plain-text reply is a session subject, `tarragon.session.<id>`.
 3. Check that the reply starts with `tarragon.session.`, then subscribe to `<session>.out`. Flush the subscription before sending your first query. Publish `{"type":"query","text":"hello"}` to `<session>.in` (a publish, not a NATS request). Each JSON envelope is one NATS message.
-4. Read the `ack` on `.out`, then follow `update` messages for its `query_id`. Base64-decode `payload`, parse the JSON, and replace the displayed list. The query is complete when no entry in `plugins` is `pending`.
+4. Read the `ack` on `.out`, then follow `update` messages for its `query_id`. Base64-decode `payload`, parse the JSON, and replace the displayed list. When no entry in `plugins` is `pending`, the current round has finished; a later action can refresh the list.
 5. Send an empty message on `.in` every 30 seconds when idle. Send the literal `close` to end the session. On a `close` reply, disconnect, or 90 seconds without input, open a new session before sending more requests.
 
 ## Responsibilities of a UI
@@ -18,7 +20,7 @@ The daemon routes UI traffic through embedded NATS. Use the Unix socket adapter 
 - Send queries and read acknowledgements/updates on that same connection.
 - Render the latest aggregate snapshot per active query.
 - Use per-plugin query state metadata to show which plugins are still pending, returned no entries, or failed.
-- Optionally support a `detach` control to ask the daemon to purge your aggregates when the UI exits.
+- `detach` or disconnect releases all queries owned by that peer, including queries without a stream. Other peers' queries are unaffected.
 
 ## Unix socket adapter
 
@@ -53,6 +55,45 @@ that stream on the same connection. Ignore already queued updates for old query
 IDs; superseded queries may never receive a final snapshot. Omit `query_stream`
 for searches that must all complete, or use distinct streams for distinct inputs.
 
+## Reading snapshots and control replies
+
+Multiple queries can run concurrently on one session. Read continuously and dispatch messages by `type`. A snapshot is the whole list so far. The aggregate publisher can combine multiple plugin responses, and the UI writer can replace a queued snapshot with a newer one for the same `query_id`. Replacement only happens between control messages or flush barriers: a terminal reply is never coalesced, and a later snapshot cannot overtake it. Use the `plugins` map to detect pending/empty/error states instead of counting updates; `started_at_unix_ms` gives the query's start time.
+
+For a control request, wait for the matching type: `status` for `status`, `restart_response` for `restart`, `reload_response` for `reload`. Keep reading with the same reader and the original deadline until that reply, an error, or EOF; an intervening `update` is not the reply. A one-shot Unix client can close its write half and keep reading: queued control replies and terminal outcomes for accepted selects arrive before EOF.
+
+Keep reading while rendering. If the bounded writer queue fills or a write times out, the session closes. After a disconnect or NATS slow-consumer error, open a new session; previous snapshots and action outcomes are not replayed. Don't automatically rerun a select or assume a plugin query is safe to repeat.
+
+## Selecting a result
+
+Send the row's `plugin` (its producer ID), `result_id`, the chosen `action` name if any, and normally the displayed `query_id`. Older callers may use `id` for `result_id`, or `text` if neither ID is present. An ordinary select can omit `query_id` or refer to an evicted list: the handler may still act or report that the row is stale. Refresh requires an owned source row.
+
+For example, this UI chooses its own `request_id` and opts into progress on this select. The daemon assigns a fresh `action_id` for each invocation, even for two clicks on the same row:
+
+```text
+UI → daemon  {"type":"select","request_id":"r7","query_id":"q1","plugin":"demo","result_id":"one","action":"mark","ui_features":["action_progress"]}
+daemon → UI  {"type":"ok","request_id":"r7","action_id":"a7"}
+daemon → UI  {"type":"action_progress","request_id":"r7","action_id":"a7","message":"Applying"}
+daemon → UI  {"type":"select_response","request_id":"r7","action_id":"a7","success":true,"message":"Marked"}
+```
+
+`ok` means received, even if validation will fail. `action_progress` is optional and non-final; it is forwarded only to the owner that requested it, if the handler sends it. Wait for exactly one `select_response` while the connection remains writable. `request_id` and `ui_features` can both be omitted. A baseline UI can keep one select outstanding, ignore additional fields, and use the next `select_response` as its answer. To overlap selects, use `request_id` to match each `ok`, then track its `action_id`. Other queries and controls can proceed while an on-call action runs.
+
+| Terminal outcome | What the UI can tell the user |
+| --- | --- |
+| Handler reports `success:true` or `success:false` | Show its `message` when present. A reported failure does not rule out partial effects. |
+| `success:false, code:"not_run"` | The action was never dispatched (for example, an invalid target or an expired queue entry). A new user-initiated attempt cannot duplicate this invocation. |
+| `success:false, code:"completion_unknown"` | The handler may already have acted. Show the explanation; never retry automatically. An on-call process can finish after the reply deadline without sending a second outcome. |
+
+Superseding a query or closing its view doesn't cancel an accepted action. Disconnecting loses the reply; a new connection with the same `client_id` cannot collect it.
+
+Keep `request_id` short. If adding correlation fields would push a reply over the 8 MiB envelope limit, the daemon keeps the terminal outcome and `action_id`, replaces the oversized message, and omits `request_id` only if it still cannot fit.
+
+### Refresh after a select
+
+A plugin can ask the daemon to refresh the selected row's **producer**. The daemon queues the terminal answer first, then, if eligible, reissues only the original producer's query with the same resolved text and `query_id`. The UI needn't send another query or interpret a `next` field. Render the ordinary full `update` for the original list. Other producers' rows remain; the refreshed rows stay visible until replaced. An empty result clears that producer's rows, while a transport error can leave its last rows visible with state `error`.
+
+No refresh is run for a missing, superseded, foreign or otherwise unavailable source, a disabled producer, or a replay without the producer's consent. A handler requesting its own results consents for that refresh; a producer can also declare `replay` in its manifest. Skipping refresh does not change the action outcome, and even a failed action can request a refresh to show partial changes. For example, `@plugins` keeps its filter when **enable**, **disable** or **restart** refreshes the overview.
+
 ### Query Replacement Actions
 
 An action may use `type: "query_replace"` and provide a `query`:
@@ -82,18 +123,9 @@ dismiss the UI after successful execution:
 ```
 
 Actions without a type retain the default behavior of dismissing the UI after
-successful selection. UIs should keep the launcher open when a selection fails
-so the user can retry. `query_replace` always keeps the UI open and takes
+successful selection. Keep the launcher open on failure to show the outcome.
+`query_replace` always keeps the UI open and takes
 precedence over any other action behavior.
-
-NDJSON framing means each message is exactly one JSON object on one line, terminated by `\n`.
-
-## Tips
-
-- Concurrency: Multiple queries can run concurrently on the same connection.
-- Snapshots: Each update contains the full current aggregate. One update can include several plugin responses; use the `plugins` map rather than counting messages to detect completion.
-- Backpressure: Keep reading while rendering. The daemon replaces queued snapshots for the same query with newer ones. If the writer's bounded queue fills or a socket write times out, that session closes. After a disconnect or NATS slow-consumer error, open a new session and resend the active query; snapshots are not replayed.
-- Plugin progress: the aggregate snapshot includes a `plugins` map keyed by stable plugin ID. UIs can render pending/empty/error states and compute pending elapsed time from `started_at_unix_ms`.
 
 ### Lifecycle-aware availability
 
@@ -103,6 +135,7 @@ When consuming daemon status metadata:
 - do not treat `connected=false` as unavailable for enabled `on_call` plugins.
 
 `on_call` plugins are expected to be dispatchable without a persistent connection.
+For a select, an enabled `on_demand_persistent` plugin can be started and awaited within the action deadline. A disconnected `daemon` handler has no such startup route.
 
 ## Message Shapes
 
@@ -117,9 +150,12 @@ When consuming daemon status metadata:
   - `payload` is Tarragon's Go `[]byte` field, which `encoding/json` marshals as a
     standard base64 string, **not** an inline JSON object. Base64-decode it
     first, then parse the decoded bytes as JSON to get the AggregateSnapshot.
+- Select and action replies: see the [select exchange and terminal outcomes](#selecting-a-result).
 - Error (Daemon → UI): `{"type":"error","query_id":"<id>","error":"..."}`. An encoded envelope, including base64, can be at most 8 MiB. If a snapshot exceeds that limit, the UI receives this error instead of that update; the session stays open.
 - AggregateSnapshot (after base64-decoding `payload`):
   - `{"query_id":"<id>","input":"<input>","started_at_unix_ms":<epoch-ms>,"results":{"<plugin>":{"elapsed_ms":<float>,"data":<plugin JSON>}, ...},"plugins":{"<plugin>":{"state":"pending|done|empty|error","count":<int>,"elapsed_ms":<float>,"error":"<message>"}},"list":[...]}`
+
+`results[plugin].data` contains the raw plugin payload. Render `list` for the merged, ranked rows. In `global` mode, sort order is descending blended score, then ascending plugin ID, with producer order retained for ties within a plugin. In `grouped` mode, groups rank by their best blended score and then plugin ID; each group's rows keep producer order regardless of score.
 
 Plugin state meanings:
 - `pending`: the plugin was selected for this query and has not responded yet.
