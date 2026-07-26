@@ -358,6 +358,73 @@ func TestSelectAdmissionSupersededRow(t *testing.T) {
 	observer.expectStatus(t)
 }
 
+func TestSelectLifetimeAcrossDetachAndOwnerLoss(t *testing.T) {
+	f := persistentFixture(t, true, 3*time.Second)
+	plugin := persistentPlugin(t, f, "p")
+	owner := f.connectUI(t, f.requests)
+	offerRow := func(ui admissionPeer) string {
+		t.Helper()
+		ui.send(t, wire.UIRequest{Type: "query", ClientID: "launcher", Text: "search"})
+		var ack wire.AckMessage
+		ui.read(t, &ack)
+		var req wire.PluginRequest
+		plugin.read(t, &req)
+		if ack.Type != "ack" || ack.QueryID == "" || req.Type != wire.MsgRequest || req.QueryID != ack.QueryID {
+			t.Fatalf("query acknowledgement %+v, plugin request %+v", ack, req)
+		}
+		plugin.send(t, wire.PluginResponse{Type: wire.MsgResponse, QueryID: ack.QueryID, Data: json.RawMessage(`["row"]`)})
+		refreshSnapshot(t, func(v any) { ui.read(t, v) }, ack.QueryID, func(q aggregate) bool {
+			return len(q.List) == 1 && q.List[0].Plugin == "p" && q.List[0].ID == "row"
+		})
+		return ack.QueryID
+	}
+	dispatch := func(queryID string) wire.SelectAck {
+		t.Helper()
+		req := click("row")
+		req.QueryID = queryID
+		ack := owner.selectRow(t, req)
+		var got wire.SelectRequest
+		plugin.read(t, &got)
+		if got.Type != wire.MsgSelect || got.QueryID != queryID || got.ResultID != req.ResultID || got.ActionID != ack.ActionID {
+			t.Fatalf("unexpected tagged select: %+v", got)
+		}
+		return ack
+	}
+
+	id := offerRow(owner)
+	a := dispatch(id)
+	owner.send(t, wire.UIRequest{Type: "detach"})
+	var detach wire.SelectAck
+	owner.read(t, &detach)
+	if detach.Type != "ok" || detach.ActionID != "" || f.store.query(id) != nil {
+		t.Fatalf("detach did not release query %s: %+v", id, detach)
+	}
+	plugin.reply(t, a.ActionID, "finished after detach", true)
+	if resp := owner.outcome(t, a, true, ""); resp.Message != "finished after detach" {
+		t.Fatalf("wrong outcome after detach: %+v", resp)
+	}
+	plugin.readBarrier(t)
+	owner.expectStatus(t)
+
+	id = offerRow(owner)
+	b := dispatch(id)
+	queryEnded := f.store.query(id).ctx.Done()
+	if err := owner.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-queryEnded:
+	case <-time.After(2 * time.Second):
+		t.Fatal("daemon did not observe owner disconnect")
+	}
+	replacement := f.connectUI(t, f.requests)
+	offerRow(replacement) // same client label and displayed row on a new session
+	plugin.send(t, wire.SelectResponse{Type: wire.MsgSelectResponse, ActionID: b.ActionID, Success: true, Next: &wire.ActionNext{Type: "refresh"}})
+	plugin.readBarrier(t)
+	replacement.expectStatus(t)
+	plugin.expectNoWrite(t)
+}
+
 func (f *admissionFixture) onDemandListener(t *testing.T) *net.UnixListener {
 	t.Helper()
 	dir := t.TempDir()

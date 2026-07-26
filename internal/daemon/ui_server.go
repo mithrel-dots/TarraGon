@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"strings"
 	"sync"
@@ -291,111 +290,109 @@ func dispatchQuery(ctx context.Context, queryText, qid string, mgr *plugins.Mana
 	if query == nil {
 		return
 	}
-	queryCtx := query.ctx
-	type pluginSnapshot struct {
-		name string
-		dir  string
-		cfg  plugins.PluginConfig
-	}
-
+	route := &resolvedQuery{q: query, text: queryText, daemonCtx: ctx, mgr: mgr, registry: pluginsReg, requests: reqOut, store: store, ui: ui}
+	producers := make(map[string]*producerDispatch)
+	var persistent, onCall []string
 	mgr.RLock()
-	snaps := make([]pluginSnapshot, 0, len(mgr.Plugins))
 	for name, p := range mgr.Plugins {
-		snaps = append(snaps, pluginSnapshot{name: name, dir: p.Dir, cfg: p.Config})
+		if !p.Config.Enabled || !isEligibleForDispatch(name, p.Config, hasTarget, targetName) {
+			continue
+		}
+		producers[name] = &producerDispatch{resolvedQuery: route, name: name, outstanding: true}
+		if p.Config.Lifecycle == plugins.LifecycleOnCall {
+			onCall = append(onCall, name)
+		} else {
+			persistent = append(persistent, name)
+		}
 	}
 	mgr.RUnlock()
-
-	targets := make([]string, 0, len(snaps))
-	for _, snap := range snaps {
-		if queryCtx.Err() != nil {
-			return
-		}
-		if !snap.cfg.Enabled {
-			continue
-		}
-		if !isEligibleForDispatch(snap.name, snap.cfg, hasTarget, targetName) {
-			continue
-		}
-		targets = append(targets, snap.name)
-	}
+	targets := append(persistent, onCall...)
+	query.mu.Lock()
+	query.producers = producers
+	query.mu.Unlock()
 	if snap, ok := store.setExpectedPlugins(qid, targets); ok {
 		ui.publishSnapshot(&wire.UpdateMessage{Type: "update", QueryID: qid, Payload: snap}, nil)
 	}
-	if targetName == plugins.OverviewID && len(targets) == 1 {
-		publishOverview(mgr, pluginsReg, store, ui, qid, queryText)
+	for _, name := range targets {
+		producers[name].run(initialDispatch)
+	}
+}
+
+// run invokes exactly the recorded producer. A refresh never re-resolves the
+// prefix or rediscovers the eligible set, even if the configuration changed.
+func (d *producerDispatch) run(reason dispatchReason) {
+	if d.q.ctx.Err() != nil {
 		return
 	}
-
-	for _, snap := range snaps {
-		if queryCtx.Err() != nil {
+	start := time.Now()
+	d.mgr.RLock()
+	plugin := d.eligiblePluginLocked(reason)
+	if plugin == nil {
+		d.mgr.RUnlock()
+		if reason == initialDispatch {
+			d.fail(start, "plugin disabled")
+		} else {
+			d.complete()
+		}
+		return
+	}
+	lifecycle := plugin.Config.Lifecycle
+	var onCall *plugins.Plugin
+	if lifecycle == plugins.LifecycleOnCall && d.name != plugins.OverviewID {
+		onCall = &plugins.Plugin{Dir: plugin.Dir, Config: plugin.Config}
+	}
+	d.mgr.RUnlock()
+	if d.name == plugins.OverviewID {
+		data, err := queryOverview(d.mgr, d.registry, d.text)
+		d.result(start, data, err)
+		return
+	}
+	if onCall != nil {
+		// A lifecycle change can leave the old persistent connection registered.
+		d.q.mu.Lock()
+		d.updatesFrom = nil
+		d.q.mu.Unlock()
+		ctx, cancel := context.WithTimeout(d.q.ctx, 3*time.Second)
+		data, err := d.registry.bus.callPlugin(ctx, onCall, wire.UIRequest{Type: "query", QueryID: d.q.QueryID, Text: d.text})
+		cancel()
+		if err == nil && !json.Valid(data) {
+			d.fail(start, "invalid on-call query response JSON")
 			return
 		}
-		if !snap.cfg.Enabled {
-			continue
+		if err != nil && reason == initialDispatch {
+			// Preserve the initial error payload expected by legacy clients.
+			// A refresh failure instead keeps the last valid data visible.
+			data, err = json.Marshal(map[string]string{"error": err.Error()})
 		}
-		if snap.cfg.Lifecycle == plugins.LifecycleOnCall {
-			continue
+		d.result(start, data, err)
+		return
+	}
+	if lifecycle == plugins.LifecycleOnDemandPersistent && !d.registry.isConnected(d.name) {
+		if err := d.mgr.StartOnDemand(d.daemonCtx, d.name, wire.ResolvePluginsSocketPath()); err != nil {
+			d.fail(start, err.Error())
+			return
 		}
-		if !isEligibleForDispatch(snap.name, snap.cfg, hasTarget, targetName) {
-			continue
-		}
-
-		if snap.cfg.Lifecycle == plugins.LifecycleOnDemandPersistent && !pluginsReg.isConnected(snap.name) {
-			if err := mgr.StartOnDemand(ctx, snap.name, wire.ResolvePluginsSocketPath()); err != nil {
-				log.Printf("[UI] failed to start on-demand plugin %s: %v", snap.name, err)
-				store.submitError(qid, snap.name, 0, err.Error(), ui.publishSnapshot)
-				continue
-			}
-
-			connected := false
-			for i := 0; i < 40; i++ {
-				if pluginsReg.isConnected(snap.name) {
-					connected = true
-					break
-				}
-				select {
-				case <-time.After(50 * time.Millisecond):
-				case <-queryCtx.Done():
-					return
-				}
-			}
-
-			if !connected {
-				log.Printf("[UI] on-demand plugin %s did not connect within 2s; skipping query %s", snap.name, qid)
-				store.submitError(qid, snap.name, 2000, "plugin did not connect", ui.publishSnapshot)
-				continue
-			}
-		}
-
-		if conn, ok := pluginsReg.getConn(snap.name); ok {
-			select {
-			case reqOut <- pluginRequest{name: snap.name, queryID: qid, text: queryText, conn: conn}:
-			case <-queryCtx.Done():
-				return
-			}
-		} else {
-			store.submitError(qid, snap.name, 0, "plugin not connected", ui.publishSnapshot)
+		ctx, cancel := context.WithTimeout(d.q.ctx, 2*time.Second)
+		_, connected := d.registry.waitConn(ctx, d.name, nil)
+		cancel()
+		if !connected {
+			d.fail(start, "plugin did not connect")
+			return
 		}
 	}
-
-	for _, snap := range snaps {
-		if queryCtx.Err() != nil {
-			return
-		}
-		if !snap.cfg.Enabled || snap.cfg.Lifecycle != plugins.LifecycleOnCall {
-			continue
-		}
-		if !isEligibleForDispatch(snap.name, snap.cfg, hasTarget, targetName) {
-			continue
-		}
-		t0 := time.Now()
-		pctx, cancel := context.WithTimeout(queryCtx, 3*time.Second)
-		raw, err := pluginsReg.bus.callPlugin(pctx, &plugins.Plugin{Dir: snap.dir, Config: snap.cfg}, wire.UIRequest{Type: "query", Text: queryText})
-		cancel()
-		if err != nil {
-			raw = json.RawMessage([]byte(fmt.Sprintf(`{"error":"%s"}`, escapeJSONString(err.Error()))))
-		}
-		store.SubmitResponse(snap.name, wire.PluginResponse{QueryID: qid, Data: raw}, float64(time.Since(t0).Microseconds())/1000.0, ui.publishSnapshot)
+	// Pin before enqueue, under the same query lock used by retirement.
+	// The router marks the actual write start; an earlier reply is unsolicited.
+	d.q.mu.Lock()
+	conn, ok := d.registry.getConn(d.name)
+	d.conn, d.reason = conn, reason
+	d.q.mu.Unlock()
+	if !ok {
+		d.fail(start, "plugin not connected")
+		return
+	}
+	select {
+	case d.requests <- pluginRequest{name: d.name, queryID: d.q.QueryID, text: d.text, conn: conn}:
+	case <-d.q.ctx.Done():
 	}
 }
 

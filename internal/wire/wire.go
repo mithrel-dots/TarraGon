@@ -79,14 +79,21 @@ type Action struct {
 	Description string `json:"description,omitempty"`
 }
 
+// ActionNext is a continuation requested by the handler. The daemon consumes
+// "refresh" after sending the ordinary terminal reply to the owner.
+type ActionNext struct {
+	Type string `json:"type"`
+}
+
 // SelectResponse is the terminal outcome from a handler or from daemon to UI.
 type SelectResponse struct {
-	Type      string `json:"type"`    // "select_response"
-	Success   bool   `json:"success"` // whether the action succeeded
-	Message   string `json:"message,omitempty"`
-	ActionID  string `json:"action_id,omitempty"`
-	RequestID string `json:"request_id,omitempty"`
-	Code      string `json:"code,omitempty"`
+	Type      string      `json:"type"`    // "select_response"
+	Success   bool        `json:"success"` // whether the action succeeded
+	Message   string      `json:"message,omitempty"`
+	ActionID  string      `json:"action_id,omitempty"`
+	RequestID string      `json:"request_id,omitempty"`
+	Code      string      `json:"code,omitempty"`
+	Next      *ActionNext `json:"next,omitempty"`
 }
 
 // SelectAck is sent to the owner before validation or dispatch.

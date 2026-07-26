@@ -2,7 +2,6 @@ package daemon
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -199,23 +198,5 @@ func TestOnCallActionExpiredBeforeStart(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, "ran")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("expired call was executed: stat error %v", err)
-	}
-}
-
-func refreshSnapshot(t *testing.T, read func(any), qid string, ready func(aggregate) bool) aggregate {
-	t.Helper()
-	for {
-		var update wire.UpdateMessage
-		read(&update)
-		if update.Type != "update" || update.QueryID != qid {
-			t.Fatalf("expected an update for %s, got %s for %s", qid, update.Type, update.QueryID)
-		}
-		var snap aggregate
-		if err := json.Unmarshal(update.Payload, &snap); err != nil {
-			t.Fatal(err)
-		}
-		if ready(snap) {
-			return snap
-		}
 	}
 }

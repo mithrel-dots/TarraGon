@@ -49,7 +49,7 @@ type queryState struct {
 	session, stream string
 	ctx             context.Context
 	cancel          context.CancelFunc
-	started         map[string]time.Time
+	producers       map[string]*producerDispatch
 	encoders        int
 	mapsShared      bool
 }
@@ -218,8 +218,20 @@ func (s *aggregateStore) SubmitResponse(plugin string, resp wire.PluginResponse,
 	if q == nil {
 		return false
 	}
-	items, errMsg := normalizeResults(plugin, resp.Data)
-	count := len(items)
+	result, errMsg := parseResult(plugin, resp.Data, elapsed)
+	q.mu.Lock()
+	s.replaceResultLocked(q, plugin, result, errMsg, publish)
+	return true
+}
+
+func parseResult(plugin string, raw json.RawMessage, elapsed float64) (aggResult, string) {
+	items, errMsg := normalizeResults(plugin, raw)
+	return aggResult{Data: raw, items: items, ElapsedMs: elapsed}, errMsg
+}
+
+// replaceResultLocked releases q.mu through scheduleLocked.
+func (s *aggregateStore) replaceResultLocked(q *queryState, plugin string, result aggResult, errMsg string, publish SnapshotPublisher) {
+	count := len(result.items)
 	state := "done"
 	if errMsg != "" {
 		state = "error"
@@ -227,12 +239,10 @@ func (s *aggregateStore) SubmitResponse(plugin string, resp wire.PluginResponse,
 		state = "empty"
 	}
 
-	q.mu.Lock()
 	q.detachSnapshot()
-	q.Results[plugin] = aggResult{ElapsedMs: elapsed, Data: resp.Data, items: items}
-	q.Plugins[plugin] = aggPluginState{State: state, Count: count, ElapsedMs: elapsed, Error: errMsg}
+	q.Results[plugin] = result
+	q.Plugins[plugin] = aggPluginState{State: state, Count: count, ElapsedMs: result.ElapsedMs, Error: errMsg}
 	s.scheduleLocked(q, plugin, publish)
-	return true
 }
 
 func (s *aggregateStore) submitError(qid, plugin string, elapsed float64, errMsg string, publish SnapshotPublisher) bool {

@@ -258,6 +258,11 @@ func TestBrokerCarriesUnixAndNativeRequests(t *testing.T) {
 		t.Fatalf("unexpected native results: %+v", snap.List)
 	}
 	readSnapshot(unix, unixQuery, "unix query", "empty")
+	respond(unixQuery, `["updated"]`)
+	snap = readSnapshot(unix, unixQuery, "unix query", "done")
+	if len(snap.List) != 1 || snap.List[0].ID != "updated" {
+		t.Fatalf("lost replacement from the original producer: %+v", snap.List)
+	}
 
 	keep := query(unix, "still live", "")
 	detached := query(native, "detach me", "")

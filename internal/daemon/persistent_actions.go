@@ -133,7 +133,7 @@ func (s *pluginSession) final(resp wire.SelectResponse) bool {
 	}
 	s.mu.Unlock()
 
-	won := a.finish(resp.Success, resp.Message)
+	won := a.finish(resp.Success, resp.Message, resp.Next)
 	if !won {
 		log.Printf("[PLUGINS] dropping late select_response from %s (action_id=%q)", s.name, resp.ActionID)
 	}

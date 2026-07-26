@@ -48,7 +48,7 @@ func (b *daemonBus) callPluginAction(ctx context.Context, plugin *plugins.Plugin
 		a.fail(err.Error())
 		return
 	}
-	a.finish(response.Success, response.Message)
+	a.finish(response.Success, response.Message, response.Next)
 }
 
 func (b *daemonBus) requestPlugin(ctx context.Context, call pluginCall, req wire.UIRequest) (json.RawMessage, error) {
@@ -156,6 +156,9 @@ func (b *daemonBus) runPluginCall(c pluginCall, data []byte) (json.RawMessage, e
 		data, err := json.Marshal(response)
 		if len(data) > wire.MaxMessageSize {
 			response.Message = oversizedActionMessage
+			if response.Next != nil && response.Next.Type != "refresh" {
+				response.Next = nil
+			}
 			return json.Marshal(response)
 		}
 		return data, err

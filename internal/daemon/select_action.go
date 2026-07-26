@@ -25,8 +25,10 @@ type selectAction struct {
 	resultID  string
 	handler   string
 	action    string
+	offered   bool // an owned source row existed when this select was received
 
 	client        *uiClient
+	store         *aggregateStore
 	wantsProgress bool
 	received      time.Time
 	timeout       time.Duration
@@ -59,6 +61,7 @@ func (ui *uiRegistry) acceptSelect(session context.Context, client *uiClient, re
 		action:        req.Action,
 		wantsProgress: slices.Contains(req.UIFeatures, wire.MsgActionProgress),
 		client:        client,
+		store:         ui.store,
 		received:      time.Now(),
 		timeout:       ui.actionTimeout,
 		done:          make(chan struct{}),
@@ -73,6 +76,7 @@ func (ui *uiRegistry) acceptSelect(session context.Context, client *uiClient, re
 		a.notRun("Too many pending actions.")
 		return nil
 	}
+	a.offered = ui.store.offeredRow(a.owner, a.queryID, a.producer, a.resultID)
 	a.mu.Lock()
 	client.actions.Add(1)
 	stop := context.AfterFunc(session, func() { a.fail("UI session closed.") })
@@ -158,18 +162,18 @@ func (a *selectAction) expire() {
 	a.failLocked("Action deadline expired.")
 }
 
-func (a *selectAction) finish(success bool, message string) bool {
+func (a *selectAction) finish(success bool, message string, next *wire.ActionNext) bool {
 	a.mu.Lock()
 	if !a.terminal && !time.Now().Before(a.deadline) {
 		a.failLocked("Action deadline expired.")
 		return false
 	}
-	return a.completeLocked(wire.SelectResponse{Success: success, Message: message})
+	return a.completeLocked(wire.SelectResponse{Success: success, Message: message}, next)
 }
 
 func (a *selectAction) notRun(message string) {
 	a.mu.Lock()
-	a.completeLocked(wire.SelectResponse{Code: "not_run", Message: message})
+	a.completeLocked(wire.SelectResponse{Code: "not_run", Message: message}, nil)
 }
 
 func (a *selectAction) fail(message string) {
@@ -183,12 +187,12 @@ func (a *selectAction) failLocked(message string) {
 		code = "completion_unknown"
 		message += " The effect may already have occurred."
 	}
-	a.completeLocked(wire.SelectResponse{Code: code, Message: message})
+	a.completeLocked(wire.SelectResponse{Code: code, Message: message}, nil)
 }
 
 // completeLocked consumes the lock. Exactly one caller can close done,
 // publish a terminal, retire its connection slot and run its continuation.
-func (a *selectAction) completeLocked(resp wire.SelectResponse) bool {
+func (a *selectAction) completeLocked(resp wire.SelectResponse, next *wire.ActionNext) bool {
 	if a.terminal {
 		a.mu.Unlock()
 		return false
@@ -203,9 +207,12 @@ func (a *selectAction) completeLocked(resp wire.SelectResponse) bool {
 	a.mu.Unlock()
 
 	resp.Type, resp.ActionID, resp.RequestID = wire.MsgSelectResponse, a.id, a.requestID
-	_ = a.client.send(&resp)
+	err := a.client.send(&resp)
 	for _, fn := range cleanup {
 		fn()
+	}
+	if err == nil && next != nil && next.Type == "refresh" {
+		a.store.refreshAction(a)
 	}
 	return true
 }
@@ -228,17 +235,11 @@ func (ui *uiRegistry) routeSelect(ctx context.Context, mgr *plugins.Manager, reg
 	}
 	if a.handler == plugins.OverviewID {
 		go func() {
-			msg, refresh, err := ui.selectOverview(ctx, mgr, reg, a)
+			msg, next, err := ui.selectOverview(ctx, mgr, reg, a)
 			if err != nil {
 				msg = err.Error()
 			}
-			if a.finish(err == nil, msg) && refresh {
-				if q := ui.store.query(a.queryID); q != nil && q.session == a.owner {
-					if target, filter, ok := resolvePrefixTarget(q.Input, mgr); ok && target == plugins.OverviewID {
-						publishOverview(mgr, reg, ui.store, ui, a.queryID, filter)
-					}
-				}
-			}
+			a.finish(err == nil, msg, next)
 		}()
 		return
 	}

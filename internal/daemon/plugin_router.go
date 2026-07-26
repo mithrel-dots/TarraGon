@@ -163,16 +163,9 @@ func startPluginRouter(ctx context.Context, store *aggregateStore) (chan<- plugi
 					continue
 				}
 				conn := s.conn
-				q := store.query(req.queryID)
-				if q == nil || q.ctx.Err() != nil {
-					continue // evicted or superseded while queued
+				if !store.beginQueryWrite(req, conn) {
+					continue // ended or retired while queued
 				}
-				q.mu.Lock()
-				if q.started == nil {
-					q.started = make(map[string]time.Time)
-				}
-				q.started[req.name] = time.Now()
-				q.mu.Unlock()
 				_ = conn.SetWriteDeadline(time.Now().Add(100 * time.Millisecond))
 				err := wire.WriteMsg(conn, &wire.PluginRequest{Type: wire.MsgRequest, QueryID: req.queryID, Text: req.text})
 				_ = conn.SetWriteDeadline(time.Time{})
@@ -207,6 +200,7 @@ func handlePluginConn(ctx context.Context, conn peerConn, registry *pluginRegist
 
 	defer func() {
 		registry.remove(hello.Name, conn)
+		store.retireQueries(hello.Name, conn)
 		log.Printf("[PLUGINS] plugin disconnected: %s", hello.Name)
 	}()
 
@@ -228,19 +222,7 @@ func handlePluginConn(ctx context.Context, conn peerConn, registry *pluginRegist
 
 		switch resp.Type {
 		case wire.MsgResponse:
-			q := store.query(resp.QueryID)
-			if q == nil {
-				continue
-			}
-			q.mu.Lock()
-			start := q.started[hello.Name]
-			delete(q.started, hello.Name)
-			q.mu.Unlock()
-			var elapsed float64
-			if !start.IsZero() {
-				elapsed = float64(time.Since(start).Microseconds()) / 1000
-			}
-			store.SubmitResponse(hello.Name, resp, elapsed, ui.publishSnapshot)
+			store.receiveQuery(hello.Name, conn, resp)
 
 		case wire.MsgSelectResponse:
 			var resp wire.SelectResponse

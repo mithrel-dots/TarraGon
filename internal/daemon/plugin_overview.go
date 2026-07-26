@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"time"
 
 	"github.com/mithrel-dots/tarragon/internal/config"
 	"github.com/mithrel-dots/tarragon/internal/plugins"
@@ -81,18 +80,12 @@ nextPlugin:
 	return items
 }
 
-func publishOverview(mgr *plugins.Manager, reg *pluginRegistry, store *aggregateStore, ui *uiRegistry, qid, filter string) {
-	start := time.Now()
+func queryOverview(mgr *plugins.Manager, reg *pluginRegistry, filter string) (json.RawMessage, error) {
 	items := overviewItems(pluginStatus(mgr, reg).Plugins, filter)
-	data, err := json.Marshal(items)
-	if err != nil {
-		store.submitError(qid, plugins.OverviewID, 0, err.Error(), ui.publishSnapshot)
-		return
-	}
-	store.SubmitResponse(plugins.OverviewID, wire.PluginResponse{QueryID: qid, Data: data}, float64(time.Since(start).Microseconds())/1000, ui.publishSnapshot)
+	return json.Marshal(items)
 }
 
-func (ui *uiRegistry) selectOverview(ctx context.Context, mgr *plugins.Manager, reg *pluginRegistry, a *selectAction) (string, bool, error) {
+func (ui *uiRegistry) selectOverview(ctx context.Context, mgr *plugins.Manager, reg *pluginRegistry, a *selectAction) (string, *wire.ActionNext, error) {
 	ui.management.Lock()
 	defer ui.management.Unlock()
 	id, action := a.resultID, a.action
@@ -109,23 +102,23 @@ func (ui *uiRegistry) selectOverview(ctx context.Context, mgr *plugins.Manager, 
 	if !available {
 		msg := "plugins overview is disabled"
 		a.notRun(msg)
-		return "", false, errors.New(msg)
+		return "", nil, errors.New(msg)
 	}
 	if target.ID == "" {
 		msg := fmt.Sprintf("unknown plugin %q", id)
 		a.notRun(msg)
-		return "", false, errors.New(msg)
+		return "", nil, errors.New(msg)
 	}
 	if !a.beginDispatch() {
-		return "", false, errors.New("action expired")
+		return "", nil, errors.New("action expired")
 	}
 	if action == "" || action == "details" {
-		return overviewDescription(target), false, nil
+		return overviewDescription(target), nil, nil
 	}
 	if id == plugins.OverviewID {
-		return "", false, errors.New("the built-in overview cannot manage itself")
+		return "", nil, errors.New("the built-in overview cannot manage itself")
 	}
-
+	refresh := &wire.ActionNext{Type: "refresh"}
 	switch action {
 	case "enable", "disable":
 		enabled := action == "enable"
@@ -133,32 +126,32 @@ func (ui *uiRegistry) selectOverview(ctx context.Context, mgr *plugins.Manager, 
 			return config.WritePluginOverride(id, map[string]any{"enabled": enabled})
 		})
 		if err != nil {
-			return "", true, err
+			return "", refresh, err
 		}
 		mgr.RLock()
 		effective := mgr.Plugins[id].Config.Enabled
 		mgr.RUnlock()
 		if effective != enabled {
-			return "", true, fmt.Errorf("saved setting for %s, but a higher-precedence override takes priority", id)
+			return "", refresh, fmt.Errorf("saved setting for %s, but a higher-precedence override takes priority", id)
 		}
 		if enabled {
-			return id + " enabled", true, nil
+			return id + " enabled", refresh, nil
 		}
-		return id + " disabled", true, nil
+		return id + " disabled", refresh, nil
 	case "restart":
 		if !canRestart(target) {
-			return "", true, fmt.Errorf("%s has no enabled persistent process to restart", id)
+			return "", refresh, fmt.Errorf("%s has no enabled persistent process to restart", id)
 		}
 		resp := restartPlugins(ctx, mgr, id)
 		if len(resp.Results) == 0 {
-			return "", true, errors.New(resp.Message)
+			return "", refresh, errors.New(resp.Message)
 		}
 		r := resp.Results[0]
 		if !resp.Success || r.Status == plugins.RestartStatusSkipped {
-			return "", true, fmt.Errorf("%s: %s", id, r.Message)
+			return "", refresh, fmt.Errorf("%s: %s", id, r.Message)
 		}
-		return strings.TrimSpace(fmt.Sprintf("%s: %s %s", id, r.Status, r.Message)), true, nil
+		return strings.TrimSpace(fmt.Sprintf("%s: %s %s", id, r.Status, r.Message)), refresh, nil
 	default:
-		return "", false, fmt.Errorf("unknown plugins action %q", action)
+		return "", nil, fmt.Errorf("unknown plugins action %q", action)
 	}
 }

@@ -56,7 +56,7 @@ func invokeOnCallQuery(ctx context.Context, p *plugins.Plugin, query string) (js
 //	<entrypoint> tarragon select <result-id> [action]
 //
 // If stdout is empty and exit status is zero, the action is treated as success.
-// If stdout contains JSON, it may include {"success": bool, "message": string}.
+// JSON stdout can override success, supply a message, or request a continuation.
 func invokeOnCallSelect(ctx context.Context, p *plugins.Plugin, resultID, action string) (wire.SelectResponse, error) {
 	return runOnCallSelect(ctx, p, resultID, action, nil)
 }
@@ -101,8 +101,9 @@ func runOnCallSelect(ctx context.Context, p *plugins.Plugin, resultID, action st
 	}
 
 	var parsed struct {
-		Success *bool  `json:"success"`
-		Message string `json:"message"`
+		Success *bool            `json:"success"`
+		Message string           `json:"message"`
+		Next    *wire.ActionNext `json:"next"`
 	}
 	if err := json.Unmarshal(out, &parsed); err != nil {
 		return wire.SelectResponse{}, fmt.Errorf("%s: invalid select response JSON: %w", p.Config.ID, err)
@@ -111,6 +112,7 @@ func runOnCallSelect(ctx context.Context, p *plugins.Plugin, resultID, action st
 		resp.Success = *parsed.Success
 	}
 	resp.Message = parsed.Message
+	resp.Next = parsed.Next
 	return resp, nil
 }
 
@@ -128,13 +130,4 @@ func resolveOnCallEntrypoint(p *plugins.Plugin) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("%s: entrypoint %q is unavailable", p.Config.ID, entry)
-}
-
-// escapeJSONString escapes a string for embedding into JSON literals.
-func escapeJSONString(s string) string {
-	b, _ := json.Marshal(s)
-	if len(b) >= 2 {
-		return string(b[1 : len(b)-1])
-	}
-	return s
 }
