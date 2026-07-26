@@ -80,7 +80,7 @@ func loadedPluginsFromDaemon(timeout time.Duration) (map[string]wire.PluginInfo,
 	}
 
 	var status wire.StatusResponse
-	if err := wire.ReadMsg(wire.NewScanner(conn), &status); err != nil || status.Type != wire.MsgStatus {
+	if err := readControlReply(conn, wire.MsgStatus, &status); err != nil {
 		return nil, false
 	}
 

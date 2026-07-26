@@ -134,16 +134,17 @@ func sendReload() (bool, string, error) {
 		_ = conn.Close()
 	}()
 
-	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+	if err := conn.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		return false, "", err
+	}
 
 	req := wire.UIRequest{Type: "reload", ClientID: "cli"}
 	if err := wire.WriteMsg(conn, req); err != nil {
 		return false, "", err
 	}
 
-	scanner := wire.NewScanner(conn)
 	var resp wire.ReloadResponse
-	if err := wire.ReadMsg(scanner, &resp); err != nil {
+	if err := readControlReply(conn, "reload_response", &resp); err != nil {
 		return false, "", err
 	}
 

@@ -84,7 +84,7 @@ func sendRestart(plugin string) (wire.RestartResponse, error) {
 		return resp, err
 	}
 
-	if err := wire.ReadMsg(wire.NewScanner(conn), &resp); err != nil {
+	if err := readControlReply(conn, "restart_response", &resp); err != nil {
 		return resp, err
 	}
 	return resp, nil
