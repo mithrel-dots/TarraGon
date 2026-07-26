@@ -45,6 +45,25 @@ func TestGenerateAndLoadConfig(t *testing.T) {
 	}
 }
 
+func TestExistingConfigGetsDefaultNATSPort(t *testing.T) {
+	resetFlags()
+	defer resetFlags()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "tarragon.toml"), []byte("nats_tcp = true\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := LoadConfig(dir); err != nil {
+		t.Fatal(err)
+	}
+	if port := viper.GetInt("nats_port"); port != 4222 {
+		t.Fatalf("expected default port 4222, got %d", port)
+	}
+	t.Setenv("NATS_PORT", "0")
+	if viper.GetInt("nats_port") != 0 {
+		t.Fatal("explicit zero must remain available for startup validation")
+	}
+}
+
 func TestGenerateConfigMultipleFormats(t *testing.T) {
 	dir := t.TempDir()
 	configDir := filepath.Join(dir, "tarragon")

@@ -18,6 +18,8 @@ import (
 
 type ConfigFormat string
 
+const defaultNATSPort = 4222
+
 const (
 	FormatTOML ConfigFormat = "toml"
 	FormatYAML ConfigFormat = "yaml"
@@ -34,7 +36,7 @@ type ConfigOption struct {
 func GetConfigOptions() []ConfigOption {
 	return []ConfigOption{
 		{Key: "nats_tcp", Value: false, Comment: "Expose embedded NATS on loopback TCP (requires TARRAGON_NATS_TOKEN)"},
-		{Key: "nats_port", Value: 4222, Comment: "Loopback port for the embedded NATS server"},
+		{Key: "nats_port", Value: defaultNATSPort, Comment: "Loopback port for the embedded NATS server"},
 		{
 			Key:     "run_tcp",
 			Value:   false,
@@ -86,6 +88,7 @@ func GetConfigOptions() []ConfigOption {
 // Flag binding moved to CLI layer (internal/cli). This package no longer binds flags.
 
 func SetupEnvironment() {
+	viper.SetDefault("nats_port", defaultNATSPort)
 	viper.AutomaticEnv()
 	viper.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 }
