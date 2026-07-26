@@ -76,8 +76,8 @@ func RunDaemon() error {
 	}
 	defer bus.close()
 	registry.bus = bus
-	handleUI := func(conn peerConn) { handleUIClient(ctx, conn, mgr, reqOut, registry, store, ui, database) }
-	handlePlugin := func(conn peerConn) { handlePluginConn(ctx, conn, registry, store, ui) }
+	handleUI := func(conn peerConn) { handleUIClient(bus.ctx, conn, mgr, reqOut, registry, store, ui, database) }
+	handlePlugin := func(conn peerConn) { handlePluginConn(bus.ctx, conn, registry, store, ui) }
 	if port != 0 {
 		if err := bus.listenNative(handleUI, handlePlugin); err != nil {
 			return err

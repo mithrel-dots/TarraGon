@@ -244,7 +244,13 @@ func handleUIClient(ctx context.Context, conn peerConn, mgr *plugins.Manager, re
 				continue
 			}
 			if parsed.Plugin != "" && parsed.QueryID != "" && pluginsReg.isConnected(parsed.Plugin) {
-				reqOut <- pluginRequest{name: parsed.Plugin, queryID: parsed.QueryID, resultID: selectedID, action: parsed.Action, msgType: wire.MsgSelect}
+				select {
+				case reqOut <- pluginRequest{name: parsed.Plugin, queryID: parsed.QueryID, resultID: selectedID, action: parsed.Action, msgType: wire.MsgSelect}:
+				case <-ctx.Done():
+					return
+				case <-client.done:
+					return
+				}
 			} else if parsed.Plugin != "" {
 				mgr.RLock()
 				plug, ok := mgr.Plugins[parsed.Plugin]

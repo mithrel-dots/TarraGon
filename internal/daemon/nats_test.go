@@ -121,6 +121,33 @@ func TestBrokerCarriesUnixAndNativeRequests(t *testing.T) {
 	}
 }
 
+func TestShutdownReleasesBlockedSelect(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	server, client := net.Pipe()
+	defer client.Close()
+	plugin, other := net.Pipe()
+	defer other.Close()
+	defer plugin.Close()
+	registry := &pluginRegistry{}
+	registry.set("p", plugin, wire.NewScanner(plugin))
+	requests := make(chan pluginRequest)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		handleUIClient(ctx, server, nil, requests, registry, NewTransientQueryStore(), newUIRegistry(), nil)
+	}()
+	if err := wire.WriteMsg(client, wire.UIRequest{Type: "select", Plugin: "p", QueryID: "q", ResultID: "r"}); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("session waited for a stopped router")
+	}
+}
+
 func testPluginListener(t testing.TB, ctx context.Context, store *aggregateStore, ui *uiRegistry) (chan<- pluginRequest, *pluginRegistry) {
 	t.Helper()
 	requests, registry := startPluginRouter(ctx, store)
