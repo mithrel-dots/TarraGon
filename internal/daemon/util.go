@@ -58,6 +58,10 @@ func invokeOnCallQuery(ctx context.Context, p *plugins.Plugin, query string) (js
 // If stdout is empty and exit status is zero, the action is treated as success.
 // If stdout contains JSON, it may include {"success": bool, "message": string}.
 func invokeOnCallSelect(ctx context.Context, p *plugins.Plugin, resultID, action string) (wire.SelectResponse, error) {
+	return runOnCallSelect(ctx, p, resultID, action, nil)
+}
+
+func runOnCallSelect(ctx context.Context, p *plugins.Plugin, resultID, action string, a *selectAction) (wire.SelectResponse, error) {
 	entry, err := resolveOnCallEntrypoint(p)
 	if err != nil {
 		return wire.SelectResponse{}, err
@@ -73,7 +77,20 @@ func invokeOnCallSelect(ctx context.Context, p *plugins.Plugin, resultID, action
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
+	if a == nil {
+		err = cmd.Start()
+	} else {
+		var started bool
+		started, err = a.startProcess(cmd.Start)
+		if !started && err == nil {
+			// Its terminal outcome is already decided. There is no child to reap.
+			return wire.SelectResponse{}, context.DeadlineExceeded
+		}
+	}
+	if err != nil {
+		return wire.SelectResponse{}, fmt.Errorf("%s: %w", p.Config.ID, err)
+	}
+	if err := cmd.Wait(); err != nil {
 		return wire.SelectResponse{}, fmt.Errorf("%s: %w; stderr=%s", p.Config.ID, err, stderr.String())
 	}
 

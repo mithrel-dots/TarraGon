@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log"
+	"os/exec"
 
 	"github.com/mithrel-dots/tarragon/internal/plugins"
 	"github.com/mithrel-dots/tarragon/internal/wire"
@@ -14,53 +15,28 @@ import (
 
 const execPrefix = "tarragon.exec."
 
-// The daemon supplies the manifest and query lifetime. Only the operation and
+// The daemon supplies the manifest and lifetime. Only the operation and
 // its arguments cross the broker; a subject can be claimed just once.
 type pluginCall struct {
 	ctx    context.Context
 	plugin *plugins.Plugin
+	action *selectAction
 }
 
 func (b *daemonBus) callPlugin(ctx context.Context, plugin *plugins.Plugin, req wire.UIRequest) (json.RawMessage, error) {
-	data, err := json.Marshal(req)
-	if err != nil {
-		return nil, err
-	}
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	stop := context.AfterFunc(b.ctx, cancel)
-	defer stop()
-	subject := execPrefix + rand.Text()
-	b.mu.Lock()
-	b.calls[subject] = pluginCall{ctx, plugin}
-	b.mu.Unlock()
-	defer func() {
-		b.mu.Lock()
-		delete(b.calls, subject)
-		b.mu.Unlock()
-	}()
-
-	response, err := b.conn.RequestWithContext(ctx, subject, data)
-	if err != nil {
-		return nil, err
-	}
-	if response.Header.Get("Tarragon-Error") != "" {
-		return nil, errors.New(string(response.Data))
-	}
-	return response.Data, nil
+	return b.requestPlugin(ctx, pluginCall{plugin: plugin}, req)
 }
 
+// callPluginAction waits in the UI's dispatch goroutine. Completing the action
+// releases its reply inbox without interrupting a process the responder started.
 func (b *daemonBus) callPluginAction(ctx context.Context, plugin *plugins.Plugin, a *selectAction) {
-	ctx, cancel := context.WithTimeout(ctx, a.timeout)
+	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	if !a.onTerminal(cancel) {
 		return
 	}
 
-	if !a.beginDispatch() {
-		return
-	}
-	data, err := b.callPlugin(ctx, plugin, wire.UIRequest{
+	data, err := b.requestPlugin(ctx, pluginCall{plugin: plugin, action: a}, wire.UIRequest{
 		Type: wire.MsgSelect, ResultID: a.resultID, Action: a.action,
 	})
 	var response wire.SelectResponse
@@ -72,6 +48,37 @@ func (b *daemonBus) callPluginAction(ctx context.Context, plugin *plugins.Plugin
 		return
 	}
 	a.finish(response.Success, response.Message)
+}
+
+func (b *daemonBus) requestPlugin(ctx context.Context, call pluginCall, req wire.UIRequest) (json.RawMessage, error) {
+	data, err := json.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(b.ctx, cancel)
+	subject := execPrefix + rand.Text()
+	b.mu.Lock()
+	call.ctx = ctx
+	b.calls[subject] = call
+	b.mu.Unlock()
+	defer func() {
+		stop()
+		cancel()
+		b.mu.Lock()
+		delete(b.calls, subject)
+		b.mu.Unlock()
+
+	}()
+
+	response, err := b.conn.RequestWithContext(ctx, subject, data)
+	if err != nil {
+		return nil, err
+	}
+	if response.Header.Get("Tarragon-Error") != "" {
+		return nil, errors.New(string(response.Data))
+	}
+	return response.Data, nil
 }
 
 func (b *daemonBus) handlePluginCall(msg *nats.Msg) {
@@ -87,7 +94,7 @@ func (b *daemonBus) handlePluginCall(msg *nats.Msg) {
 
 	go func() {
 		defer b.sessions.Done()
-		result, err := call.run(msg.Data)
+		result, err := b.runPluginCall(call, msg.Data)
 		response := nats.NewMsg(msg.Reply)
 		response.Data = result
 		if err != nil {
@@ -106,7 +113,7 @@ func (b *daemonBus) handlePluginCall(msg *nats.Msg) {
 	}()
 }
 
-func (c pluginCall) run(data []byte) (json.RawMessage, error) {
+func (b *daemonBus) runPluginCall(c pluginCall, data []byte) (json.RawMessage, error) {
 	var req wire.UIRequest
 	if err := json.Unmarshal(data, &req); err != nil {
 		return nil, err
@@ -115,11 +122,34 @@ func (c pluginCall) run(data []byte) (json.RawMessage, error) {
 	case "query":
 		return invokeOnCallQuery(c.ctx, c.plugin, req.Text)
 	case wire.MsgSelect:
-		response, err := invokeOnCallSelect(c.ctx, c.plugin, req.ResultID, req.Action)
-		if err != nil {
-			return nil, err
+		ctx := c.ctx
+		if c.action != nil {
+			select {
+			case b.actionSlots <- struct{}{}:
+				defer func() { <-b.actionSlots }()
+			default:
+				return nil, errors.New("too many on-call actions in progress")
+			}
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(b.ctx, b.actionSafetyLimit)
+			defer cancel()
 		}
-		return json.Marshal(response)
+		response, err := runOnCallSelect(ctx, c.plugin, req.ResultID, req.Action, c.action)
+		if err != nil {
+			// A normal nonzero exit is a definitive plugin-reported failure.
+			// A killed process or unreadable reply has no definitive outcome.
+			var exit *exec.ExitError
+			if c.action == nil || !errors.As(err, &exit) || exit.ExitCode() < 0 {
+				return nil, err
+			}
+			response = wire.SelectResponse{Type: wire.MsgSelectResponse, Message: err.Error()}
+		}
+		data, err := json.Marshal(response)
+		if len(data) > wire.MaxMessageSize {
+			response.Message = oversizedActionMessage
+			return json.Marshal(response)
+		}
+		return data, err
 	default:
 		return nil, errors.New("unknown on-call request")
 	}

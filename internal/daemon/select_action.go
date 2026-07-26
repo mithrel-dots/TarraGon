@@ -118,6 +118,21 @@ func (a *selectAction) beginDispatch() bool {
 	return true
 }
 
+// Start and the transition to "possibly ran" are indivisible for a local
+// child. Waiting for the child happens outside this lock and the UI lifetime.
+func (a *selectAction) startProcess(start func() error) (bool, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.dispatched || !a.pendingLocked() {
+		return false, nil
+	}
+	if err := start(); err != nil {
+		return false, err
+	}
+	a.dispatched = true
+	return true, nil
+}
+
 func (a *selectAction) progress(message string) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
