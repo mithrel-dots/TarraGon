@@ -65,21 +65,11 @@ var enablePluginCmd = &cobra.Command{
 }
 
 func resolveSystemBinary(name string) (string, error) {
-	whichPath, err := exec.LookPath("which")
+	path, err := exec.LookPath(name)
 	if err != nil {
-		return "", errors.New("which is required but was not found in PATH")
+		return "", fmt.Errorf("resolve plugin executable: %w", err)
 	}
-
-	out, err := exec.Command(whichPath, name).CombinedOutput()
-	if err != nil {
-		return "", fmt.Errorf("resolve %q in PATH via which: %w", name, err)
-	}
-
-	binaryPath := strings.TrimSpace(string(out))
-	if binaryPath == "" {
-		return "", fmt.Errorf("resolve %q in PATH via which: empty output", name)
-	}
-	return binaryPath, nil
+	return filepath.Abs(path)
 }
 
 func fetchSystemPluginManifest(binaryPath string) ([]byte, error) {

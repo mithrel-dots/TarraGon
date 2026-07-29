@@ -23,7 +23,7 @@ Repository layout note:
 There are two supported plugin sources:
 
 1. **Plugin Git repository** (installed with `tarragon plugin install <git-url>`): the repository root must contain `plugin.toml` and a `Makefile`; `entrypoint` is typically a path relative to the installed plugin directory.
-2. **System plugin** (enabled with `tarragon plugin enable <name>`): Tarragon resolves the binary with `which <name>`, runs `<binary> tarragon manifest`, rewrites a relative `entrypoint` to the resolved absolute binary path, appends `source = "system"`, and stores the resulting manifest in Tarragon's plugin directory.
+2. **System plugin** (enabled with `tarragon plugin enable <name>`): Tarragon looks up the binary in `PATH`, runs `<binary> tarragon manifest`, rewrites a relative `entrypoint` to the resolved absolute binary path, appends `source = "system"`, and stores the resulting manifest in Tarragon's plugin directory.
 
 ### System Plugin Enable + Reload Behavior
 

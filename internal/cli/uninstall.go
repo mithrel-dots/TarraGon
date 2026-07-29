@@ -17,17 +17,24 @@ var uninstallPluginCmd = &cobra.Command{
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		name := args[0]
+		if name == "." || !filepath.IsLocal(name) || filepath.Base(name) != name {
+			return fmt.Errorf("expected an installed plugin directory name, got %q", name)
+		}
 		pluginRoot := plugins.DefaultDir()
 		if pluginRoot == "" {
 			return errors.New("could not determine plugin installation directory")
 		}
 
 		pluginDir := filepath.Join(pluginRoot, name)
-		if _, err := os.Stat(pluginDir); err != nil {
+		info, err := os.Lstat(pluginDir)
+		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				return fmt.Errorf("plugin %q is not installed at %s", name, pluginDir)
 			}
 			return fmt.Errorf("access plugin directory: %w", err)
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("%s is not a plugin directory", pluginDir)
 		}
 
 		if _, err := fmt.Fprintf(cmd.OutOrStdout(), "Uninstalling plugin %q from %s\n", name, pluginDir); err != nil {
@@ -39,7 +46,7 @@ var uninstallPluginCmd = &cobra.Command{
 			if _, err := fmt.Fprintln(cmd.OutOrStdout(), "Running make uninstall..."); err != nil {
 				return err
 			}
-			uninstallCmd := exec.Command("make", "uninstall")
+			uninstallCmd := exec.Command("make", "uninstall", "INSTALL_ROOT="+pluginDir, "PLUGIN_DIR="+pluginDir)
 			uninstallCmd.Dir = pluginDir
 			uninstallCmd.Stdout = cmd.OutOrStdout()
 			uninstallCmd.Stderr = cmd.ErrOrStderr()
