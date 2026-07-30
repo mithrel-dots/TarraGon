@@ -40,10 +40,8 @@ esac
 	}
 	store := NewTransientQueryStore()
 	requests, registry := startPluginRouter(t.Context(), store)
-	path := filepath.Join(root, "u")
-	t.Setenv("TARRAGON_UI_SOCKET", path)
 	testUIListener(t, t.Context(), mgr, requests, registry, store, newUIRegistry(store), nil)
-	conn, err := net.Dial("unix", path)
+	conn, err := net.Dial("unix", wire.ResolveUISocketPath())
 	if err != nil {
 		t.Fatal(err)
 	}

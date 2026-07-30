@@ -12,15 +12,6 @@ import (
 )
 
 func TestPersistentPluginE2E(t *testing.T) {
-	pluginsSocket := wire.ResolvePluginsSocketPath()
-	uiSocket := wire.ResolveUISocketPath()
-	_ = wire.CleanupSocket(pluginsSocket)
-	_ = wire.CleanupSocket(uiSocket)
-	defer func() {
-		_ = wire.CleanupSocket(pluginsSocket)
-		_ = wire.CleanupSocket(uiSocket)
-	}()
-
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -39,6 +30,8 @@ func TestPersistentPluginE2E(t *testing.T) {
 	}}
 
 	testUIListener(t, ctx, mgr, reqOut, plugReg, store, uiReg, nil)
+	pluginsSocket := wire.ResolvePluginsSocketPath()
+	uiSocket := wire.ResolveUISocketPath()
 
 	pluginReqCh := make(chan wire.PluginRequest, 1)
 	pluginErrCh := make(chan error, 1)

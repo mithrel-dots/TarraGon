@@ -123,32 +123,36 @@ func TestKeepOpenActionRoundTrip(t *testing.T) {
 	}
 }
 
-func TestCleanupSocketRemovesFile(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "x.sock")
+func TestListenUnixKeepsLiveListener(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "private", "x.sock")
 	ln, err := ListenUnix(path)
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	if err := ln.Close(); err != nil {
-		t.Fatalf("close listener: %v", err)
+	defer ln.Close()
+	if other, err := ListenUnix(path); err == nil {
+		other.Close()
+		t.Fatal("replaced live listener")
 	}
-	if err := CleanupSocket(path); err != nil {
-		t.Fatalf("cleanup: %v", err)
+	conn, err := net.Dial("unix", path)
+	if err != nil {
+		t.Fatalf("original listener no longer reachable: %v", err)
 	}
-	if _, err := os.Stat(path); !os.IsNotExist(err) {
-		t.Fatalf("expected removed, stat err=%v", err)
-	}
+	conn.Close()
 }
 
-func TestListenUnix(t *testing.T) {
+func TestListenUnixLeavesSharedDirectoryAlone(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "l.sock")
-	ln, err := ListenUnix(path)
-	if err != nil {
-		t.Fatalf("listen: %v", err)
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
 	}
-	_ = ln.Close()
+	if ln, err := ListenUnix(filepath.Join(dir, "l.sock")); err == nil {
+		ln.Close()
+		t.Fatal("unexpected listener in non-private directory")
+	}
+	if fi, err := os.Stat(dir); err != nil || fi.Mode().Perm() != 0o755 {
+		t.Fatalf("parent directory changed: %v, %v", fi, err)
+	}
 }
 
 func TestListenUnixCreatesDirWithSecureMode(t *testing.T) {
@@ -176,6 +180,9 @@ func TestListenUnixCreatesDirWithSecureMode(t *testing.T) {
 
 func TestListenUnixRemovesStaleSocket(t *testing.T) {
 	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	path := filepath.Join(dir, "stale.sock")
 
 	// Simulate a stale socket file left behind by a crashed daemon: a real
@@ -196,11 +203,27 @@ func TestListenUnixRemovesStaleSocket(t *testing.T) {
 		t.Fatalf("expected stale socket file to remain, stat err=%v", err)
 	}
 
-	second, err := ListenUnix(path)
-	if err != nil {
-		t.Fatalf("second listen should remove stale socket and succeed: %v", err)
+	type attempt struct {
+		ln  net.Listener
+		err error
 	}
-	_ = second.Close()
+	results := make(chan attempt, 2)
+	for range 2 {
+		go func() {
+			ln, err := ListenUnix(path)
+			results <- attempt{ln, err}
+		}()
+	}
+	var winners int
+	for range 2 {
+		if result := <-results; result.err == nil {
+			defer result.ln.Close()
+			winners++
+		}
+	}
+	if winners != 1 {
+		t.Fatalf("expected one listener to claim the stale socket, got %d", winners)
+	}
 }
 
 func TestResolveUISocketPath(t *testing.T) {

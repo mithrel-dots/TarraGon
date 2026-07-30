@@ -207,10 +207,8 @@ func TestUnixSelectAfterCloseWrite(t *testing.T) {
 			f := persistentFixture(t, true, tc.timeout)
 			plugin := persistentPlugin(t, f, "p")
 			held := make(chan pluginRequest, 1)
-			path := filepath.Join(t.TempDir(), "u")
-			t.Setenv("TARRAGON_UI_SOCKET", path)
 			testUIListener(t, t.Context(), f.mgr, held, f.registry, f.store, f.ui, nil)
-			conn, err := net.DialUnix("unix", nil, &net.UnixAddr{Net: "unix", Name: path})
+			conn, err := net.DialUnix("unix", nil, &net.UnixAddr{Net: "unix", Name: wire.ResolveUISocketPath()})
 			if err != nil {
 				t.Fatal(err)
 			}

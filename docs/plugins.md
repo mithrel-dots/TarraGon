@@ -229,8 +229,9 @@ The daemon resolves the plugins socket path at startup, in order:
 3. Otherwise: `/tmp/tarragon-<euid>/plugins.sock` (`<euid>` is the daemon's
    effective UID).
 
-The daemon creates the parent directory with mode `0700` before listening, and
-removes a stale leftover socket file if one is present. Persistent plugins
+The daemon creates a missing parent directory with mode `0700`. An existing
+parent must already be private and owned by the daemon user. The daemon removes
+stale sockets and refuses to replace live ones. Persistent plugins
 should not hardcode a socket path; always read `TARRAGON_PLUGINS_ENDPOINT`.
 
 ### Python skeleton

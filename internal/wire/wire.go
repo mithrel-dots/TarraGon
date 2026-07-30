@@ -9,6 +9,10 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"syscall"
+	"time"
+
+	"github.com/mithrel-dots/tarragon/internal/filelock"
 )
 
 // Environment variables that override the resolved socket paths.
@@ -280,9 +284,9 @@ func NewScanner(r io.Reader) *bufio.Scanner {
 	return scanner
 }
 
-// CleanupSocket removes a stale unix socket file if it exists.
-func CleanupSocket(path string) error {
-	fi, err := os.Stat(path)
+// Caller holds the parent directory lock through the subsequent bind.
+func cleanupStaleSocket(path string) error {
+	fi, err := os.Lstat(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil
@@ -294,6 +298,14 @@ func CleanupSocket(path string) error {
 		return fmt.Errorf("%s exists and is not a socket", path)
 	}
 
+	conn, err := net.DialTimeout("unix", path, time.Second)
+	if err == nil {
+		conn.Close()
+		return fmt.Errorf("socket %s already in use", path)
+	}
+	if !errors.Is(err, syscall.ECONNREFUSED) {
+		return fmt.Errorf("check existing socket %s: %w", path, err)
+	}
 	return os.Remove(path)
 }
 
@@ -304,10 +316,19 @@ func ListenUnix(path string) (net.Listener, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("create socket directory: %w", err)
 	}
-	if err := os.Chmod(dir, 0o700); err != nil {
-		return nil, fmt.Errorf("secure socket directory: %w", err)
+	info, err := os.Stat(dir)
+	if err != nil {
+		return nil, err
 	}
-	if err := CleanupSocket(path); err != nil {
+	if info.Mode().Perm()&0o077 != 0 || info.Sys().(*syscall.Stat_t).Uid != uint32(os.Geteuid()) {
+		return nil, fmt.Errorf("socket directory %s must belong to the current user and be private (0700)", dir)
+	}
+	lock, err := filelock.Dir(dir)
+	if err != nil {
+		return nil, err
+	}
+	defer lock.Close()
+	if err := cleanupStaleSocket(path); err != nil {
 		return nil, err
 	}
 	return net.Listen("unix", path)

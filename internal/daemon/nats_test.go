@@ -96,7 +96,7 @@ func TestBrokerCarriesUnixAndNativeRequests(t *testing.T) {
 	if err := client.Flush(); err != nil {
 		t.Fatal(err)
 	}
-	path := filepath.Join(t.TempDir(), "ui.sock")
+	path := filepath.Join(t.TempDir(), "ipc", "ui.sock")
 	ln, err := b.listenUnix(path, handleUI)
 	if err != nil {
 		t.Fatal(err)
@@ -331,6 +331,7 @@ func TestShutdownReleasesBlockedSelect(t *testing.T) {
 
 func testPluginListener(t testing.TB, ctx context.Context, store *aggregateStore, ui *uiRegistry) (chan<- pluginRequest, *pluginRegistry) {
 	t.Helper()
+	t.Setenv("TARRAGON_PLUGINS_SOCKET", filepath.Join(t.TempDir(), "ipc", "p"))
 	requests, registry := startPluginRouter(ctx, store)
 	registry.bus = testBus(t, ctx)
 	ln, err := registry.bus.listenUnix(wire.ResolvePluginsSocketPath(), func(c peerConn) { handlePluginConn(ctx, c, registry, store, ui) })
@@ -343,6 +344,7 @@ func testPluginListener(t testing.TB, ctx context.Context, store *aggregateStore
 
 func testUIListener(t testing.TB, ctx context.Context, mgr *plugins.Manager, requests chan<- pluginRequest, registry *pluginRegistry, store *aggregateStore, ui *uiRegistry, database *db.DB) {
 	t.Helper()
+	t.Setenv("TARRAGON_UI_SOCKET", filepath.Join(t.TempDir(), "ipc", "u"))
 	if registry.bus == nil {
 		registry.bus = testBus(t, ctx)
 	}

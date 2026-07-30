@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"math"
 	"net"
-	"path/filepath"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -34,8 +33,6 @@ func BenchmarkDaemonLatestQuery(b *testing.B) {
 func benchmarkDaemonDelivery(b *testing.B, stream string, interval time.Duration) {
 	const fanout, burst = 50, 8
 	dir := b.TempDir()
-	b.Setenv("TARRAGON_PLUGINS_SOCKET", filepath.Join(dir, "p"))
-	b.Setenv("TARRAGON_UI_SOCKET", filepath.Join(dir, "u"))
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	store := NewTransientQueryStore()

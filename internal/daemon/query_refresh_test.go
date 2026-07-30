@@ -68,7 +68,7 @@ echo '["unrelated"]'
 	if err := b.listenNative(handleUI, nil); err != nil {
 		t.Fatal(err)
 	}
-	path := filepath.Join(dir, "u")
+	path := filepath.Join(dir, "ipc", "u")
 	ln, err := b.listenUnix(path, handleUI)
 	if err != nil {
 		t.Fatal(err)

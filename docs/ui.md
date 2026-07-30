@@ -32,8 +32,9 @@ The daemon resolves the UI socket path at startup, in order:
 3. Otherwise: `/tmp/tarragon-<euid>/ui.sock` (`<euid>` is the daemon's
    effective UID).
 
-The daemon creates the parent directory with mode `0700` before listening, and
-removes a stale leftover socket file if one is present. UI clients should
+The daemon creates a missing parent directory with mode `0700`. An existing
+parent must already be private and owned by the daemon user. The daemon removes
+stale sockets and refuses to replace live ones. UI clients should
 implement the same resolution order (or read `TARRAGON_UI_SOCKET` directly)
 rather than hardcoding a path.
 
