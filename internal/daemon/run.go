@@ -44,9 +44,6 @@ func RunDaemon() error {
 		orderingMode = "global"
 	}
 	frecencyWeight := viper.GetFloat64("frecency_weight")
-	if frecencyWeight == 0 {
-		frecencyWeight = 0.3
-	}
 	database, err := db.Open(viper.GetString("db_path"))
 	if err != nil {
 		log.Printf("DB open error (frecency disabled): %v", err)

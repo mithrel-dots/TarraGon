@@ -2,7 +2,9 @@ package config
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -11,6 +13,61 @@ import (
 	"github.com/spf13/viper"
 	"gopkg.in/yaml.v3"
 )
+
+func TestConcurrentOverrideWriters(t *testing.T) {
+	if key := os.Getenv("TARRAGON_TEST_OVERRIDE_KEY"); key != "" {
+		viper.SetConfigFile(os.Getenv("TARRAGON_TEST_CONFIG"))
+		if err := WritePluginOverride("demo", map[string]any{key: true}); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+	t.Cleanup(viper.Reset)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "tarragon.toml")
+	target := filepath.Join(dir, "settings")
+	if err := os.WriteFile(target, []byte("frecency_weight = 0\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, path); err != nil {
+		t.Fatal(err)
+	}
+	const writers = 8
+	results := make(chan error, writers)
+	for i := range writers {
+		go func() {
+			cmd := exec.Command(os.Args[0], "-test.run=^TestConcurrentOverrideWriters$")
+			cmd.Env = append(os.Environ(), "TARRAGON_TEST_CONFIG="+path, fmt.Sprintf("TARRAGON_TEST_OVERRIDE_KEY=key%d", i))
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				err = fmt.Errorf("%w: %s", err, out)
+			}
+			results <- err
+		}()
+	}
+	for range writers {
+		if err := <-results; err != nil {
+			t.Error(err)
+		}
+	}
+	if err := LoadConfig(dir); err != nil {
+		t.Fatal(err)
+	}
+	for i := range writers {
+		if !viper.GetBool(fmt.Sprintf("plugins.demo.key%d", i)) {
+			t.Errorf("missing edit %d", i)
+		}
+	}
+	if got, err := os.Readlink(path); err != nil || got != target {
+		t.Fatalf("config symlink changed: %q, %v", got, err)
+	}
+	if info, err := os.Stat(target); err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("config permissions changed: %v, %v", info, err)
+	}
+	if !viper.GetBool("run_ipc") || viper.GetFloat64("frecency_weight") != 0 {
+		t.Fatal("expected the default UI socket and explicit zero ranking weight")
+	}
+}
 
 // resetFlags clears both viper and pflag state
 func resetFlags() {

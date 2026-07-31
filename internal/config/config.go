@@ -3,14 +3,17 @@ package config
 
 import (
 	"bytes"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/mithrel-dots/tarragon/internal/db"
+	"github.com/mithrel-dots/tarragon/internal/filelock"
 	"github.com/pelletier/go-toml/v2"
 	"github.com/pelletier/go-toml/v2/unstable"
 	"github.com/spf13/viper"
@@ -88,7 +91,9 @@ func GetConfigOptions() []ConfigOption {
 // Flag binding moved to CLI layer (internal/cli). This package no longer binds flags.
 
 func SetupEnvironment() {
-	viper.SetDefault("nats_port", defaultNATSPort)
+	for _, option := range GetConfigOptions() {
+		viper.SetDefault(option.Key, option.Value)
+	}
 	viper.AutomaticEnv()
 	viper.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 }
@@ -289,11 +294,40 @@ func GenerateConfig(path string, format ConfigFormat) error {
 		return fmt.Errorf("unsupported format: %s", format)
 	}
 
-	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+	if err := writeConfigFile(path, content, 0o644, true); err != nil {
 		return fmt.Errorf("error writing config file: %w", err)
 	}
 
 	return nil
+}
+
+// Publish only complete files. Initial generation must not replace a config
+// another process just created; edits preserve the existing permissions.
+func writeConfigFile(path, content string, mode os.FileMode, create bool) error {
+	tmp, err := os.OpenFile(filepath.Join(filepath.Dir(path), ".tarragon-"+rand.Text()), os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name())
+	_, err = tmp.WriteString(content)
+	if err == nil && !create {
+		err = tmp.Chmod(mode)
+	}
+	closeErr := tmp.Close()
+	if err != nil {
+		return err
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	if create {
+		err := os.Link(tmp.Name(), path)
+		if os.IsExist(err) {
+			return nil
+		}
+		return err
+	}
+	return os.Rename(tmp.Name(), path)
 }
 
 func generateTOML(options []ConfigOption) string {
@@ -366,64 +400,22 @@ func formatYAMLValue(key string, value interface{}) string {
 // preserving comments by editing the TOML text directly. Higher-precedence
 // drop-ins remain authoritative if they set the same key.
 func WritePluginOverride(name string, overrides map[string]any) error {
-	if strings.TrimSpace(name) == "" {
-		return fmt.Errorf("plugin name is required")
-	}
 	if len(overrides) == 0 {
 		return fmt.Errorf("at least one override is required")
 	}
-
-	sectionValues, err := primaryPluginOverrides(name)
-	if err != nil {
-		return err
-	}
-	for key, value := range overrides {
-		sectionValues[key] = value
-	}
-
-	section := buildPluginSection(name, sectionValues)
-	if err := updatePluginSectionInConfig(name, section, false); err != nil {
-		return err
-	}
-
-	if err := ReloadConfig(); err != nil {
-		return fmt.Errorf("sync config after write: %w", err)
-	}
-
-	return nil
+	return editPluginOverride(name, overrides)
 }
 
 // ResetPluginOverride removes [plugins.<name>] and writes config while
 // preserving comments by editing the TOML text directly.
 func ResetPluginOverride(name string) error {
-	if strings.TrimSpace(name) == "" {
-		return fmt.Errorf("plugin name is required")
-	}
-
-	if err := updatePluginSectionInConfig(name, "", true); err != nil {
-		return err
-	}
-
-	if err := ReloadConfig(); err != nil {
-		return fmt.Errorf("sync config after write: %w", err)
-	}
-
-	return nil
+	return editPluginOverride(name, nil)
 }
 
-func primaryPluginOverrides(name string) (map[string]any, error) {
-	path := viper.ConfigFileUsed()
-	if path == "" {
-		return nil, fmt.Errorf("config file path is not set")
-	}
-	if strings.ToLower(filepath.Ext(path)) != ".toml" {
-		return nil, fmt.Errorf("plugin overrides require TOML config, got %s", path)
-	}
-
+func primaryPluginOverrides(data []byte, name string) (map[string]any, error) {
 	primary := viper.New()
-	primary.SetConfigFile(path)
 	primary.SetConfigType("toml")
-	if err := primary.ReadInConfig(); err != nil {
+	if err := primary.ReadConfig(bytes.NewReader(data)); err != nil {
 		return nil, fmt.Errorf("read primary config file: %w", err)
 	}
 
@@ -504,7 +496,14 @@ func formatPluginOverrideValue(key string, value any) string {
 	}
 }
 
-func updatePluginSectionInConfig(name, section string, remove bool) error {
+var editMu sync.Mutex // also serialize access to the process-local Viper instance
+
+func editPluginOverride(name string, overrides map[string]any) error {
+	if strings.TrimSpace(name) == "" {
+		return fmt.Errorf("plugin name is required")
+	}
+	editMu.Lock()
+	defer editMu.Unlock()
 	path := viper.ConfigFileUsed()
 	if path == "" {
 		return fmt.Errorf("config file path is not set")
@@ -513,12 +512,32 @@ func updatePluginSectionInConfig(name, section string, remove bool) error {
 		return fmt.Errorf("plugin overrides require TOML config, got %s", path)
 	}
 
+	path, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return err
+	}
+	dir, err := filelock.Dir(filepath.Dir(path))
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return fmt.Errorf("read config file: %w", err)
 	}
 
-	updated, err := replacePluginSectionText(data, name, section, remove)
+	var section string
+	if overrides != nil {
+		values, err := primaryPluginOverrides(data, name)
+		if err != nil {
+			return err
+		}
+		for key, value := range overrides {
+			values[key] = value
+		}
+		section = buildPluginSection(name, values)
+	}
+	updated, err := replacePluginSectionText(data, name, section, overrides == nil)
 	if err != nil {
 		return err
 	}
@@ -528,10 +547,16 @@ func updatePluginSectionInConfig(name, section string, remove bool) error {
 	if err := toml.Unmarshal([]byte(updated), &check); err != nil {
 		return fmt.Errorf("cannot update plugin section in %s: %w", path, err)
 	}
-	if err := os.WriteFile(path, []byte(updated), 0o644); err != nil {
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if err := writeConfigFile(path, updated, info.Mode().Perm(), false); err != nil {
 		return fmt.Errorf("write config file: %w", err)
 	}
-
+	if err := ReloadConfig(); err != nil {
+		return fmt.Errorf("sync config after write: %w", err)
+	}
 	return nil
 }
 
