@@ -7,11 +7,41 @@ import (
 	"math"
 	"path/filepath"
 	"reflect"
+	"sync"
 	"testing"
 
 	"github.com/mithrel-dots/tarragon/internal/db"
 	"github.com/mithrel-dots/tarragon/internal/wire"
 )
+
+func TestConcurrentSelectionsKeepAllHistory(t *testing.T) {
+	database, err := db.Open(filepath.Join(t.TempDir(), "history.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	store := newAggregateStore(10, "global", database, 0.3)
+	const selections = 40
+	var done sync.WaitGroup
+	for range selections {
+		done.Add(1)
+		go func() {
+			defer done.Done()
+			recordSelect(database, store, "demo", "row")
+		}()
+	}
+	done.Wait()
+	scores, err := database.GetFrecencyScores(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := math.Round(scores["demo:row"]); got != selections {
+		t.Fatalf("stored %.0f of %d selections", got, selections)
+	}
+	if got := math.Round(store.frecencyScoresSnapshot()["demo:row"]); got != selections {
+		t.Fatalf("cache reflects %.0f of %d selections", got, selections)
+	}
+}
 
 // Inspect each update synchronously in the store's snapshot contract tests.
 func (s *aggregateStore) update(id, plugin string, elapsed float64, data json.RawMessage) ([]byte, bool) {

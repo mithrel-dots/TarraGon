@@ -62,6 +62,7 @@ type aggregateStore struct {
 	frecencyDB   *db.DB
 	frecencyW    float64
 
+	refreshMu       sync.Mutex // order DB snapshots without blocking readers during a query
 	frecencyCacheMu sync.RWMutex
 	frecencyCache   map[string]float64
 
@@ -116,6 +117,8 @@ func (s *aggregateStore) RefreshFrecencyCache(ctx context.Context) error {
 		return nil
 	}
 
+	s.refreshMu.Lock()
+	defer s.refreshMu.Unlock()
 	scores, err := s.frecencyDB.GetFrecencyScores(ctx)
 	if err != nil {
 		return err

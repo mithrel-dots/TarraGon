@@ -177,6 +177,8 @@ func (r *uiRegistry) remove(c *uiClient) {
 }
 
 func handleUIClient(ctx context.Context, conn peerConn, mgr *plugins.Manager, reqOut chan<- pluginRequest, pluginsReg *pluginRegistry, store *aggregateStore, ui *uiRegistry, frecencyDB *db.DB) {
+	var history sync.WaitGroup
+	defer history.Wait()
 	scanner := wire.NewScanner(conn)
 	client := &uiClient{conn: conn}
 	ui.add(client)
@@ -230,7 +232,11 @@ func handleUIClient(ctx context.Context, conn peerConn, mgr *plugins.Manager, re
 			a := ui.acceptSelect(session, client, parsed)
 			if a != nil {
 				if frecencyDB != nil && a.producer != "" && a.resultID != "" {
-					go recordSelect(frecencyDB, store, a.producer, a.resultID)
+					history.Add(1)
+					go func() {
+						defer history.Done()
+						recordSelect(frecencyDB, store, a.producer, a.resultID)
+					}()
 				}
 				ui.routeSelect(ctx, mgr, pluginsReg, reqOut, a)
 			}

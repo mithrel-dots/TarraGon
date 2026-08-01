@@ -44,7 +44,8 @@ func Open(path string) (*DB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
-	// Pragmas tuned for app DB use.
+	// Keep all writers on the connection configured with the busy timeout.
+	sqlDB.SetMaxOpenConns(1)
 	if _, err := sqlDB.Exec(`
 		PRAGMA journal_mode=WAL;
 		PRAGMA foreign_keys=ON;
