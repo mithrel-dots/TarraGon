@@ -338,7 +338,7 @@ For example, a script that prints `["one","two"]` on `query` and exits zero sile
 
 The UI can issue further requests while a select process runs. Failure to start the process gives `not_run`. Once started, the child can continue past the UI reply deadline under the daemon's longer process limit. The timeout gives the UI one `completion_unknown`; a late exit cannot send a second outcome or trigger a refresh. Query processes remain tied to their query request.
 
-If a select's encoded response exceeds the 8 MiB limit, the daemon shortens its message and preserves the reported outcome and any `refresh` instruction.
+On-call stdout is limited to 8 MiB plus a final newline. The daemon rejects oversized replies and keeps at most 4 KiB of stderr for error messages. If a valid select reply grows past 8 MiB when encoded for the UI, the daemon shortens its message and preserves the reported outcome and any `refresh` instruction.
 
 ## Refreshing a producer's results
 

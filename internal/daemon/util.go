@@ -15,6 +15,44 @@ import (
 	"github.com/mithrel-dots/tarragon/internal/wire"
 )
 
+// Drain both pipes through cmd.Wait even after the retained prefix is full.
+type limitedOutput struct {
+	limit     int
+	data      []byte
+	truncated bool
+}
+
+func (b *limitedOutput) Write(p []byte) (int, error) {
+	n := min(len(p), b.limit-len(b.data))
+	b.data = append(b.data, p[:n]...)
+	if n < len(p) {
+		b.truncated = true
+	}
+	return len(p), nil
+}
+
+func (b *limitedOutput) reply() ([]byte, error) {
+	out := bytes.TrimSpace(b.data)
+	if b.truncated || len(out) > wire.MaxMessageSize {
+		return nil, wire.ErrMessageTooLarge
+	}
+	return out, nil
+}
+
+func (b *limitedOutput) diagnostic() string {
+	if b.truncated {
+		return string(b.data) + " [truncated]"
+	}
+	return string(b.data)
+}
+
+func captureOnCallOutput(cmd *exec.Cmd) (stdout, stderr *limitedOutput) {
+	stdout = &limitedOutput{limit: wire.MaxMessageSize + 1} // optional final newline
+	stderr = &limitedOutput{limit: 4096}
+	cmd.Stdout, cmd.Stderr = stdout, stderr
+	return stdout, stderr
+}
+
 // onCallEnv gives ephemeral plugins the same identity and prefix context that
 // persistent plugins receive when the daemon starts them.
 func onCallEnv(p *plugins.Plugin) []string {
@@ -36,13 +74,14 @@ func invokeOnCallQuery(ctx context.Context, p *plugins.Plugin, query string) (js
 	cmd := exec.CommandContext(ctx, entry, "tarragon", "query", query)
 	cmd.WaitDelay = time.Second // Descendants may keep stdout/stderr open after cancellation.
 	cmd.Env = onCallEnv(p)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	stdout, stderr := captureOnCallOutput(cmd)
 	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("%s: %w; stderr=%s", p.Config.ID, err, stderr.String())
+		return nil, fmt.Errorf("%s: %w; stderr=%s", p.Config.ID, err, stderr.diagnostic())
 	}
-	out := bytes.TrimSpace(stdout.Bytes())
+	out, err := stdout.reply()
+	if err != nil {
+		return nil, err
+	}
 	if len(out) == 0 {
 		out = []byte("{}")
 	}
@@ -74,9 +113,7 @@ func runOnCallSelect(ctx context.Context, p *plugins.Plugin, resultID, action st
 	cmd := exec.CommandContext(ctx, entry, args...)
 	cmd.WaitDelay = time.Second
 	cmd.Env = onCallEnv(p)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	stdout, stderr := captureOnCallOutput(cmd)
 	if a == nil {
 		err = cmd.Start()
 	} else {
@@ -91,11 +128,14 @@ func runOnCallSelect(ctx context.Context, p *plugins.Plugin, resultID, action st
 		return wire.SelectResponse{}, fmt.Errorf("%s: %w", p.Config.ID, err)
 	}
 	if err := cmd.Wait(); err != nil {
-		return wire.SelectResponse{}, fmt.Errorf("%s: %w; stderr=%s", p.Config.ID, err, stderr.String())
+		return wire.SelectResponse{}, fmt.Errorf("%s: %w; stderr=%s", p.Config.ID, err, stderr.diagnostic())
 	}
 
 	resp := wire.SelectResponse{Type: wire.MsgSelectResponse, Success: true}
-	out := bytes.TrimSpace(stdout.Bytes())
+	out, err := stdout.reply()
+	if err != nil {
+		return wire.SelectResponse{}, err
+	}
 	if len(out) == 0 {
 		return resp, nil
 	}

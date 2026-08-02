@@ -158,7 +158,8 @@ func TestOnCallActionStartAndExitFailures(t *testing.T) {
 		{"unstartable", "#!/nonexistent/tarragon-test-interpreter\n", "not_run", "plain.sh"},
 		{"reported failure", "#!/bin/sh\necho '{\"success\":false,\"message\":\"stale\"}'\n", "", "stale"},
 		{"failed exit", "#!/bin/sh\necho 'failed to apply' >&2\nexit 2\n", "", "failed to apply"},
-		{"oversized failed exit", "#!/bin/sh\nhead -c 1500000 /dev/zero | tr '\\000' '<' >&2\nexit 2\n", "", oversizedActionMessage},
+		{"oversized failed exit", "#!/bin/sh\nhead -c 1500000 /dev/zero | tr '\\000' '<' >&2\nexit 2\n", "", "[truncated]"},
+		{"oversized reply", "#!/bin/sh\nhead -c 8388610 /dev/zero\n", "completion_unknown", wire.ErrMessageTooLarge.Error()},
 		{"invalid reply", "#!/bin/sh\necho bad-json\n", "completion_unknown", "invalid select response JSON"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
