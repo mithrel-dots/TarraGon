@@ -645,6 +645,31 @@ done:
 	}
 }
 
+func TestDispatchStartsPluginsIndependently(t *testing.T) {
+	dir := t.TempDir()
+	entry := writeScript(t, dir, "query", `#!/bin/sh
+cd "${0%/*}" || exit 1
+touch "$TARRAGON_PLUGIN_ID.ready"
+while [ ! -f first.ready ] || [ ! -f second.ready ]; do sleep 0.01; done
+echo '["ok"]'
+`)
+	f := newAdmissionFixture(t, time.Second)
+	for _, id := range []string{"first", "second"} {
+		f.configure(id, plugins.LifecycleOnCall, true, entry)
+	}
+	f.registry.bus = testBus(t, t.Context())
+	f.store.startQuery(t.Context(), "q", "cli", "hello", "owner", "")
+	dispatchQuery(t.Context(), "hello", "q", f.mgr, f.requests, f.registry, f.store, f.ui, false, "")
+	q := f.store.query("q")
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for _, id := range []string{"first", "second"} {
+		if got := string(q.Results[id].Data); got != `["ok"]` {
+			t.Fatalf("plugin %s did not finish alongside its peer: %s", id, got)
+		}
+	}
+}
+
 func TestDispatchQuery_ExplicitTargetBypassesGeneralEligibility(t *testing.T) {
 	ctx := context.Background()
 	mgr := plugins.NewManager("-")

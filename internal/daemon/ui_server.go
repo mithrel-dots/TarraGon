@@ -298,30 +298,31 @@ func dispatchQuery(ctx context.Context, queryText, qid string, mgr *plugins.Mana
 	}
 	route := &resolvedQuery{q: query, text: queryText, daemonCtx: ctx, mgr: mgr, registry: pluginsReg, requests: reqOut, store: store, ui: ui}
 	producers := make(map[string]*producerDispatch)
-	var persistent, onCall []string
+	var targets []string
 	mgr.RLock()
 	for name, p := range mgr.Plugins {
 		if !p.Config.Enabled || !isEligibleForDispatch(name, p.Config, hasTarget, targetName) {
 			continue
 		}
 		producers[name] = &producerDispatch{resolvedQuery: route, name: name, outstanding: true}
-		if p.Config.Lifecycle == plugins.LifecycleOnCall {
-			onCall = append(onCall, name)
-		} else {
-			persistent = append(persistent, name)
-		}
+		targets = append(targets, name)
 	}
 	mgr.RUnlock()
-	targets := append(persistent, onCall...)
 	query.mu.Lock()
 	query.producers = producers
 	query.mu.Unlock()
 	if snap, ok := store.setExpectedPlugins(qid, targets); ok {
 		ui.publishSnapshot(&wire.UpdateMessage{Type: "update", QueryID: qid, Payload: snap}, nil)
 	}
-	for _, name := range targets {
-		producers[name].run(initialDispatch)
+	var pending sync.WaitGroup
+	for _, producer := range producers {
+		pending.Add(1)
+		go func() {
+			defer pending.Done()
+			producer.run(initialDispatch)
+		}()
 	}
+	pending.Wait()
 }
 
 // run invokes exactly the recorded producer. A refresh never re-resolves the
