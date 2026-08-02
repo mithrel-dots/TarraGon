@@ -3,7 +3,6 @@ package daemon
 import (
 	"context"
 	"fmt"
-	"log"
 	"slices"
 	"sort"
 
@@ -47,13 +46,9 @@ func reloadPlugins(ctx context.Context, mgr *plugins.Manager, load func() error)
 	for id, p := range mgr.Plugins {
 		before[id] = p.Config
 	}
-	if err := mgr.DiscoverNew(); err != nil {
+	if err := mgr.ReloadConfigs(false); err != nil {
 		mgr.Unlock()
-		return fmt.Errorf("failed to discover new plugins: %w", err)
-	}
-	if err := mgr.ApplyOverrides(); err != nil {
-		mgr.Unlock()
-		return fmt.Errorf("failed to apply config overrides: %w", err)
+		return fmt.Errorf("failed to reload plugins: %w", err)
 	}
 	var stop []string
 	startDaemon := false
@@ -80,16 +75,13 @@ func reloadPlugins(ctx context.Context, mgr *plugins.Manager, load func() error)
 func restartPlugins(ctx context.Context, mgr *plugins.Manager, target string) wire.RestartResponse {
 	resp := wire.RestartResponse{Type: "restart_response"}
 	mgr.Lock()
-	if err := config.ReloadConfig(); err != nil {
-		log.Printf("[UI] restart: could not re-read config: %v", err)
+	err := config.ReloadConfig()
+	if err == nil {
+		err = mgr.ReloadConfigs(true)
 	}
-	if err := mgr.RefreshConfigs(); err != nil {
-		log.Printf("[UI] restart: plugin discovery failed: %v", err)
-	}
-	err := mgr.ApplyOverrides()
 	mgr.Unlock()
 	if err != nil {
-		resp.Message = fmt.Sprintf("failed to apply config overrides: %v", err)
+		resp.Message = fmt.Sprintf("failed to reload plugins: %v", err)
 		return resp
 	}
 	var targets []string

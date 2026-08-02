@@ -758,10 +758,11 @@ func TestStartsWithRoutingPrefixUsesConfiguredSymbol(t *testing.T) {
 	viper.Set("prefix_symbol", ":")
 	t.Cleanup(viper.Reset)
 
-	if !startsWithRoutingPrefix(" :calc") {
+	mgr := plugins.NewManager("-")
+	if !mgr.HasRoutingPrefix(" :calc") {
 		t.Fatal("expected configured routing symbol to be recognized")
 	}
-	if startsWithRoutingPrefix("@calc") {
+	if mgr.HasRoutingPrefix("@calc") {
 		t.Fatal("default routing symbol should not be recognized after configuration")
 	}
 }

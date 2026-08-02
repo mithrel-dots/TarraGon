@@ -277,14 +277,14 @@ func handleUIClient(ctx context.Context, conn peerConn, mgr *plugins.Manager, re
 			return
 		}
 
+		mgr.RLock()
 		targetName, targetText, hasTarget := resolvePrefixTarget(input, mgr)
 		if !hasTarget {
 			targetText = input
 		}
 		// A query beginning with the routing symbol is an explicit routing
 		// attempt, even when its prefix is only partially typed or unknown.
-		mgr.RLock()
-		prefixTargeted := hasTarget || startsWithRoutingPrefix(input)
+		prefixTargeted := hasTarget || mgr.HasRoutingPrefix(input)
 		mgr.RUnlock()
 
 		go dispatchQuery(ctx, targetText, qid, mgr, reqOut, pluginsReg, store, ui, prefixTargeted, targetName)
@@ -413,12 +413,7 @@ func isEligibleForDispatch(name string, cfg plugins.PluginConfig, hasTarget bool
 	return cfg.ProvidesGeneral
 }
 
-func startsWithRoutingPrefix(input string) bool {
-	text := strings.TrimSpace(input)
-	symbol := strings.TrimSpace(plugins.PrefixSymbol())
-	return symbol != "" && strings.HasPrefix(text, symbol)
-}
-
+// The caller holds the manager read lock for the routing decision.
 func resolvePrefixTarget(input string, mgr *plugins.Manager) (string, string, bool) {
 	text := strings.TrimSpace(input)
 	if text == "" {
@@ -426,7 +421,6 @@ func resolvePrefixTarget(input string, mgr *plugins.Manager) (string, string, bo
 	}
 	var targetName string
 	var targetPrefix string
-	mgr.RLock()
 	for name, p := range mgr.Plugins {
 		if !p.Config.Enabled {
 			continue
@@ -445,7 +439,6 @@ func resolvePrefixTarget(input string, mgr *plugins.Manager) (string, string, bo
 			targetPrefix = prefix
 		}
 	}
-	mgr.RUnlock()
 	if targetName == "" {
 		return "", "", false
 	}

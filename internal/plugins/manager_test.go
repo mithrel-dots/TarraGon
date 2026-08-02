@@ -70,8 +70,8 @@ func TestOverviewDoesNotNeedOrLoadAnExternalManifest(t *testing.T) {
 		t.Fatalf("missing built-in overview on a fresh install: %+v", overview)
 	}
 	writeManifest(t, root, "other", "id='plugins'\nentrypoint='other'\nlifecycle_mode='daemon'\n")
-	for _, discover := range []func() error{m.Discover, m.DiscoverNew, m.RefreshConfigs} {
-		if err := discover(); err != nil {
+	for _, refresh := range []bool{false, true} {
+		if err := m.ReloadConfigs(refresh); err != nil {
 			t.Fatal(err)
 		}
 		if p := m.Plugins[OverviewID]; p != overview || p.Config.Entrypoint != "" || p.BaseConfig.Source != "builtin" {
@@ -86,6 +86,46 @@ func TestStartPersistentSkipsNonDaemonAndDisabled(t *testing.T) {
 	m.Plugins["disabled_daemon"] = &Plugin{Config: PluginConfig{Name: "disabled_daemon", Enabled: false, Entrypoint: "nope.sh", Lifecycle: LifecycleDaemon}}
 	if err := m.StartPersistent(context.Background(), "ipc:///tmp/test.ipc"); err != nil {
 		t.Fatalf("expected no error, got %v", err)
+	}
+}
+
+func TestStartPersistentAttemptsEveryPlugin(t *testing.T) {
+	m := writePluginScript(t, "healthy", filepath.Join(t.TempDir(), "log"), true)
+	defer m.StopAll()
+	for _, name := range []string{"broken1", "broken2"} {
+		m.Plugins[name] = &Plugin{Config: PluginConfig{Enabled: true, Lifecycle: LifecycleDaemon}}
+	}
+	err := m.StartPersistent(t.Context(), "")
+	if err == nil || !strings.Contains(err.Error(), "broken1") || !strings.Contains(err.Error(), "broken2") {
+		t.Fatalf("expected both startup failures: %v", err)
+	}
+	if !m.IsRunning("healthy") {
+		t.Fatal("healthy plugin did not start")
+	}
+}
+
+func TestRejectedReloadKeepsLiveConfiguration(t *testing.T) {
+	viper.Reset()
+	t.Cleanup(viper.Reset)
+	root := t.TempDir()
+	writeManifest(t, root, "old", "prefix='old'\nenabled=true\n")
+	m := NewManager(root)
+	if err := m.Discover(); err != nil {
+		t.Fatal(err)
+	}
+	old := m.Plugins["old"]
+	writeManifest(t, root, "old", "prefix='different'\nenabled=false\n")
+	writeManifest(t, root, "new", "prefix='new'\n")
+	viper.Set("prefix_symbol", ":")
+	viper.Set("plugins.new.lifecycle_mode", "invalid")
+	for _, refresh := range []bool{false, true} {
+		if err := m.ReloadConfigs(refresh); err == nil {
+			t.Fatal("accepted invalid lifecycle")
+		}
+		if m.Plugins["new"] != nil || m.Plugins["old"] != old || !old.Config.Enabled ||
+			old.Config.ResolvedPrefix != "@old" || old.BaseConfig.Prefix != "old" || !m.HasRoutingPrefix("@") {
+			t.Fatal("failed reload changed live plugins or routing")
+		}
 	}
 }
 
@@ -188,14 +228,15 @@ func TestDiscoverNewAddsMissingWithoutOverwritingExisting(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	original := &Plugin{Config: PluginConfig{Name: "existing", Entrypoint: "old.sh", Enabled: true, Lifecycle: LifecycleDaemon}}
+	base := PluginConfig{Name: "existing", Entrypoint: "old.sh", Enabled: true, Lifecycle: LifecycleDaemon}
+	original := &Plugin{Config: base, BaseConfig: base}
 	original.running.Store(true)
 
 	m := NewManager(root)
 	m.Plugins["existing"] = original
 
-	if err := m.DiscoverNew(); err != nil {
-		t.Fatalf("DiscoverNew: %v", err)
+	if err := m.ReloadConfigs(false); err != nil {
+		t.Fatalf("reload: %v", err)
 	}
 
 	if got := m.Plugins["existing"]; got != original {
@@ -234,7 +275,7 @@ func TestRefreshConfigsUpdatesManifestWithoutReplacingRuntimeState(t *testing.T)
 	if err := os.WriteFile(manifestPath, []byte("name=\"example\"\nenabled=true\nentrypoint=\"new.sh\"\nlifecycle_mode=\"daemon\"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.RefreshConfigs(); err != nil {
+	if err := m.ReloadConfigs(true); err != nil {
 		t.Fatalf("refresh: %v", err)
 	}
 

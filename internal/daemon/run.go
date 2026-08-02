@@ -30,7 +30,7 @@ func RunDaemon() error {
 		log.Printf("Plugin discovery error: %v", err)
 	}
 	if err := mgr.ApplyOverrides(); err != nil {
-		log.Printf("Plugin override error: %v", err)
+		return fmt.Errorf("apply plugin overrides: %w", err)
 	}
 	defer mgr.StopAll()
 
@@ -72,6 +72,7 @@ func RunDaemon() error {
 	}
 	defer bus.close()
 	registry.bus = bus
+	runIPC := viper.GetBool("run_ipc")
 	handleUI := func(conn peerConn) { handleUIClient(bus.ctx, conn, mgr, reqOut, registry, store, ui, database) }
 	handlePlugin := func(conn peerConn) { handlePluginConn(bus.ctx, conn, registry, store, ui) }
 	if port != 0 {
@@ -85,7 +86,7 @@ func RunDaemon() error {
 		return err
 	}
 	defer ln.Close()
-	if viper.GetBool("run_ipc") {
+	if runIPC {
 		uiListener, err := bus.listenUnix(wire.ResolveUISocketPath(), handleUI)
 		if err != nil {
 			return err

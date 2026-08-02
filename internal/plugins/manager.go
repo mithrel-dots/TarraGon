@@ -136,10 +136,11 @@ func (p *Plugin) StopWithTimeout(timeout time.Duration) {
 
 // Manager oversees all plugins.
 type Manager struct {
-	Plugins     map[string]*Plugin
-	pluginDir   string
-	stopTimeout time.Duration
-	mu          sync.RWMutex
+	Plugins      map[string]*Plugin
+	pluginDir    string
+	stopTimeout  time.Duration
+	prefixSymbol string
+	mu           sync.RWMutex
 }
 
 // Lock acquires the manager write lock.
@@ -165,16 +166,18 @@ func DefaultDir() string {
 
 // NewManager creates a new Manager for the given directory.
 func NewManager(dir string) *Manager {
+	symbol := PrefixSymbol()
 	overview := PluginConfig{
 		ID: OverviewID, Name: "Plugins", Description: "Browse and manage plugins",
 		Source: "builtin", Enabled: true, Lifecycle: LifecycleOnCall,
 		Prefix: OverviewID, RequirePrefix: true, Capabilities: []string{"suggest", "action"},
-		ResolvedPrefix: ResolvePrefix(OverviewID, PrefixSymbol()),
+		PrefixSymbol: symbol, ResolvedPrefix: ResolvePrefix(OverviewID, symbol),
 	}
 	return &Manager{
-		Plugins:     map[string]*Plugin{OverviewID: {BaseConfig: overview, Config: overview}},
-		pluginDir:   dir,
-		stopTimeout: DefaultStopTimeout,
+		Plugins:      map[string]*Plugin{OverviewID: {BaseConfig: overview, Config: overview}},
+		pluginDir:    dir,
+		stopTimeout:  DefaultStopTimeout,
+		prefixSymbol: symbol,
 	}
 }
 
@@ -292,70 +295,30 @@ func (m *Manager) Discover() error {
 	return nil
 }
 
-// DiscoverNew scans the plugin directory and adds only plugins not already
-// present in the manager.
-//
-// Existing plugin entries are left untouched so any in-memory runtime state
-// (running process handles, etc.) remains consistent.
-func (m *Manager) DiscoverNew() error {
-	entries, err := os.ReadDir(m.pluginDir)
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("reading plugin dir: %w", err)
+// ReloadConfigs stages discovery and overrides together. A restart also
+// refreshes known manifests; removed plugins stay manageable until shutdown.
+// The caller holds the manager lock.
+func (m *Manager) ReloadConfigs(refreshKnown bool) error {
+	next := NewManager(m.pluginDir)
+	if err := next.Discover(); err != nil {
+		return err
 	}
-
-	for _, ent := range entries {
-		if !ent.IsDir() {
-			continue
+	for id, p := range m.Plugins {
+		if !refreshKnown || next.Plugins[id] == nil {
+			next.Plugins[id] = &Plugin{BaseConfig: p.BaseConfig, Dir: p.Dir}
 		}
-		dir := filepath.Join(m.pluginDir, ent.Name())
-		cfg, err := loadPluginConfig(dir, ent.Name())
-		if err != nil {
-			log.Printf("Skipping plugin %s: %v", ent.Name(), err)
-			continue
-		}
-
-		if _, exists := m.Plugins[cfg.ID]; exists {
-			continue
-		}
-
-		m.Plugins[cfg.ID] = &Plugin{Config: cfg, BaseConfig: cfg, Dir: dir}
 	}
-
-	m.ResolvePrefixes()
-	return nil
-}
-
-// RefreshConfigs re-reads manifests for known plugins without replacing their
-// runtime process state. New plugins are discovered as well; removed plugins
-// remain known until the daemon restarts so a running process can still be
-// managed safely.
-func (m *Manager) RefreshConfigs() error {
-	entries, err := os.ReadDir(m.pluginDir)
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("reading plugin dir: %w", err)
+	if err := next.ApplyOverrides(); err != nil {
+		return err
 	}
-
-	for _, ent := range entries {
-		if !ent.IsDir() {
-			continue
+	for id, candidate := range next.Plugins {
+		if p := m.Plugins[id]; p != nil {
+			p.Config, p.BaseConfig, p.Dir = candidate.Config, candidate.BaseConfig, candidate.Dir
+		} else {
+			m.Plugins[id] = candidate
 		}
-		dir := filepath.Join(m.pluginDir, ent.Name())
-		cfg, err := loadPluginConfig(dir, ent.Name())
-		if err != nil {
-			log.Printf("Skipping plugin %s: %v", ent.Name(), err)
-			continue
-		}
-
-		if p, ok := m.Plugins[cfg.ID]; ok {
-			p.BaseConfig = cfg
-			p.Config = cfg
-			p.Dir = dir
-			continue
-		}
-		m.Plugins[cfg.ID] = &Plugin{Config: cfg, BaseConfig: cfg, Dir: dir}
 	}
-
-	m.ResolvePrefixes()
+	m.prefixSymbol = next.prefixSymbol
 	return nil
 }
 
@@ -397,31 +360,34 @@ func (m *Manager) ApplyOverrides() error {
 		log.Printf("config: %s", warning)
 	}
 
+	effective := make(map[string]PluginConfig, len(m.Plugins))
 	for id, p := range m.Plugins {
-		// Reset to defaults from plugin.toml so removed overrides take effect.
-		p.Config = p.BaseConfig
-
-		sections := overrideSections(id, p.BaseConfig)
+		cfg := p.BaseConfig
+		sections := overrideSections(id, cfg)
 
 		if path, ok := lookupOverride(sections, "enabled"); ok {
-			p.Config.Enabled = viper.GetBool(path)
+			cfg.Enabled = viper.GetBool(path)
 		}
 
 		if path, ok := lookupOverride(sections, "prefix"); ok {
-			p.Config.Prefix = viper.GetString(path)
+			cfg.Prefix = viper.GetString(path)
 		}
 
 		if path, ok := lookupOverride(sections, "lifecycle_mode"); ok {
 			if id == OverviewID {
 				log.Printf("config: %s is ignored for the built-in plugin", path)
-				continue
+			} else {
+				mode, err := ParseLifecycleMode(viper.GetString(path))
+				if err != nil {
+					return fmt.Errorf("invalid lifecycle override for plugin %q: %w", id, err)
+				}
+				cfg.Lifecycle = mode
 			}
-			mode, err := ParseLifecycleMode(viper.GetString(path))
-			if err != nil {
-				return fmt.Errorf("invalid lifecycle override for plugin %q: %w", id, err)
-			}
-			p.Config.Lifecycle = mode
 		}
+		effective[id] = cfg
+	}
+	for id, cfg := range effective {
+		m.Plugins[id].Config = cfg
 	}
 
 	m.ResolvePrefixes()
@@ -436,10 +402,17 @@ func (m *Manager) ApplyOverrides() error {
 // prefix and the configured prefix symbol.
 func (m *Manager) ResolvePrefixes() {
 	symbol := PrefixSymbol()
+	m.prefixSymbol = symbol
 	for _, p := range m.Plugins {
 		p.Config.PrefixSymbol = symbol
 		p.Config.ResolvedPrefix = ResolvePrefix(p.Config.Prefix, symbol)
 	}
+}
+
+// HasRoutingPrefix uses the symbol from the last successfully applied config.
+// The caller holds the manager read lock.
+func (m *Manager) HasRoutingPrefix(input string) bool {
+	return m.prefixSymbol != "" && strings.HasPrefix(strings.TrimSpace(input), m.prefixSymbol)
 }
 
 // PrefixCollisions reports effective prefixes claimed by more than one enabled
@@ -552,6 +525,7 @@ func (m *Manager) StartPersistent(ctx context.Context, ipcEndpoint string) error
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	var failures []error
 	for name, p := range m.Plugins {
 		if !p.Config.Enabled {
 			continue
@@ -559,13 +533,13 @@ func (m *Manager) StartPersistent(ctx context.Context, ipcEndpoint string) error
 		if p.Config.Lifecycle == LifecycleDaemon {
 			log.Printf("starting plugin %s (lifecycle=%s)", name, p.Config.Lifecycle)
 			if err := p.start(ctx, ipcEndpoint, m.stopTimeout); err != nil {
-				log.Printf("failed to start plugin %s: %v", name, err)
-				return fmt.Errorf("start plugin %s: %w", name, err)
+				failures = append(failures, fmt.Errorf("start plugin %s: %w", name, err))
+				continue
 			}
 			log.Printf("started plugin %s (pid=%d)", name, p.cmd.Process.Pid)
 		}
 	}
-	return nil
+	return errors.Join(failures...)
 }
 
 // StartOnDemand starts a single on-demand persistent plugin if needed.
@@ -641,7 +615,7 @@ func (p *Plugin) start(ctx context.Context, ipcEndpoint string, stopTimeout time
 		fmt.Sprintf("TARRAGON_PLUGIN_NAME=%s", p.Config.ID),
 		fmt.Sprintf("TARRAGON_PLUGIN_ID=%s", p.Config.ID),
 		fmt.Sprintf("TARRAGON_PLUGIN_DISPLAY_NAME=%s", p.Config.Name),
-		fmt.Sprintf("TARRAGON_PREFIX_SYMBOL=%s", PrefixSymbol()),
+		fmt.Sprintf("TARRAGON_PREFIX_SYMBOL=%s", p.Config.PrefixSymbol),
 		fmt.Sprintf("TARRAGON_PLUGIN_PREFIX=%s", p.Config.ResolvedPrefix),
 	)
 	if err := cmd.Start(); err != nil {
