@@ -472,7 +472,9 @@ accepts = "file"
 mime = "image/*"
 ```
 
-`accepts` is `file`, `url` or `text`. `ref.value` must be a nonempty string without NUL; use an absolute path for files. `mime` is optional: without it, any reference of that kind matches. Otherwise use a bare media type or `type/*`; a producer must supply a concrete matching MIME type. A missing MIME never matches a restricted rule. Handler `action` and `label` are nonblank strings. Invalid rules and references do not prevent the producer's other results from appearing.
+`accepts` is `file`, `url` or `text`. `ref.value` must be a nonempty string without NUL. A `file` reference must be an absolute filesystem path. The daemon checks the path form without accessing the filesystem. It omits invalid references from normalized rows, so they cannot create cross-plugin offers. The raw producer result and its native actions are preserved.
+
+`mime` is optional: without it, any reference of that kind matches. Otherwise use a bare media type or `type/*`; a producer must supply a concrete matching MIME type. A missing MIME never matches a restricted rule. Handler `action` and `label` are nonblank strings. Invalid rules do not prevent the producer's other results from appearing.
 
 The daemon reads enabled effective manifests for all lifecycles. Creating an offer sends **nothing** to the consumer. If the user selects it, a persistent handler receives `{"type":"select","query_id":"","result_id":"/pictures/sky.png","action":"set"}` (with an `action_id` on a tagged connection). An on-call handler receives `entrypoint tarragon select "/pictures/sky.png" set`. Neither gets the producer's private context or cached row ID. The consumer validates the supplied value for its operation. A `next:{"type":"refresh"}` asks to refresh the **producer** and requires its `replay` capability.
 

@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"path/filepath"
 	"slices"
 	"strings"
 
@@ -21,7 +22,8 @@ func readResultRef(raw json.RawMessage) *wire.ResultRef {
 	}
 	var ref wire.ResultRef
 	if json.Unmarshal(raw, &ref) != nil || !plugins.ReferenceKind(ref.Type) ||
-		ref.Value == "" || strings.ContainsRune(ref.Value, 0) {
+		ref.Value == "" || strings.ContainsRune(ref.Value, 0) ||
+		(ref.Type == "file" && !filepath.IsAbs(ref.Value)) {
 		return nil
 	}
 	if _, ok := plugins.MediaType(ref.MIME, false); !ok {
