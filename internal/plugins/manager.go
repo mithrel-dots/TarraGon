@@ -52,12 +52,13 @@ type PluginConfig struct {
 	Entrypoint  string        `toml:"entrypoint"`
 	Lifecycle   LifecycleMode `toml:"lifecycle_mode"`
 
-	ProvidesGeneral bool     `toml:"provides_general_suggestions"`
-	Prefix          string   `toml:"prefix"`
-	RequirePrefix   bool     `toml:"require_prefix"`
-	BuildDeps       []string `toml:"build_dependencies"`
-	Capabilities    []string `toml:"capabilities"`
-	Icon            string   `toml:"icon"`
+	ProvidesGeneral bool      `toml:"provides_general_suggestions"`
+	Prefix          string    `toml:"prefix"`
+	RequirePrefix   bool      `toml:"require_prefix"`
+	BuildDeps       []string  `toml:"build_dependencies"`
+	Capabilities    []string  `toml:"capabilities"`
+	Handlers        []Handler `toml:"-"`
+	Icon            string    `toml:"icon"`
 
 	// ResolvedPrefix is the prefix a user actually types. It is derived from
 	// Prefix and the global prefix symbol, and is never read from the manifest.
@@ -137,6 +138,7 @@ func (p *Plugin) StopWithTimeout(timeout time.Duration) {
 // Manager oversees all plugins.
 type Manager struct {
 	Plugins      map[string]*Plugin
+	handlers     []Handler
 	pluginDir    string
 	stopTimeout  time.Duration
 	prefixSymbol string
@@ -243,10 +245,14 @@ func loadPluginConfig(pluginDir, dirName string) (PluginConfig, error) {
 		return PluginConfig{}, err
 	}
 
-	cfg := PluginConfig{ProvidesGeneral: true}
-	if err := toml.Unmarshal(data, &cfg); err != nil {
+	manifest := struct {
+		PluginConfig
+		Declarations any `toml:"handlers"`
+	}{PluginConfig: PluginConfig{ProvidesGeneral: true}}
+	if err := toml.Unmarshal(data, &manifest); err != nil {
 		return PluginConfig{}, fmt.Errorf("invalid config: %w", err)
 	}
+	cfg := manifest.PluginConfig
 
 	declared := strings.TrimSpace(cfg.ID)
 	cfg.ID = NormalizePluginID(declared)
@@ -267,6 +273,7 @@ func loadPluginConfig(pluginDir, dirName string) (PluginConfig, error) {
 	if cfg.Name == "" {
 		cfg.Name = cfg.ID
 	}
+	cfg.Handlers = parseHandlers(cfg.ID, manifest.Declarations)
 
 	return cfg, nil
 }
@@ -292,6 +299,7 @@ func (m *Manager) Discover() error {
 		m.Plugins[cfg.ID] = &Plugin{Config: cfg, BaseConfig: cfg, Dir: dir}
 	}
 	m.ResolvePrefixes()
+	m.indexHandlers()
 	return nil
 }
 
@@ -319,6 +327,7 @@ func (m *Manager) ReloadConfigs(refreshKnown bool) error {
 		}
 	}
 	m.prefixSymbol = next.prefixSymbol
+	m.handlers = next.handlers
 	return nil
 }
 
@@ -391,6 +400,7 @@ func (m *Manager) ApplyOverrides() error {
 	}
 
 	m.ResolvePrefixes()
+	m.indexHandlers()
 	for _, collision := range m.PrefixCollisions() {
 		log.Printf("config: %s", collision)
 	}

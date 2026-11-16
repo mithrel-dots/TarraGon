@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -102,7 +103,7 @@ func TestQueryReplacementActionRoundTrip(t *testing.T) {
 	if err := json.Unmarshal(b, &out); err != nil {
 		t.Fatalf("unmarshal action: %v", err)
 	}
-	if out != *in {
+	if !reflect.DeepEqual(out, *in) {
 		t.Fatalf("action changed across wire round trip: got %+v, want %+v", out, *in)
 	}
 }
@@ -118,7 +119,7 @@ func TestKeepOpenActionRoundTrip(t *testing.T) {
 	if err := json.Unmarshal(b, &out); err != nil {
 		t.Fatalf("unmarshal action: %v", err)
 	}
-	if out != *in {
+	if !reflect.DeepEqual(out, *in) {
 		t.Fatalf("action changed across wire round trip: got %+v, want %+v", out, *in)
 	}
 }

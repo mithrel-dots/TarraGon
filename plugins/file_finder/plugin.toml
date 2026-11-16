@@ -9,4 +9,4 @@ provides_general_suggestions = true
 prefix = "f"
 require_prefix = false
 build_dependencies = ["go"]
-capabilities = ["suggest"]
+capabilities = ["suggest", "replay"]

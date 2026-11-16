@@ -125,11 +125,13 @@ func (r *pluginRegistry) waitConn(ctx context.Context, name string, done <-chan 
 
 // Requests routed to plugins.
 type pluginRequest struct {
-	name         string
-	queryID      string
-	text         string
-	conn         peerConn
-	selectAction *selectAction
+	name          string
+	pluginContext string
+	queryID       string
+	text          string
+	conn          peerConn
+	end           bool
+	selectAction  *selectAction
 }
 
 func startPluginRouter(ctx context.Context, store *aggregateStore) (chan<- pluginRequest, *pluginRegistry) {
@@ -163,11 +165,17 @@ func startPluginRouter(ctx context.Context, store *aggregateStore) (chan<- plugi
 					continue
 				}
 				conn := s.conn
-				if !store.beginQueryWrite(req, conn) {
-					continue // ended or retired while queued
+				var frame any
+				if req.end {
+					frame = map[string]string{"type": wire.MsgEnd, "query_id": req.queryID}
+				} else {
+					if !store.beginQueryWrite(req, conn) {
+						continue // ended or retired while queued
+					}
+					frame = &wire.PluginRequest{Type: wire.MsgRequest, QueryID: req.queryID, Text: req.text, Context: req.pluginContext}
 				}
 				_ = conn.SetWriteDeadline(time.Now().Add(100 * time.Millisecond))
-				err := wire.WriteMsg(conn, &wire.PluginRequest{Type: wire.MsgRequest, QueryID: req.queryID, Text: req.text})
+				err := wire.WriteMsg(conn, frame)
 				_ = conn.SetWriteDeadline(time.Time{})
 				if err != nil {
 					log.Printf("[PLUGINS] send to %s failed: %v", req.name, err)
@@ -221,7 +229,7 @@ func handlePluginConn(ctx context.Context, conn peerConn, registry *pluginRegist
 		}
 
 		switch resp.Type {
-		case wire.MsgResponse:
+		case wire.MsgResponse, wire.MsgLiveUpdate:
 			store.receiveQuery(hello.Name, conn, resp)
 
 		case wire.MsgSelectResponse:

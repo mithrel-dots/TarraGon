@@ -11,6 +11,9 @@ description = "demo plugin"
 entrypoint = "demo-plugin"
 lifecycle_mode = "on_call"
 custom_flag = "preserve-me"
+[[handlers]]
+action = "set"
+source = "custom"
 `)
 
 	out, name, err := rewriteManifestForSystem(manifest, "/usr/bin/demo", "demo")
@@ -25,7 +28,7 @@ custom_flag = "preserve-me"
 	if !strings.Contains(got, `entrypoint = "/usr/bin/demo"`) {
 		t.Fatalf("expected rewritten absolute entrypoint, got:\n%s", got)
 	}
-	if !strings.Contains(got, `source = "system"`) {
+	if !strings.HasPrefix(got, "source = \"system\"\n") || !strings.Contains(got, `source = "custom"`) {
 		t.Fatalf("expected source marker, got:\n%s", got)
 	}
 	if !strings.Contains(got, `custom_flag = "preserve-me"`) {

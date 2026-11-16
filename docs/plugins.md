@@ -23,7 +23,7 @@ Repository layout note:
 There are two supported plugin sources:
 
 1. **Plugin Git repository** (installed with `tarragon plugin install <git-url>`): the repository root must contain `plugin.toml` and a `Makefile`; `entrypoint` is typically a path relative to the installed plugin directory.
-2. **System plugin** (enabled with `tarragon plugin enable <name>`): Tarragon looks up the binary in `PATH`, runs `<binary> tarragon manifest`, rewrites a relative `entrypoint` to the resolved absolute binary path, appends `source = "system"`, and stores the resulting manifest in Tarragon's plugin directory.
+2. **System plugin** (enabled with `tarragon plugin enable <name>`): Tarragon looks up the binary in `PATH`, runs `<binary> tarragon manifest`, rewrites a relative `entrypoint` to the resolved absolute binary path, sets `source = "system"`, and stores the resulting manifest in Tarragon's plugin directory.
 
 ### System Plugin Enable + Reload Behavior
 
@@ -144,7 +144,7 @@ Lifecycle modes:
 
 ## Dispatch Eligibility and Prefix Targeting
 
-Tarragon supports both global (unprefixed) and explicit prefix-targeted dispatch.
+When the UI does not address a plugin by ID, Tarragon routes by input text:
 
 - **Global/unprefixed query**:
   - `require_prefix = true` excludes a plugin from unprefixed dispatch.
@@ -169,6 +169,25 @@ The symbol comes from the top-level `prefix_symbol` config option, which default
 A prefix that starts with a non-alphanumeric character is treated as literal and is used exactly as written, so `prefix = "@calc"` and `prefix = "="` keep working regardless of the configured symbol. Prefix overrides in `[plugins.<id>]` follow the same rule.
 
 The effective prefix is what `tarragon plugin list`, `tarragon plugin config` and the status response report. The configured symbol is passed to plugins as `TARRAGON_PREFIX_SYMBOL` for plugins that expose several prefixes of their own.
+
+## Scoped queries and plugin context
+
+A UI can query an enabled plugin by its stable `plugin` ID, including a plugin with no prefix. Only that plugin receives the query. Its `text` is literal: `""`, surrounding spaces, and text starting with another plugin's prefix all pass through unchanged. An unknown or disabled ID gets an `ack` and a snapshot with `plugins[id].state:"error"` and no rows.
+
+The UI may include an opaque `context` string describing the destination. Use it for non-secret values such as a catalog ID. It must be valid Unicode encoded in at most **4096 UTF-8 bytes**, without NUL. Omitting it or sending `""` means no context. A query with invalid context or nonempty context without an explicit `plugin` gets an `error` before dispatch; a prefix in `text` does not qualify.
+
+For a persistent plugin, context is an optional field on `request` and `select` on either transport:
+
+```text
+UI → daemon       {"type":"query","plugin":"catalog","context":"show:42","text":""}
+daemon → catalog  {"type":"request","query_id":"q2","context":"show:42","text":""}
+UI → daemon       {"type":"select","plugin":"catalog","query_id":"q2","result_id":"episode:2","action":"play"}
+daemon → catalog  {"type":"select","query_id":"q2","context":"show:42","result_id":"episode:2","action":"play"}
+```
+
+A select can supply `context` directly. When the same UI selects from its retained query for that handler, the recorded context takes precedence, including an empty context. Another UI cannot inherit it by copying the query ID. Invalid select context yields the normal `ok` followed by `select_response` with `code:"not_run"`. A producer refresh reuses the recorded text and context.
+
+An `on_call` plugin reads nonempty context from **`TARRAGON_CONTEXT`** for that invocation. Without context the variable is absent, even if it was set in the daemon's environment. The example above runs `entrypoint tarragon query ""` and `entrypoint tarragon select "episode:2" "play"`; context adds no argv slot.
 
 ## Lifecycle-Aware Status Expectations
 
@@ -206,6 +225,20 @@ The daemon measures latency and merges your response into the snapshot for that 
 
 A persistent plugin may send more `response` frames for a retained query on the same connection. Each replaces that plugin's rows; an empty list clears them. If you opt into refresh, finish sending the old round's updates before requesting a replay. The first response after a refresh is dispatched counts as its answer: the wire carries no round number.
 
+### Live results
+
+A persistent producer can opt into a live query on its **solicited** `response`. Keep a bounded window (for example, the last 100 log lines) and send it as a complete replacement each time:
+
+```jsonl
+{"type":"response","query_id":"q3","live":true,"data":{"results":["line 1"]}}
+{"type":"live_update","query_id":"q3","data":{"results":["line 1","line 2"]}}
+{"type":"live_update","query_id":"q3","final":true,"data":{"results":["finished"]}}
+```
+
+Each `live_update` replaces only your producer's rows. It is accepted only for the opted-in query on the original connection. `final:true` publishes the last replacement and ends that producer's subscription. A refresh `request` still needs its own `response`; a push, including a final push, cannot acknowledge it. Include `live:true` on that response to keep pushing. Legacy producers can continue using their original `response` behavior.
+
+Opting in also promises to handle `{"type":"end","query_id":"q3"}`: stop the feed for that query only. This applies even without an `end` manifest capability. UIs need not request a reservation for live results; ordinary history eviction can end the feed. See [watch limits and errors](ui.md#watching-a-live-view) for the retention and envelope budgets. On-call plugins return one result per invocation.
+
 Environment variables passed to plugins:
 - `TARRAGON_PLUGINS_ENDPOINT`: Unix socket path to connect to (for example, `/run/user/1000/tarragon/plugins.sock`).
 - `TARRAGON_PLUGIN_NAME`: The stable plugin id used for IPC routing. This is set for persistent and on-call plugins.
@@ -218,6 +251,18 @@ Environment variables passed to plugins:
 `TARRAGON_PLUGINS_ENDPOINT` is set only for persistent plugins. On-call plugins
 receive the identity and prefix variables above when invoked for a query or
 selection.
+
+### Ending pending work
+
+A persistent plugin can add `end` to its manifest `capabilities` if it can cancel a pending query by ID. When the view ends, the daemon sends one frame on the connection that received the request:
+
+```json
+{"type":"end","query_id":"q2"}
+```
+
+Stop work for `q2` only; overlapping requests and selects are independent. No reply is required. A request may finish while `end` is in transit, so an already finished ID is a no-op. Once the daemon accepts a `live:true` response, that query also gets `end` without a manifest capability. Declare `end` to receive cancellation while the first response is still pending.
+
+An ordinary completed query gets no `end`. Neither does an undispatched request or a replacement connection. The daemon drops later data for the ended ID. On-call queries use process cancellation instead; their select processes are independent.
 
 ### Socket Locations
 
@@ -350,7 +395,7 @@ To show the effect of an action on the selected list, include a single `next` ob
 
 A persistent handler puts the same `next` on its `select_response`, with `action_id` if it declared that capability. An action can explicitly request refresh even with `success:false`, for example if it changed some state before failing. To keep the list visible after success, give the offered row action `type:"keep_open"`.
 
-The daemon consumes `next`: it queues the action outcome, then sends only the **original producer** a query with the **original resolved text**, even if the prefix has since changed. The UI and persistent producer see the same `query_id` as before; an on-call producer receives the same query argv. Neither the select nor the other producers run again. A baseline UI just gets an ordinary full snapshot for the original query.
+The daemon consumes `next:{"type":"refresh"}`: it queues the action outcome, then sends only the **original producer** a query with the **original resolved text**, even if the prefix has since changed. The UI and persistent producer see the same `query_id` as before; an on-call producer receives the same query argv. Neither the select nor the other producers run again. A baseline UI just gets an ordinary full snapshot for the original query.
 
 Refresh requires a retained source query and row owned by the selecting UI, an enabled producer, and consent to replay. Asking to refresh your own result gives consent for that invocation. Declare `capabilities = ["replay"]` (alongside any existing capabilities) only if your queries are safe to repeat. Another handler cannot give consent for your plugin. A missing or ineligible source simply skips refresh; the original action outcome stands.
 
@@ -370,6 +415,13 @@ Plugin payloads are normalized into Tarragon result items. The daemon currently 
 
 Array items can be objects or strings.
 
+To preserve a meaningful sequence such as episode order, return
+`{"ordered":true,"results":[{"id":"ep2","score":0.1},{"id":"ep10","score":0.9}]}`.
+When the query explicitly targeted your plugin by ID or resolved prefix, the
+daemon keeps that order and skips frecency blending. Global search still uses
+the configured ranking, even when yours is the only result. Each response
+replaces the previous one; omit `ordered` to resume ordinary ranking.
+
 Recognized object fields:
 
 - `id`
@@ -379,6 +431,7 @@ Recognized object fields:
 - `category`
 - `score`
 - `preview_path`
+- `ref` (an independently usable value for [cross-plugin actions](#cross-plugin-actions))
 - `actions`
 
 Example:
@@ -401,6 +454,32 @@ Example:
 }
 ```
 
+### Cross-plugin actions
+
+A producer can expose a value separately from its private row ID. For example, `file_finder` emits a `file` reference for each path and derives its MIME type from the extension. A producer with private IDs could emit:
+
+```json
+{"id":"f17","label":"Sky","ref":{"type":"file","value":"/pictures/sky.png","mime":"image/png"},"actions":[{"name":"open","default":true}]}
+```
+
+Declare independently invokable actions in the **consumer's** `plugin.toml`. The bundled `wallpaper` plugin declares:
+
+```toml
+[[handlers]]
+action = "set"
+label = "Set as wallpaper"
+accepts = "file"
+mime = "image/*"
+```
+
+`accepts` is `file`, `url` or `text`. `ref.value` must be a nonempty string without NUL; use an absolute path for files. `mime` is optional: without it, any reference of that kind matches. Otherwise use a bare media type or `type/*`; a producer must supply a concrete matching MIME type. A missing MIME never matches a restricted rule. Handler `action` and `label` are nonblank strings. Invalid rules and references do not prevent the producer's other results from appearing.
+
+The daemon reads enabled effective manifests for all lifecycles. Creating an offer sends **nothing** to the consumer. If the user selects it, a persistent handler receives `{"type":"select","query_id":"","result_id":"/pictures/sky.png","action":"set"}` (with an `action_id` on a tagged connection). An on-call handler receives `entrypoint tarragon select "/pictures/sky.png" set`. Neither gets the producer's private context or cached row ID. The consumer validates the supplied value for its operation. A `next:{"type":"refresh"}` asks to refresh the **producer** and requires its `replay` capability.
+
+Only the daemon assigns `secondary` and `offer_id`. The generated legacy action-name suffix ` [via <plugin>/<action> #<token>]` is reserved.
+
+### Action behavior
+
 An action can request query replacement instead of plugin selection:
 
 ```json
@@ -412,8 +491,7 @@ An action can request query replacement instead of plugin selection:
 ```
 
 The UI replaces its input with `query`, remains open, and submits a normal
-query request. It must not send a select request for this action. Actions
-without `type: "query_replace"` retain the existing select behavior.
+query request. It must not send a select request for this action.
 
 An action can also keep the UI open after a successful normal selection:
 
@@ -429,9 +507,38 @@ Action types have these semantics:
 - no `type`: send a normal select request; the UI dismisses after success.
 - `type: "keep_open"`: send a normal select request; the UI remains open after success.
 - `type: "query_replace"`: replace the query and submit it normally; the UI remains open.
+- `type: "open"`: push the current view and send a new scoped query to `destination.plugin`.
 
 The UI should remain open when an action fails so the user can see the outcome. The
 `keep_open` type is a UI hint, and the UI may apply its own user-level policy.
+
+### Opening a view or returning to its parent
+
+When the destination is known in the result, return an Open action. The UI queries the target by ID; the plugin receives no select. `title` and `placeholder` are labels chosen by the opener, not fields on the target's query:
+
+```json
+{"name":"Episodes","type":"open","destination":{"plugin":"catalog","context":"show:42","text":""},"title":"Episodes","placeholder":"Filter episodes"}
+```
+
+If a destination depends on work performed by a select, return one `next` object on its successful final `select_response`, or on the successful on-call select's stdout. For example:
+
+```jsonl
+{"success":true,"message":"Saved","next":{"type":"open","destination":{"plugin":"catalog","context":"episode:7","text":""},"title":"Episode 7"}}
+{"success":true,"message":"Saved","next":{"type":"back"}}
+```
+
+Open/Back applies to the still-current invoking view. For a dynamic Open the daemon identifies the handler as `next.issuer` in the UI reply. Issuing a scoped destination for **your own** plugin promises the UI can re-query that destination on Back, even after the earlier query was evicted. Opening another plugin makes no promise for it. A scoped destination's `context` is non-secret and subject to the same constraints as an ordinary scoped query.
+
+A baseline UI gets a `query_replace` only if the effective prefix routes to the same plugin, with exactly the same forwarded text and no context. Otherwise the menu omits that Open. A post-select Open/Back cannot be translated to a legacy menu action. If the select itself only makes sense with the continuation, mark the **offered** action, e.g. `{"name":"Continue","requires":["navigation"]}`. Otherwise omit `requires` so the legacy UI still gets the ordinary action, success and message. The raw plugin payload is preserved; see [the UI navigation contract](ui.md#open-and-back).
+
+### Non-secret prompts
+
+A rename action can open `{"plugin":"files","context":"rename:file-17","text":""}`
+with `placeholder:"New name"`. Treat each scoped query as validation or preview:
+typing `new.txt` can return `[{"id":"new.txt","actions":[{"name":"save","default":true,"no_frecency":true}]}]`.
+Only a select of the candidate commits the rename. Back needs no rollback.
+`no_frecency` suppresses recording the candidate in the daemon's selection
+database. Query text, context, and result IDs are not secret input channels.
 
 ## Makefile Specification (Required)
 

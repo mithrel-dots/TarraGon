@@ -11,14 +11,18 @@ import (
 	"time"
 
 	"github.com/mithrel-dots/tarragon/internal/db"
+	"github.com/mithrel-dots/tarragon/internal/plugins"
 	"github.com/mithrel-dots/tarragon/internal/wire"
 )
 
 // aggregate store keeps full results per query for streaming snapshots
 type aggResult struct {
-	ElapsedMs float64           `json:"elapsed_ms"`
-	Data      json.RawMessage   `json:"data"`
-	items     []wire.ResultItem // normalized, with the original plugin scores
+	ElapsedMs      float64             `json:"elapsed_ms"`
+	Data           json.RawMessage     `json:"data"`
+	items          []wire.ResultItem   // normalized, with the original plugin scores
+	watchBytes     int64               // charged only while this query holds a reservation
+	ordered        bool                // preserve array order only in a targeted query
+	blockedSelects map[string][]string // row ID → names hidden or reserved for navigation
 }
 
 type aggPluginState struct {
@@ -32,6 +36,7 @@ type aggregate struct {
 	QueryID         string                    `json:"query_id"`
 	Input           string                    `json:"input"`
 	StartedAtUnixMs int64                     `json:"started_at_unix_ms"`
+	WatchError      string                    `json:"watch_error,omitempty"`
 	Results         map[string]aggResult      `json:"results"`
 	Plugins         map[string]aggPluginState `json:"plugins,omitempty"`
 	List            []wire.ResultItem         `json:"list"`
@@ -45,8 +50,12 @@ type queryState struct {
 	aggregate
 	mu              sync.Mutex
 	publishing      bool
+	watch           *watchReservation
 	changed         []string
 	session, stream string
+	target          string // resolved prefix or explicitly addressed ID
+	pluginContext   string // available to an owned select as soon as the query is acknowledged
+	uiFeatures      []string
 	ctx             context.Context
 	cancel          context.CancelFunc
 	producers       map[string]*producerDispatch
@@ -57,6 +66,7 @@ type queryState struct {
 type aggregateStore struct {
 	mu           sync.RWMutex
 	publishers   sync.WaitGroup
+	watches      watchBudget
 	limit        int
 	orderingMode string
 	frecencyDB   *db.DB
@@ -98,6 +108,7 @@ func newAggregateStore(limit int, orderingMode string, frecencyDB *db.DB, frecen
 	}
 	s := &aggregateStore{
 		limit:         limit,
+		watches:       defaultWatchBudget(),
 		orderingMode:  orderingMode,
 		frecencyDB:    frecencyDB,
 		frecencyW:     frecencyWeight,
@@ -142,51 +153,71 @@ func (s *aggregateStore) create(qid, client, input string) {
 }
 
 func (s *aggregateStore) startQuery(ctx context.Context, qid, client, input, session, stream string) {
+	s.startUIQuery(ctx, qid, client, session, wire.UIRequest{Text: input, QueryStream: stream}, "")
+}
+
+func (s *aggregateStore) startUIQuery(ctx context.Context, qid, client, session string, req wire.UIRequest, target string) string {
+	var ends queryEnds
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if _, ok := s.byID[qid]; ok {
-		return
+		s.mu.Unlock()
+		return ""
 	}
-	if stream != "" {
+	if req.QueryStream != "" {
 		for id := range s.byOwner[session] {
-			if s.byID[id].stream == stream {
-				s.removeLocked(id)
+			if s.byID[id].stream == req.QueryStream {
+				ends = s.removeLocked(id)
 				break
 			}
 		}
 	}
 	ctx, cancel := context.WithCancel(ctx)
-	if s.limit > 0 && len(s.byID) >= s.limit {
-		s.removeLocked(s.order[0])
+	q := &queryState{
+		ctx: ctx, cancel: cancel, session: session, stream: req.QueryStream,
+		target: target, pluginContext: req.Context, uiFeatures: req.UIFeatures,
+		aggregate: aggregate{
+			QueryID:         qid,
+			Input:           req.Text,
+			StartedAtUnixMs: time.Now().UnixMilli(),
+			Results:         make(map[string]aggResult),
+			Plugins:         make(map[string]aggPluginState),
+			Client:          client,
+			Created:         time.Now(),
+		},
 	}
-	s.byID[qid] = &queryState{ctx: ctx, cancel: cancel, session: session, stream: stream, aggregate: aggregate{
-		QueryID:         qid,
-		Input:           input,
-		StartedAtUnixMs: time.Now().UnixMilli(),
-		Results:         make(map[string]aggResult),
-		Plugins:         make(map[string]aggPluginState),
-		Client:          client,
-		Created:         time.Now(),
-	}}
-	s.order = append(s.order, qid)
+	reason, evicted := s.retainQueryLocked(q, req.Watch)
+	if reason != "" {
+		cancel()
+		s.mu.Unlock()
+		ends.send()
+		return reason
+	}
+	ends = append(ends, evicted...)
+	s.byID[qid] = q
 	if s.byOwner[session] == nil {
 		s.byOwner[session] = make(map[string]struct{})
 	}
 	s.byOwner[session][qid] = struct{}{}
+	s.mu.Unlock()
+	ends.send()
+	return ""
 }
 
-func (s *aggregateStore) removeLocked(id string) {
+func (s *aggregateStore) removeLocked(id string) queryEnds {
 	q := s.byID[id]
+	q.mu.Lock()
 	if q.cancel != nil {
 		q.cancel()
 	}
+	ends := q.endsLocked()
+	s.forgetRetentionLocked(q)
+	q.mu.Unlock()
 	delete(s.byID, id)
 	delete(s.byOwner[q.session], id)
 	if len(s.byOwner[q.session]) == 0 {
 		delete(s.byOwner, q.session)
 	}
-	i := slices.Index(s.order, id)
-	s.order = slices.Delete(s.order, i, i+1)
+	return ends
 }
 
 func (s *aggregateStore) query(qid string) *queryState {
@@ -201,10 +232,19 @@ func (s *aggregateStore) setExpectedPlugins(qid string, plugins []string) ([]byt
 		return nil, false
 	}
 	ag.mu.Lock()
+	if ag.ctx.Err() != nil {
+		ag.mu.Unlock()
+		return nil, false
+	}
 	ag.detachSnapshot()
 	ag.Plugins = make(map[string]aggPluginState, len(plugins))
 	for _, name := range plugins {
 		ag.Plugins[name] = aggPluginState{State: "pending"}
+	}
+	if ag.watch != nil {
+		// Serialize even the initial snapshot with a racing watch timeout.
+		s.scheduleLocked(ag, "", ag.watch.publish)
+		return nil, false
 	}
 	return s.encodeUnlocked(ag)
 }
@@ -223,17 +263,30 @@ func (s *aggregateStore) SubmitResponse(plugin string, resp wire.PluginResponse,
 	}
 	result, errMsg := parseResult(plugin, resp.Data, elapsed)
 	q.mu.Lock()
-	s.replaceResultLocked(q, plugin, result, errMsg, publish)
-	return true
+	return s.replaceResultLocked(q, plugin, result, errMsg, publish)
 }
 
-func parseResult(plugin string, raw json.RawMessage, elapsed float64) (aggResult, string) {
-	items, errMsg := normalizeResults(plugin, raw)
-	return aggResult{Data: raw, items: items, ElapsedMs: elapsed}, errMsg
-}
-
-// replaceResultLocked releases q.mu through scheduleLocked.
-func (s *aggregateStore) replaceResultLocked(q *queryState, plugin string, result aggResult, errMsg string, publish SnapshotPublisher) {
+// replaceResultLocked returns with q.mu released.
+func (s *aggregateStore) replaceResultLocked(q *queryState, plugin string, result aggResult, errMsg string, publish SnapshotPublisher) bool {
+	if q.ctx.Err() != nil {
+		q.mu.Unlock()
+		return false
+	}
+	var mgr *plugins.Manager
+	if d := q.producers[plugin]; d != nil {
+		mgr = d.mgr
+	}
+	for i := range result.items {
+		result.projectRow(&result.items[i], q.uiFeatures, mgr)
+	}
+	q.addOffersLocked(result.items, mgr)
+	if q.watch != nil {
+		result.watchBytes = resultWatchBytes(result)
+		delta := result.watchBytes - q.Results[plugin].watchBytes + int64(len(errMsg)-len(q.Plugins[plugin].Error))
+		if !s.chargeWatchLocked(q, delta, publish) {
+			return false
+		}
+	}
 	count := len(result.items)
 	state := "done"
 	if errMsg != "" {
@@ -246,6 +299,7 @@ func (s *aggregateStore) replaceResultLocked(q *queryState, plugin string, resul
 	q.Results[plugin] = result
 	q.Plugins[plugin] = aggPluginState{State: state, Count: count, ElapsedMs: result.ElapsedMs, Error: errMsg}
 	s.scheduleLocked(q, plugin, publish)
+	return true
 }
 
 func (s *aggregateStore) submitError(qid, plugin string, elapsed float64, errMsg string, publish SnapshotPublisher) bool {
@@ -254,6 +308,17 @@ func (s *aggregateStore) submitError(qid, plugin string, elapsed float64, errMsg
 		return false
 	}
 	q.mu.Lock()
+	return s.submitErrorLocked(q, plugin, elapsed, errMsg, publish)
+}
+
+func (s *aggregateStore) submitErrorLocked(q *queryState, plugin string, elapsed float64, errMsg string, publish SnapshotPublisher) bool {
+	if q.ctx.Err() != nil {
+		q.mu.Unlock()
+		return false
+	}
+	if q.watch != nil && !s.chargeWatchLocked(q, int64(len(errMsg)-len(q.Plugins[plugin].Error)), publish) {
+		return false
+	}
 	q.detachSnapshot()
 	q.Plugins[plugin] = aggPluginState{State: "error", ElapsedMs: elapsed, Error: errMsg}
 	s.scheduleLocked(q, plugin, publish)
@@ -262,6 +327,9 @@ func (s *aggregateStore) submitError(qid, plugin string, elapsed float64, errMsg
 
 // scheduleLocked releases q.mu. No timer delays the first or final update.
 func (s *aggregateStore) scheduleLocked(q *queryState, plugin string, publish SnapshotPublisher) {
+	if q.watch != nil && q.watch.timer != nil {
+		q.checkInitialWatchLocked()
+	}
 	if !slices.Contains(q.changed, plugin) {
 		q.changed = append(q.changed, plugin)
 	}
@@ -291,8 +359,16 @@ func (s *aggregateStore) drain(q *queryState, publish SnapshotPublisher) {
 			return
 		}
 		q.changed = nil
+		terminal, finished := q.WatchError != "", q.watchFinishedLocked()
 		if data, ok := s.encodeUnlocked(q); ok && s.query(q.QueryID) == q {
 			publish(&wire.UpdateMessage{Type: "update", QueryID: q.QueryID, Payload: data}, changed)
+		}
+		if terminal {
+			s.endQuery(q.session, q.QueryID)
+			return
+		}
+		if finished {
+			s.demoteWatch(q)
 		}
 	}
 }
@@ -317,7 +393,7 @@ func (s *aggregateStore) encodeUnlocked(q *queryState) ([]byte, bool) {
 	q.encoders++
 	q.mapsShared = true
 	q.mu.Unlock()
-	data, ok := s.encodeSnapshot(&snapshot)
+	data, ok := s.encodeSnapshot(&snapshot, q.target)
 	q.mu.Lock()
 	q.encoders--
 	if q.encoders == 0 {
@@ -327,8 +403,10 @@ func (s *aggregateStore) encodeUnlocked(q *queryState) ([]byte, bool) {
 	return data, ok
 }
 
-func (s *aggregateStore) encodeSnapshot(ag *aggregate) ([]byte, bool) {
-	if len(ag.Results) != 0 {
+func (s *aggregateStore) encodeSnapshot(ag *aggregate, target string) ([]byte, bool) {
+	if res := ag.Results[target]; target != "" && res.ordered {
+		ag.List = res.items
+	} else if len(ag.Results) != 0 {
 		total := 0
 		for _, res := range ag.Results {
 			total += len(res.items)
@@ -346,7 +424,8 @@ func (s *aggregateStore) encodeSnapshot(ag *aggregate) ([]byte, bool) {
 	return snap, true
 }
 
-func normalizeResults(plugin string, raw json.RawMessage) ([]wire.ResultItem, string) {
+func parseResult(plugin string, raw json.RawMessage, elapsed float64) (aggResult, string) {
+	result := aggResult{Data: raw, ElapsedMs: elapsed}
 	// Object with known array fields.
 	var obj map[string]json.RawMessage
 	if json.Unmarshal(raw, &obj) == nil {
@@ -354,18 +433,21 @@ func normalizeResults(plugin string, raw json.RawMessage) ([]wire.ResultItem, st
 		for _, k := range []string{"suggestions", "variants", "items", "choices", "results"} {
 			if arr, ok := obj[k]; ok {
 				if items := parseArrayItems(plugin, arr); len(items) > 0 {
-					return items, errMsg
+					result.items = items
+					result.ordered = string(obj["ordered"]) == "true"
+					return result, errMsg
 				}
 			}
 		}
 		// Single object with id/label/title/text.
 		if item, ok := parseObjectItem(plugin, obj); ok {
-			return []wire.ResultItem{item}, errMsg
+			result.items = []wire.ResultItem{item}
 		}
-		return nil, errMsg
+		return result, errMsg
 	}
 	// Top-level array.
-	return parseArrayItems(plugin, raw), ""
+	result.items = parseArrayItems(plugin, raw)
+	return result, ""
 }
 
 func parseArrayItems(plugin string, raw json.RawMessage) []wire.ResultItem {
@@ -425,6 +507,7 @@ func parseObjectItem(plugin string, obj map[string]json.RawMessage) (wire.Result
 		Plugin:      plugin,
 		Score:       score,
 		Actions:     actions,
+		Ref:         readResultRef(obj["ref"]),
 	}, true
 }
 
@@ -459,6 +542,11 @@ func readActionsField(obj map[string]json.RawMessage, key string) []wire.Action 
 	}
 	var actions []wire.Action
 	if json.Unmarshal(raw, &actions) == nil {
+		// Only the daemon can issue a cross-plugin offer.
+		for i := range actions {
+			actions[i].Secondary = false
+			actions[i].OfferID = ""
+		}
 		return actions
 	}
 	return nil
@@ -542,11 +630,13 @@ func applyFrecency(item wire.ResultItem, frecencyScores map[string]float64, weig
 
 func (s *aggregateStore) removeByOwner(uid string) int {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	var ends queryEnds
 	set := s.byOwner[uid]
 	removed := len(set)
 	for qid := range set {
-		s.removeLocked(qid)
+		ends = append(ends, s.removeLocked(qid)...)
 	}
+	s.mu.Unlock()
+	ends.send()
 	return removed
 }

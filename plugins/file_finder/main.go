@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"mime"
 	"net"
 	"os"
 	"os/exec"
@@ -62,6 +63,13 @@ type resultItem struct {
 	PreviewPath string       `json:"preview_path,omitempty"`
 	Score       float64      `json:"score"`
 	Actions     []actionItem `json:"actions,omitempty"`
+	Ref         fileRef      `json:"ref"`
+}
+
+type fileRef struct {
+	Type  string `json:"type"`
+	Value string `json:"value"`
+	MIME  string `json:"mime,omitempty"`
 }
 
 type selectResponse struct {
@@ -481,8 +489,11 @@ func (i *indexer) query(ctx context.Context, q string) ([]resultItem, error) {
 		if parent == "" {
 			parent = "/"
 		}
+		// shortcut: infer MIME from the extension; sniff during indexing if extensionless files need typed offers.
+		mediaType, _, _ := mime.ParseMediaType(mime.TypeByExtension(filepath.Ext(h.Path)))
 		results = append(results, resultItem{
 			ID:          h.Path,
+			Ref:         fileRef{Type: "file", Value: h.Path, MIME: mediaType},
 			Label:       h.Filename,
 			Description: parent,
 			Icon:        "text-x-generic",

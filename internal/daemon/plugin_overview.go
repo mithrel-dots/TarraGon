@@ -42,14 +42,8 @@ func canRestart(p wire.PluginInfo) bool {
 func overviewItems(infos []wire.PluginInfo, filter string) []wire.ResultItem {
 	terms := strings.Fields(strings.ToLower(filter))
 	items := make([]wire.ResultItem, 0, len(infos))
-	claimed := make(map[string]bool)
 nextPlugin:
 	for _, p := range infos {
-		// Status is sorted by ID, the same tie-breaker as query routing.
-		canOpen := p.Enabled && p.Prefix != "" && !claimed[p.Prefix]
-		if canOpen {
-			claimed[p.Prefix] = true
-		}
 		desc := overviewDescription(p)
 		text := strings.ToLower(p.Name + " " + desc)
 		for _, term := range terms {
@@ -59,9 +53,11 @@ nextPlugin:
 		}
 		actions := []wire.Action{{Name: "details", Type: wire.ActionTypeKeepOpen, Default: true}}
 		if p.ID != plugins.OverviewID {
-			if canOpen {
+			if p.Enabled {
 				actions[0].Default = false
-				actions = append([]wire.Action{{Name: "open", Type: wire.ActionTypeQueryReplace, Query: p.Prefix + " ", Default: true}}, actions...)
+				open := wire.Action{Name: "open", Type: wire.ActionTypeOpen, Default: true,
+					Destination: &wire.Destination{Plugin: p.ID}, Title: p.Name}
+				actions = append([]wire.Action{open}, actions...)
 			}
 			if canRestart(p) {
 				actions = append(actions, wire.Action{Name: "restart", Type: wire.ActionTypeKeepOpen})

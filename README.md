@@ -30,13 +30,13 @@ Restart the daemon after changing listener settings. `run_ipc` controls only `ui
 
 ### How a suggestion reaches the UI
 
-1. **Route.** The daemon returns a `query_id` to the frontend that asked. A matching prefix targets one plugin; an unprefixed query goes to all eligible plugins.
+1. **Route.** The daemon returns a `query_id` to the frontend that asked. A query can address an enabled plugin by ID with literal text and optional context. Otherwise a matching prefix targets one plugin and an unprefixed query goes to all eligible plugins.
 2. **Merge.** The daemon normalizes each reply and replaces only that plugin’s results for the query.
 3. **Display.** The daemon ranks the results so far and sends a [full snapshot](docs/ui.md#message-shapes) only to that Unix socket connection or native NATS session. The UI replaces its list without waiting for every plugin. Several plugin replies can appear in one snapshot.
 
 Two frontends can search and select concurrently, even with the same `client_id`. Each receives its own acknowledgements, updates and action outcomes. Two native sessions on one NATS connection are separate owners; broker access still allows subscribing to other subjects.
 
-**Ranking.** SQLite records how often and how recently you select each result. The daemon caches these scores at startup and refreshes them after each selection. By default, ranking blends 70% plugin score with 30% selection history (`frecency_weight`). In `global` order, equal blended scores break by ascending plugin ID, then by the plugin's original row order. In `grouped` order, groups rank by their best blended score, then by plugin ID; rows within each group keep their original order.
+**Ranking.** By default the daemon blends 70% plugin score with 30% SQLite selection history (`frecency_weight`). In `global` order, equal blended scores break by ascending plugin ID, then by the plugin's original row order. In `grouped` order, groups rank by their best blended score, then by plugin ID; rows within each group keep their original order. A targeted producer can request its own list order, and individual actions can opt out of selection history.
 
 **Selection.** A [select](docs/ui.md#selecting-a-result) gets an `ok` on receipt and one terminal `select_response` on the same open session. A plugin can [request a refresh](docs/plugins.md#refreshing-a-producers-results) of its own results on that query without re-running the action or the other producers. A plugin that just prints `["one","two"]` needs no new handshake, manifest capabilities or command-line arguments.
 
@@ -61,7 +61,7 @@ To rebuild the diagram, install [D2](https://d2lang.com/tour/install/), edit the
 ### Plugin Overview
 Type `@plugins` to browse plugins, including disabled ones. Filter by name or status with `@plugins calc` or `@plugins disabled`. Each row shows the plugin ID, effective prefix, lifecycle, and connection state. The overview is built into the daemon and uses your configured prefix symbol.
 
-Use **open** to search a plugin by its prefix and **details** to inspect it. **Enable**, **disable** and **restart** refresh the overview using its original filter, even if an override was saved but startup failed. Changes use the same primary TOML overrides as `tarragon plugin config`; higher-priority drop-ins still apply. **Restart** applies to persistent plugins; an on-demand plugin starts again when next needed.
+Use **open** to browse an enabled plugin by ID in a navigation-capable UI. Baseline UIs get a prefix replacement when it routes to the same plugin. Use **details** to inspect the plugin. **Enable**, **disable** and **restart** refresh the overview using its original filter, even if an override was saved but startup failed. Changes use the same primary TOML overrides as `tarragon plugin config`; higher-priority drop-ins still apply. **Restart** applies to persistent plugins; an on-demand plugin starts again when next needed.
 
 ### Plugin System
 - **Integrated Suggestions**: Seamlessly blends suggestions from eligible plugins, including bundled plugins for installed applications and other local tasks.

@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"net"
+	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -64,7 +66,7 @@ func TestNativeListenerWithToken(t *testing.T) {
 // A socket-only exchange must also be observable on the broker. A working
 // socket round trip alone would not catch an accidental direct-to-core path.
 func TestBrokerCarriesUnixAndNativeRequests(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	b, err := startNATS(ctx, -1, "")
 	if err != nil {
@@ -77,11 +79,28 @@ func TestBrokerCarriesUnixAndNativeRequests(t *testing.T) {
 	registry.bus = b
 	manager := plugins.NewManager(t.TempDir())
 	manager.Plugins["native"] = &plugins.Plugin{Config: plugins.PluginConfig{
-		Name: "native", Enabled: true, ProvidesGeneral: true, Lifecycle: plugins.LifecycleDaemon,
+		Name: "native", Enabled: true, ProvidesGeneral: true, Lifecycle: plugins.LifecycleDaemon, Capabilities: []string{wire.MsgEnd},
+	}}
+	dir := t.TempDir()
+	actionGate := openOnCallTestGate(t, dir)
+	action := writeScript(t, dir, "effect", `#!/bin/sh
+cd "${0%/*}" || exit 1
+echo $$ > pid
+read -r value < gate
+echo "$value" > "$3.done"
+`)
+	manager.Plugins["effect"] = &plugins.Plugin{Config: plugins.PluginConfig{
+		Name: "effect", Enabled: true, Lifecycle: plugins.LifecycleOnCall, Entrypoint: action,
 	}}
 	handleUI := func(c peerConn) { handleUIClient(b.ctx, c, manager, requests, registry, store, ui, nil) }
 	handlePlugin := func(c peerConn) { handlePluginConn(b.ctx, c, registry, store, ui) }
-	if err := b.listenNative(handleUI, handlePlugin); err != nil {
+	var shortIdle atomic.Bool
+	if err := b.listenNative(func(c peerConn) {
+		if shortIdle.Swap(false) {
+			c.(*subjectPeer).idleTimeout = 500 * time.Millisecond
+		}
+		handleUI(c)
+	}, handlePlugin); err != nil {
 		t.Fatal(err)
 	}
 	client, err := nats.Connect(b.server.ClientURL())
@@ -150,7 +169,7 @@ func TestBrokerCarriesUnixAndNativeRequests(t *testing.T) {
 		t.Fatalf("unexpected routes %s → %s", request.Subject, reply.Subject)
 	}
 
-	openSession := func(role string) (peer, func()) {
+	openSession := func(role string) (peer, func(bool)) {
 		t.Helper()
 		open, err := client.RequestWithContext(ctx, "tarragon."+role+".open", nil)
 		if err != nil {
@@ -193,9 +212,11 @@ func TestBrokerCarriesUnixAndNativeRequests(t *testing.T) {
 					t.Fatal(err)
 				}
 			},
-		}, func() {
+		}, func(closeInput bool) {
 			t.Helper()
-			send([]byte("close"))
+			if closeInput {
+				send([]byte("close"))
+			}
 			if got := string(next()); got != "close" {
 				t.Fatalf("expected session close, got %s", got)
 			}
@@ -226,9 +247,9 @@ func TestBrokerCarriesUnixAndNativeRequests(t *testing.T) {
 		}
 		return snap
 	}
-	query := func(p peer, text, stream string) string {
+	query := func(p peer, text, stream string, watch bool) string {
 		t.Helper()
-		p.send(wire.UIRequest{Type: "query", Text: text, ClientID: "cli", QueryStream: stream})
+		p.send(wire.UIRequest{Type: "query", Text: text, ClientID: "cli", QueryStream: stream, Watch: watch})
 		var ack wire.AckMessage
 		p.read(&ack)
 		if ack.Type != "ack" || ack.QueryID == "" {
@@ -248,8 +269,8 @@ func TestBrokerCarriesUnixAndNativeRequests(t *testing.T) {
 
 	// Hold replies until both peers have pending lists with the same label
 	// and stream. The third peer shares the native UI's broker connection.
-	unixQuery := query(unix, "unix query", "search")
-	nativeQuery := query(native, "hello", "search")
+	unixQuery := query(unix, "unix query", "search", false)
+	nativeQuery := query(native, "hello", "search", false)
 	status(observer)
 	respond(nativeQuery, `{"id":"match","label":"Hello"}`)
 	respond(unixQuery, `[]`)
@@ -264,29 +285,93 @@ func TestBrokerCarriesUnixAndNativeRequests(t *testing.T) {
 		t.Fatalf("lost replacement from the original producer: %+v", snap.List)
 	}
 
-	keep := query(unix, "still live", "")
-	detached := query(native, "detach me", "")
+	keep := query(unix, "still live", "", true)
+	plugin.send(wire.PluginResponse{Type: wire.MsgResponse, QueryID: keep, Live: true, Data: json.RawMessage(`["unix"]`)})
+	readSnapshot(unix, keep, "still live", "done")
+	unixUsage := totalWatchUsage(store)
+	detached := query(native, "detach me", "", true)
 	native.send(wire.UIRequest{Type: "detach", ClientID: "renamed"})
 	var ack wire.AckMessage
 	native.read(&ack)
 	if ack.Type != "ok" || store.query(detached) != nil || store.query(nativeQuery) != nil {
 		t.Fatalf("detach did not end the owner's queries: %+v", ack)
 	}
-	closed := query(native, "close me", "")
-	closeNative()
-	if store.query(closed) != nil {
-		t.Fatal("closed native session retained its non-stream query")
+	var end wire.AckMessage
+	plugin.read(&end)
+	if end.Type != wire.MsgEnd || end.QueryID != detached {
+		t.Fatalf("unexpected plugin frame on detach: %+v", end)
+	}
+	for _, reason := range []string{"close", "idle"} {
+		if reason == "idle" {
+			shortIdle.Store(true)
+			native, closeNative = openSession("ui")
+		}
+		streamed := query(native, reason+" streamed", "search", true)
+		unstreamed := query(native, reason+" unstreamed", "", true)
+		plugin.send(wire.PluginResponse{Type: wire.MsgResponse, QueryID: unstreamed, Live: true, Data: json.RawMessage(`["native"]`)})
+		readSnapshot(native, unstreamed, reason+" unstreamed", "done")
+		if u := totalWatchUsage(store); u.count != 3 || u.bytes <= unixUsage.bytes {
+			t.Fatalf("expected two native watches and one Unix watch, got %+v", u)
+		}
+		native.send(wire.UIRequest{Type: wire.MsgSelect, QueryID: unstreamed, Plugin: "effect", ResultID: reason})
+		var actionAck wire.SelectAck
+		native.read(&actionAck)
+		if actionAck.Type != "ok" || actionAck.ActionID == "" {
+			t.Fatalf("bad select receipt: %+v", actionAck)
+		}
+		onCallChildPID(t, dir)
+		closeNative(reason == "close")
+		if u := totalWatchUsage(store); u != unixUsage {
+			t.Fatalf("native %s left watch usage %+v, want Unix usage %+v", reason, u, unixUsage)
+		}
+		want := map[string]bool{streamed: true, unstreamed: true}
+		for len(want) != 0 {
+			plugin.read(&end)
+			if end.Type != wire.MsgEnd || !want[end.QueryID] || store.query(end.QueryID) != nil {
+				t.Fatalf("unexpected plugin frame or retained query on native %s: %+v", reason, end)
+			}
+			delete(want, end.QueryID)
+			respond(end.QueryID, `["late"]`)
+			plugin.send(wire.PluginResponse{Type: wire.MsgLiveUpdate, QueryID: end.QueryID, Data: json.RawMessage(`["late push"]`)})
+		}
+		if _, err := actionGate.WriteString("finished\n"); err != nil {
+			t.Fatal(err)
+		}
+		for {
+			data, _ := os.ReadFile(filepath.Join(dir, reason+".done"))
+			if string(data) == "finished\n" {
+				break
+			}
+			select {
+			case <-ctx.Done():
+				t.Fatalf("native %s cancelled the select process", reason)
+			case <-time.After(time.Millisecond):
+			}
+		}
+		if err := os.Remove(filepath.Join(dir, "pid")); err != nil {
+			t.Fatal(err)
+		}
 	}
 	replacement, _ := openSession("ui")
 	status(replacement)
 	respond(detached, `["late detach reply"]`)
-	respond(closed, `["late close reply"]`)
-	respond(keep, `{"error":"offline"}`)
-	readSnapshot(unix, keep, "still live", "error")
+	plugin.send(wire.PluginResponse{Type: wire.MsgLiveUpdate, QueryID: keep, Data: json.RawMessage(`["still watching"]`)})
+	readSnapshot(unix, keep, "still live", "done")
 	store.WaitForPublications()
 	status(unix)
 	status(replacement)
 	status(observer)
+	socket.Close()
+	plugin.read(&end)
+	if end.Type != wire.MsgEnd || end.QueryID != keep || totalWatchUsage(store) != (watchUsage{}) {
+		t.Fatalf("Unix disconnect did not release its watch: %+v %+v", end, totalWatchUsage(store))
+	}
+}
+
+func totalWatchUsage(s *aggregateStore) watchUsage {
+	s.watches.mu.Lock()
+	defer s.watches.mu.Unlock()
+	return s.watches.total
 }
 
 func TestShutdownReleasesBlockedSelect(t *testing.T) {

@@ -11,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/mithrel-dots/tarragon/internal/config"
 	"github.com/mithrel-dots/tarragon/internal/db"
@@ -19,6 +20,40 @@ import (
 )
 
 var querySeq atomic.Uint64
+
+const invalidContextMessage = "context must be valid UTF-8, at most 4096 bytes, with no NUL"
+
+func validPluginContext(value string) bool {
+	return len(value) <= 4096 && utf8.ValidString(value) && !strings.ContainsRune(value, 0)
+}
+
+func validRequestContext(value string, frame []byte) bool {
+	if !validPluginContext(value) {
+		return false
+	}
+	if !strings.ContainsRune(value, utf8.RuneError) {
+		return true
+	}
+	// encoding/json silently replaces invalid bytes and unpaired surrogates.
+	// Only re-read the raw token if a replacement occurred or was supplied.
+	var field struct{ Context json.RawMessage }
+	if json.Unmarshal(frame, &field) != nil {
+		return false
+	}
+	raw := string(field.Context)
+	explicit := strings.Count(raw, "\uFFFD")
+	for {
+		_, escape, ok := strings.Cut(raw, `\`)
+		if !ok {
+			break
+		}
+		if len(escape) >= 5 && strings.EqualFold(escape[:5], "ufffd") {
+			explicit++
+		}
+		raw = escape[1:] // skip the escaped character, including a literal backslash
+	}
+	return explicit == strings.Count(value, "\uFFFD")
+}
 
 // uiClient tracks a connected UI.
 type uiClient struct {
@@ -116,6 +151,7 @@ func (r *uiRegistry) add(c *uiClient) {
 	r.mu.Unlock()
 	go func() {
 		defer r.remove(c)
+		writer := &uiFrameWriter{c.conn}
 		for {
 			select {
 			case <-c.done:
@@ -128,8 +164,7 @@ func (r *uiRegistry) add(c *uiClient) {
 					close(barrier)
 					continue
 				}
-				_ = c.conn.SetWriteDeadline(time.Now().Add(100 * time.Millisecond))
-				if err := writeUIFrame(c.conn, msg); err != nil {
+				if err := writeUIFrame(writer, msg); err != nil {
 					return
 				}
 			}
@@ -138,6 +173,17 @@ func (r *uiRegistry) add(c *uiClient) {
 }
 
 const oversizedActionMessage = "Action message exceeds the 8 MiB payload limit."
+
+type uiFrameWriter struct{ peerConn }
+
+func (w uiFrameWriter) Write(frame []byte) (int, error) {
+	// Bound socket I/O after JSON encoding, including a small replacement
+	// error frame when the original update was oversized.
+	if err := w.SetWriteDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
+		return 0, err
+	}
+	return w.peerConn.Write(frame)
+}
 
 func writeUIFrame(w io.Writer, msg any) error {
 	err := wire.WriteMsg(w, msg)
@@ -155,6 +201,12 @@ func writeUIFrame(w io.Writer, msg any) error {
 		}
 		if err := wire.WriteMsg(w, &short); !errors.Is(err, wire.ErrMessageTooLarge) {
 			return err
+		}
+		if short.Next != nil {
+			short.Next = nil
+			if err := wire.WriteMsg(w, &short); !errors.Is(err, wire.ErrMessageTooLarge) {
+				return err
+			}
 		}
 		short.RequestID = ""
 		return wire.WriteMsg(w, &short)
@@ -224,14 +276,18 @@ func handleUIClient(ctx context.Context, conn peerConn, mgr *plugins.Manager, re
 		}
 
 		switch parsed.Type {
+		case wire.MsgEnd:
+			store.endQuery(uid, parsed.QueryID)
+			_ = client.send(&wire.AckMessage{Type: "ok", QueryID: parsed.QueryID})
+			continue
 		case "detach":
 			store.removeByOwner(uid)
 			_ = client.send(map[string]any{"type": "ok"})
 			continue
 		case "select":
-			a := ui.acceptSelect(session, client, parsed)
+			a := ui.acceptSelect(session, client, parsed, scanner.Bytes())
 			if a != nil {
-				if frecencyDB != nil && a.producer != "" && a.resultID != "" {
+				if frecencyDB != nil && !a.noFrecency && a.producer != "" && a.resultID != "" {
 					history.Add(1)
 					go func() {
 						defer history.Done()
@@ -267,27 +323,41 @@ func handleUIClient(ctx context.Context, conn peerConn, mgr *plugins.Manager, re
 			continue
 		}
 
-		input := parsed.Text
-		if input == "" {
+		if parsed.Context != "" && parsed.Plugin == "" {
+			_ = client.send(map[string]string{"type": "error", "error": "context requires an explicit plugin"})
 			continue
 		}
+		if !validRequestContext(parsed.Context, scanner.Bytes()) {
+			_ = client.send(map[string]string{"type": "error", "error": invalidContextMessage})
+			continue
+		}
+		if parsed.Text == "" && parsed.Plugin == "" {
+			continue
+		}
+		targetName, targetText := parsed.Plugin, parsed.Text
+		targeted := targetName != ""
+		if !targeted {
+			mgr.RLock()
+			if name, text, ok := resolvePrefixTarget(parsed.Text, mgr); ok {
+				targetName, targetText, targeted = name, text, true
+			} else {
+				targeted = mgr.HasRoutingPrefix(parsed.Text)
+			}
+			mgr.RUnlock()
+		}
 		qid := fmt.Sprintf("q-%d-%d", time.Now().UnixNano(), querySeq.Add(1))
-		store.startQuery(ctx, qid, client.clientID, input, uid, parsed.QueryStream)
+		rejection := store.startUIQuery(ctx, qid, client.clientID, uid, parsed, targetName)
 		if err := client.send(&wire.AckMessage{Type: "ack", QueryID: qid}); err != nil {
 			return
 		}
-
-		mgr.RLock()
-		targetName, targetText, hasTarget := resolvePrefixTarget(input, mgr)
-		if !hasTarget {
-			targetText = input
+		if rejection != "" {
+			_ = client.send(watchRejectedUpdate(qid, rejection))
+			continue
 		}
-		// A query beginning with the routing symbol is an explicit routing
-		// attempt, even when its prefix is only partially typed or unknown.
-		prefixTargeted := hasTarget || mgr.HasRoutingPrefix(input)
-		mgr.RUnlock()
-
-		go dispatchQuery(ctx, targetText, qid, mgr, reqOut, pluginsReg, store, ui, prefixTargeted, targetName)
+		if parsed.Watch {
+			store.armWatch(qid, ui.publishSnapshot)
+		}
+		go dispatchQuery(ctx, targetText, qid, mgr, reqOut, pluginsReg, store, ui, targeted, targetName)
 	}
 }
 
@@ -296,7 +366,7 @@ func dispatchQuery(ctx context.Context, queryText, qid string, mgr *plugins.Mana
 	if query == nil {
 		return
 	}
-	route := &resolvedQuery{q: query, text: queryText, daemonCtx: ctx, mgr: mgr, registry: pluginsReg, requests: reqOut, store: store, ui: ui}
+	route := &resolvedQuery{q: query, text: queryText, pluginContext: query.pluginContext, daemonCtx: ctx, mgr: mgr, registry: pluginsReg, requests: reqOut, store: store, ui: ui}
 	producers := make(map[string]*producerDispatch)
 	var targets []string
 	mgr.RLock()
@@ -308,6 +378,10 @@ func dispatchQuery(ctx context.Context, queryText, qid string, mgr *plugins.Mana
 		targets = append(targets, name)
 	}
 	mgr.RUnlock()
+	if targetName != "" && len(targets) == 0 {
+		store.submitError(qid, targetName, 0, "plugin is unknown or disabled", ui.publishSnapshot)
+		return
+	}
 	query.mu.Lock()
 	query.producers = producers
 	query.mu.Unlock()
@@ -358,9 +432,10 @@ func (d *producerDispatch) run(reason dispatchReason) {
 		// A lifecycle change can leave the old persistent connection registered.
 		d.q.mu.Lock()
 		d.updatesFrom = nil
+		d.live = false
 		d.q.mu.Unlock()
 		ctx, cancel := context.WithTimeout(d.q.ctx, 3*time.Second)
-		data, err := d.registry.bus.callPlugin(ctx, onCall, wire.UIRequest{Type: "query", QueryID: d.q.QueryID, Text: d.text})
+		data, err := d.registry.bus.callPlugin(ctx, onCall, wire.UIRequest{Type: "query", QueryID: d.q.QueryID, Text: d.text, Context: d.pluginContext})
 		cancel()
 		if err == nil && !json.Valid(data) {
 			d.fail(start, "invalid on-call query response JSON")
@@ -398,7 +473,7 @@ func (d *producerDispatch) run(reason dispatchReason) {
 		return
 	}
 	select {
-	case d.requests <- pluginRequest{name: d.name, queryID: d.q.QueryID, text: d.text, conn: conn}:
+	case d.requests <- pluginRequest{name: d.name, queryID: d.q.QueryID, text: d.text, pluginContext: d.pluginContext, conn: conn}:
 	case <-d.q.ctx.Done():
 	}
 }

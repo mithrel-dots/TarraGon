@@ -177,19 +177,60 @@ func TestPluginOverviewOverUIConnection(t *testing.T) {
 }
 
 func TestOverviewActionsRespectRoutingAndLifecycle(t *testing.T) {
-	rows := overviewItems([]wire.PluginInfo{
-		{ID: "a", Enabled: true, Prefix: "@x", Lifecycle: "on_call"},
-		{ID: "b", Enabled: true, Prefix: "@x", Lifecycle: "daemon", Connected: true},
-		{ID: "c", Enabled: false, Lifecycle: "daemon"},
-	}, "")
-	want := [][]string{{"open", "details", "disable"}, {"details", "restart", "disable"}, {"details", "enable"}}
-	for i, row := range rows {
-		var actions []string
-		for _, action := range row.Actions {
-			actions = append(actions, action.Name)
+	f := newAdmissionFixture(t, time.Second)
+	entry := writeScript(t, t.TempDir(), "probe", "#!/bin/sh\nprintf '[\"%s\"]' \"$TARRAGON_PLUGIN_ID\"\n")
+	f.configure("a", plugins.LifecycleDaemon, true, "")
+	f.configure("b", plugins.LifecycleOnCall, true, entry)
+	f.configure("c", plugins.LifecycleDaemon, false, "")
+	f.configure("d", plugins.LifecycleOnCall, true, entry)
+	f.configure(plugins.OverviewID, plugins.LifecycleOnCall, true, "")
+	f.mgr.Plugins["a"].Config.ResolvedPrefix = "@x"
+	f.mgr.Plugins["b"].Config.ResolvedPrefix = "@x"
+	f.mgr.Plugins[plugins.OverviewID].Config.ResolvedPrefix = "@plugins"
+	f.registry.bus = testBus(t, t.Context())
+	for _, features := range [][]string{nil, {navigationFeature}} {
+		peer := f.connectUI(t, f.requests)
+		u := navigationUI{views: []navigationView{{destination: wire.Destination{Text: "@plugins"}}}, features: features}
+		overview := navigationSnapshot(t, peer, u.query(), plugins.OverviewID)
+		if len(overview.List) != 5 {
+			t.Fatalf("expected five overview rows, got %+v", overview.List)
 		}
-		if !row.Actions[0].Default || !slices.Equal(actions, want[i]) {
-			t.Fatalf("%s: unexpected actions %+v", row.ID, row.Actions)
+		for _, row := range overview.List {
+			if row.ID == plugins.OverviewID {
+				continue
+			}
+			want := []string{"details", "disable"}
+			switch row.ID {
+			case "a":
+				want = []string{"details", "restart", "disable"}
+			case "c":
+				want = []string{"details", "enable"}
+			}
+			if row.ID == "a" || len(features) > 0 && row.ID != "c" {
+				want = append([]string{"open"}, want...)
+				open := row.Actions[0]
+				if len(features) > 0 {
+					if open.Type != "open" || open.Destination == nil || open.Destination.Plugin != row.ID {
+						t.Fatalf("expected scoped Open for %s: %+v", row.ID, open)
+					}
+					if row.ID == "b" || row.ID == "d" {
+						snap := navigationSnapshot(t, peer, u.activate(row, open), row.ID)
+						if len(snap.Plugins) != 1 || len(snap.List) != 1 || snap.List[0].ID != row.ID {
+							t.Fatalf("Open failed to reach %s: %+v", row.ID, snap.List)
+						}
+						u.back()
+					}
+				} else if open.Type != "query_replace" || open.Query != "@x " {
+					t.Fatalf("bad legacy replacement: %+v", open)
+				}
+			}
+			var names []string
+			for _, action := range row.Actions {
+				names = append(names, action.Name)
+			}
+			if !row.Actions[0].Default || !slices.Equal(names, want) {
+				t.Fatalf("%s, features %v: unexpected actions %+v", row.ID, features, row.Actions)
+			}
 		}
 	}
 }

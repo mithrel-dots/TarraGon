@@ -56,6 +56,40 @@ that stream on the same connection. Ignore already queued updates for old query
 IDs; superseded queries may never receive a final snapshot. Omit `query_stream`
 for searches that must all complete, or use distinct streams for distinct inputs.
 
+### Scoped queries
+
+`{"type":"query","plugin":"catalog","context":"show:42","text":""}` addresses
+one enabled plugin by ID, even if it has no prefix. Text is literal: empty
+strings, surrounding spaces, and another plugin's prefix are passed through.
+An unknown or disabled target still gets an `ack` and a snapshot with that
+plugin in `error`; the daemon doesn't search other plugins.
+
+`context` is optional, non-secret UTF-8 (at most 4096 bytes, no NUL). A query
+with invalid context or context without a target gets `error` before dispatch.
+A select on an owned source query uses its recorded context for that producer.
+For a direct select without that source, supply the plugin's context explicitly.
+
+### Ending one query
+
+When a view closes, release its query on the session that created it:
+
+```text
+UI → daemon  {"type":"end","query_id":"q2"}
+daemon → UI  {"type":"ok","query_id":"q2"}
+```
+
+The session and its other queries stay open. Repeating `end`, or naming an unknown or foreign ID, gets the same `ok`. Discard already queued updates for a closed view. Ending a query cancels its pending queries and refreshes; accepted selects still run and can return their usual outcomes.
+
+Stream supersession and history eviction also end a query. `detach`, Unix disconnect, native `close`, or native idle expiry releases **all** queries on that peer. The 90-second native timeout measures time without session input; it is not a deadline for a query or select.
+
+### Watching a live view
+
+Send `{"type":"query","plugin":"logs","text":"","watch":true}` to reserve a view. The daemon sends the usual `ack` and full `update` snapshots. Continue reading after all plugins have answered: a live producer can replace its rows on the same `query_id`. An older UI that omits `watch` can still receive these snapshots until ordinary history evicts its query.
+
+A reserved view survives other clients' searches, including while the first replies are pending. The limits are **4 watches and 4 MiB per owner**, **32 watches and 32 MiB daemon-wide**, separate from ordinary history. The byte charge includes retained query strings and features, raw producer data, and normalized rows and actions. Completing the initial round with no live producers returns the query to ordinary history. Leaving a view should send `{"type":"end","query_id":"q3"}`. Supersession, detach, and session loss also release reservations.
+
+Check `watch_error` in the **decoded snapshot**. If capacity is unavailable, the daemon acknowledges the query, then sends an empty snapshot explaining the refusal; no plugin is invoked. If a replacement would exceed the byte budget, the final snapshot keeps the previous valid rows and explains the limit. A watch still waiting for initial replies ends after five seconds unless a producer has confirmed a live feed. After that deadline, silent producers cannot keep the reservation when the last live feed stops. Other watches are unaffected. The separate 8 MiB **encoded envelope** limit still yields a query-scoped `error` instead of the oversized update; it does not disconnect the session.
+
 ## Reading snapshots and control replies
 
 Multiple queries can run concurrently on one session. Read continuously and dispatch messages by `type`. A snapshot is the whole list so far. The aggregate publisher can combine multiple plugin responses, and the UI writer can replace a queued snapshot with a newer one for the same `query_id`. Replacement only happens between control messages or flush barriers: a terminal reply is never coalesced, and a later snapshot cannot overtake it. Use the `plugins` map to detect pending/empty/error states instead of counting updates; `started_at_unix_ms` gives the query's start time.
@@ -87,13 +121,37 @@ daemon → UI  {"type":"select_response","request_id":"r7","action_id":"a7","suc
 
 Superseding a query or closing its view doesn't cancel an accepted action. Disconnecting loses the reply; a new connection with the same `client_id` cannot collect it.
 
-Keep `request_id` short. If adding correlation fields would push a reply over the 8 MiB envelope limit, the daemon keeps the terminal outcome and `action_id`, replaces the oversized message, and omits `request_id` only if it still cannot fit.
+For a non-secret prompt, submit edits as scoped queries and send a select only
+on explicit confirmation. Back leaves the view without committing. Echo
+`no_frecency:true` on the select when the offered action requested it: this
+suppresses daemon selection history even if the source query has been evicted.
+The UI manages its own input history separately.
+
+Keep `request_id` short. If a reply exceeds the 8 MiB envelope limit, the daemon keeps the terminal outcome and `action_id`, shortens the message, and drops the navigation continuation and then `request_id` only if it still cannot fit.
 
 ### Refresh after a select
 
 A plugin can ask the daemon to refresh the selected row's **producer**. The daemon queues the terminal answer first, then, if eligible, reissues only the original producer's query with the same resolved text and `query_id`. The UI needn't send another query or interpret a `next` field. Render the ordinary full `update` for the original list. Other producers' rows remain; the refreshed rows stay visible until replaced. An empty result clears that producer's rows, while a transport error can leave its last rows visible with state `error`.
 
 No refresh is run for a missing, superseded, foreign or otherwise unavailable source, a disabled producer, or a replay without the producer's consent. A handler requesting its own results consents for that refresh; a producer can also declare `replay` in its manifest. Skipping refresh does not change the action outcome, and even a failed action can request a refresh to show partial changes. For example, `@plugins` keeps its filter when **enable**, **disable** or **restart** refreshes the overview.
+
+### Secondary actions from other plugins
+
+Include `ui_features:["action_offers"]` on the **query** if your UI can render secondary choices. Read actions from the normalized `list`. For example:
+
+```json
+{"id":"f17","label":"Sky","plugin":"file_finder","ref":{"type":"file","value":"/pictures/sky.png","mime":"image/png"},"actions":[{"name":"open","default":true},{"name":"Set as wallpaper","secondary":true,"offer_id":"P0v3u5Id"}]}
+```
+
+Keep the producer's default. A secondary choice can be the only visible action: expose it explicitly, never as the default. On selection, echo the `offer_id`, name, displayed `query_id`, producer and original row ID:
+
+```json
+{"type":"select","query_id":"q4","plugin":"file_finder","result_id":"f17","action":"Set as wallpaper","offer_id":"P0v3u5Id"}
+```
+
+`offer_id` identifies a choice; the `ok` receipt still assigns a new `action_id` per invocation. Never substitute `ref.value` or send a select directly to the handler. Offers apply only to the owner and row that received them. A changed reference, disabled handler, ended query or unknown token can yield `not_run`.
+
+A baseline query instead receives an appended name such as `Set as wallpaper [via wallpaper/set #<token>]`; echo the entire name unchanged, including its opaque suffix. The daemon offers these only after an existing native choice. Duplicate row IDs and colliding action names cannot authorize an injected action. Stale aliases never fall back to a producer select.
 
 ### Query Replacement Actions
 
@@ -110,8 +168,7 @@ An action may use `type: "query_replace"` and provide a `query`:
 When the user invokes this action, replace the input text with `query` and
 send it as a normal query request. Keep the socket and UI open; process the
 acknowledgement and updates exactly as for any other query. Do not send a
-select request for this action. Actions without this type retain the existing
-select behavior.
+select request for this action.
 
 An action with `type: "keep_open"` is a normal select action that should not
 dismiss the UI after successful execution:
@@ -125,8 +182,31 @@ dismiss the UI after successful execution:
 
 Actions without a type retain the default behavior of dismissing the UI after
 successful selection. Keep the launcher open on failure to show the outcome.
-`query_replace` always keeps the UI open and takes
-precedence over any other action behavior.
+`query_replace` always keeps the UI open.
+
+### Open and Back
+
+Send `ui_features:["navigation"]` on each query whose view supports Open and Back. Render the actions in the snapshot's **`list`**; `results[plugin].data` is the producer's original payload, including choices that might be unavailable to this UI.
+
+For a row action with `type:"open"`, save the current view on a local stack, show the opener's optional `title` and `placeholder`, then submit the destination as a **new** scoped query. No select is involved:
+
+```text
+row action   {"name":"Episodes","type":"open","destination":{"plugin":"catalog","context":"show:42","text":""},"title":"Episodes","placeholder":"Filter episodes"}
+UI → daemon  {"type":"query","plugin":"catalog","context":"show:42","text":"","ui_features":["navigation"]}
+```
+
+A normal select can also return a destination chosen by the handler, or ask to go Back:
+
+```jsonl
+{"type":"select_response","action_id":"a7","success":true,"next":{"type":"open","issuer":"catalog","destination":{"plugin":"catalog","context":"episode:7","text":""},"title":"Episode 7"}}
+{"type":"select_response","action_id":"a8","success":true,"next":{"type":"back"}}
+```
+
+Associate each select's `action_id` with the view that invoked it. On success, apply its Open/Back **before** any normal dismiss-on-success behavior and only while that invoking view is still current. A late outcome remains the outcome of the original action, even if the user has moved on. Navigation support is remembered from the owned query. A capable UI can also send `ui_features:["navigation"]` on a direct select or when selecting a cached row whose query may have been evicted.
+
+Save the destination, issuer, current input, selected `(plugin, result_id)`, scroll position and cached rows. For a row Open the issuer is `row.plugin`; for a select's Open use `next.issuer`, which the daemon sets to the actual handler. Back at the root does nothing. Otherwise restore the previous view from cache, including its selection and scroll. If a new query is needed, only automatically submit a **scoped** destination whose target issued it or whose enabled target declares `replay`. A plugin that opens another plugin (including Open in `@plugins`) does not grant that target's consent. With no cache or replay promise, restore the input and wait for user input; never automatically reissue an arbitrary user-typed legacy query. A replay gets a **new** `query_id`; [producer refresh](#refresh-after-a-select) keeps the original ID.
+
+Without `navigation`, the daemon offers `query_replace` for a known Open only when the target's effective prefix routes to that same enabled plugin and forwards exactly the destination text, with no context to lose. For example, `@plugins` can offer `query:"@wp "` to a baseline client, but a prefixless plugin or the loser of a prefix collision has **details** instead. A navigation-capable client can open either directly by ID. A select marked `requires:["navigation"]` is hidden from a baseline client; an ordinary select still receives its normal outcome even when the handler recommends navigation. Do not send a substitute select for a hidden action or for Open.
 
 ### Lifecycle-aware availability
 
@@ -158,16 +238,17 @@ For a select, an enabled `on_demand_persistent` plugin can be started and awaite
 
 `results[plugin].data` contains the raw plugin payload. Render `list` for the merged, ranked rows. In `global` mode, sort order is descending blended score, then ascending plugin ID, with producer order retained for ties within a plugin. In `grouped` mode, groups rank by their best blended score and then plugin ID; each group's rows keep producer order regardless of score.
 
+For an explicitly addressed plugin or resolved prefix, a producer can return
+`ordered:true` alongside its results. Render the resulting `list` in sequence;
+its scores come directly from the plugin.
+
 Plugin state meanings:
 - `pending`: the plugin was selected for this query and has not responded yet.
 - `done`: the plugin responded with one or more normalized result entries.
 - `empty`: the plugin responded successfully but produced no normalized result entries.
 - `error`: the plugin failed, timed out, or returned an error payload.
 
-Result actions may also include `type` and `query`. The `query_replace` type
-uses `query` as the replacement input and starts a normal query. The
-`keep_open` type performs a normal selection without dismissing the UI after
-success.
+See [Query Replacement Actions](#query-replacement-actions) and [Open and Back](#open-and-back) for action fields and UI behavior.
 
 ## Example: Python
 

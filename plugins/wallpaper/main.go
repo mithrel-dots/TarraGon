@@ -543,7 +543,9 @@ func runCLIContract(args []string) int {
 		if len(args) > 2 {
 			action = args[2]
 		}
-		_ = p.lib.Scan(ctx, p.cfg)
+		if args[1] == randomID {
+			_ = p.lib.Scan(ctx, p.cfg)
+		}
 		resp := p.handleSelect(ctx, args[1], action)
 		_ = json.NewEncoder(os.Stdout).Encode(resp)
 		if !resp.Success {

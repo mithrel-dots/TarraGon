@@ -1,0 +1,16 @@
+{
+  "results": [
+    {
+      "id": "show",
+      "actions": [
+        {"name":"Episodes","type":"open","destination":{"plugin":"catalog","context":"show:42","text":""},"title":"Episodes","placeholder":"Filter episodes","default":true},
+        {"name":"Search","type":"open","destination":{"plugin":"catalog","text":"summary"}},
+        {"name":"Literal","type":"open","destination":{"plugin":"catalog","text":" summary "}},
+        {"name":"Continue","requires":["navigation"]},
+        {"name":"Mark","type":"keep_open"},
+        {"name":"Done","requires":["navigation"]}
+      ]
+    },
+    {"id":"private-view","ref":{"type":"text","value":"candidate"},"actions":[{"name":"Open","type":"open","destination":{"plugin":"catalog","context":"private","text":""}}]}
+  ]
+}

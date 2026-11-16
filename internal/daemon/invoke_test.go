@@ -30,7 +30,7 @@ func TestInvokeOnCallQuery_Success(t *testing.T) {
 if [[ "$1" == "tarragon" && "$2" == "query" ]]; then echo "{\"ok\":true,\"echo\":\"$3\"}"; exit 0; fi
 `)
 	p := &plugins.Plugin{Dir: d, Config: plugins.PluginConfig{Name: "t", Entrypoint: "plug.sh", Enabled: true}}
-	out, err := invokeOnCallQuery(context.Background(), p, "abc")
+	out, err := invokeOnCallQuery(context.Background(), p, "abc", "")
 	if err != nil {
 		t.Fatalf("invoke error: %v", err)
 	}
@@ -99,7 +99,7 @@ func TestInvokeOnCallQuery_Timeout(t *testing.T) {
 	p := &plugins.Plugin{Dir: d, Config: plugins.PluginConfig{Name: "t", Entrypoint: "slow.sh", Enabled: true}}
 	ctx, cancel := context.WithTimeout(context.Background(), 10_000_000) // 10ms
 	defer cancel()
-	if _, err := invokeOnCallQuery(ctx, p, "x"); err == nil {
+	if _, err := invokeOnCallQuery(ctx, p, "x", ""); err == nil {
 		t.Fatalf("expected timeout error")
 	}
 }
@@ -108,7 +108,7 @@ func TestInvokeOnCallQuery_AbsoluteEntrypoint(t *testing.T) {
 	d := t.TempDir()
 	entry := writeScript(t, d, "plug-abs.sh", "#!/usr/bin/env bash\nif [[ \"$1\" == \"tarragon\" && \"$2\" == \"query\" ]]; then echo '{\"ok\":true,\"data\":\"abs\"}'; fi\n")
 	p := &plugins.Plugin{Dir: d, Config: plugins.PluginConfig{Name: "t", Entrypoint: entry, Enabled: true}}
-	out, err := invokeOnCallQuery(context.Background(), p, "ignored")
+	out, err := invokeOnCallQuery(context.Background(), p, "ignored", "")
 	if err != nil {
 		t.Fatalf("invoke error: %v", err)
 	}
@@ -130,7 +130,7 @@ func TestInvokeOnCallQuery_SystemEntrypointMoved(t *testing.T) {
 			Enabled:    true,
 		},
 	}
-	out, err := invokeOnCallQuery(context.Background(), p, "ignored")
+	out, err := invokeOnCallQuery(context.Background(), p, "ignored", "")
 	if err != nil {
 		t.Fatalf("invoke error: %v", err)
 	}

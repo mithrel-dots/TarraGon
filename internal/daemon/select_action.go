@@ -17,22 +17,27 @@ import (
 // selectAction lives independently of the query that offered the row. Its
 // owner is the original peer, even if a new peer registers the same label.
 type selectAction struct {
-	id        string
-	requestID string
-	owner     string
-	queryID   string
-	producer  string
-	resultID  string
-	handler   string
-	action    string
-	offered   bool // an owned source row existed when this select was received
+	id            string
+	requestID     string
+	owner         string
+	queryID       string
+	producer      string
+	resultID      string
+	handler       string
+	pluginContext string
+	handlerRule   *plugins.Handler // nil for a producer's native action
+	handlerValue  string
+	action        string
+	offered       bool // an owned source row existed when this select was received
+	noFrecency    bool
 
-	client        *uiClient
-	store         *aggregateStore
-	wantsProgress bool
-	received      time.Time
-	timeout       time.Duration
-	done          chan struct{}
+	client          *uiClient
+	store           *aggregateStore
+	wantsProgress   bool
+	wantsNavigation bool
+	received        time.Time
+	timeout         time.Duration
+	done            chan struct{}
 
 	mu         sync.Mutex
 	deadline   time.Time
@@ -42,7 +47,7 @@ type selectAction struct {
 	cleanup    []func()
 }
 
-func (ui *uiRegistry) acceptSelect(session context.Context, client *uiClient, req wire.UIRequest) *selectAction {
+func (ui *uiRegistry) acceptSelect(session context.Context, client *uiClient, req wire.UIRequest, frame []byte) *selectAction {
 	row := req.ID
 	if row == "" {
 		row = req.ResultID
@@ -51,23 +56,58 @@ func (ui *uiRegistry) acceptSelect(session context.Context, client *uiClient, re
 		row = req.Text
 	}
 	a := &selectAction{
-		id:            "a-" + rand.Text(),
-		requestID:     req.RequestID,
-		owner:         client.uid,
-		queryID:       req.QueryID,
-		producer:      req.Plugin,
-		handler:       req.Plugin,
-		resultID:      row,
-		action:        req.Action,
-		wantsProgress: slices.Contains(req.UIFeatures, wire.MsgActionProgress),
-		client:        client,
-		store:         ui.store,
-		received:      time.Now(),
-		timeout:       ui.actionTimeout,
-		done:          make(chan struct{}),
+		id:              "a-" + rand.Text(),
+		requestID:       req.RequestID,
+		owner:           client.uid,
+		queryID:         req.QueryID,
+		producer:        req.Plugin,
+		handler:         req.Plugin,
+		pluginContext:   req.Context,
+		resultID:        row,
+		action:          req.Action,
+		noFrecency:      req.NoFrecency,
+		wantsProgress:   slices.Contains(req.UIFeatures, wire.MsgActionProgress),
+		wantsNavigation: slices.Contains(req.UIFeatures, navigationFeature),
+		client:          client,
+		store:           ui.store,
+		received:        time.Now(),
+		timeout:         ui.actionTimeout,
+		done:            make(chan struct{}),
 	}
 	a.deadline = a.received.Add(a.timeout)
 	if err := client.send(&wire.SelectAck{Type: "ok", ActionID: a.id, RequestID: a.requestID}); err != nil {
+		return nil
+	}
+	if !validRequestContext(req.Context, frame) {
+		a.notRun(invalidContextMessage)
+		return nil
+	}
+	invalidOffer := req.OfferID != "" || legacyOfferName(req.Action)
+	if q := ui.store.query(a.queryID); q != nil && q.session == a.owner {
+		a.wantsNavigation = slices.Contains(q.uiFeatures, navigationFeature)
+		q.mu.Lock()
+		if q.ctx.Err() == nil && (q.target == a.handler || q.producers[a.handler] != nil) {
+			a.pluginContext = q.pluginContext
+		}
+		if row := q.sourceRowLocked(a.producer, a.resultID); row != nil && q.ctx.Err() == nil {
+			if !invalidOffer && slices.Contains(q.Results[a.producer].blockedSelects[row.ID], req.Action) {
+				q.mu.Unlock()
+				a.notRun("This choice is not a selectable plugin action for this view.")
+				return nil
+			}
+			a.offered = true
+			a.noFrecency = a.noFrecency || skipsFrecency(row.Actions, a.action)
+			for _, selected := range row.Actions {
+				if selected.Secondary && selected.Name == req.Action {
+					invalidOffer = selected.OfferID != req.OfferID || !q.bindOfferLocked(a, row, selected)
+					break
+				}
+			}
+		}
+		q.mu.Unlock()
+	}
+	if invalidOffer {
+		a.notRun("Action offer is stale or was not offered to this view.")
 		return nil
 	}
 	select {
@@ -76,7 +116,6 @@ func (ui *uiRegistry) acceptSelect(session context.Context, client *uiClient, re
 		a.notRun("Too many pending actions.")
 		return nil
 	}
-	a.offered = ui.store.offeredRow(a.owner, a.queryID, a.producer, a.resultID)
 	a.mu.Lock()
 	client.actions.Add(1)
 	stop := context.AfterFunc(session, func() { a.fail("UI session closed.") })
@@ -88,6 +127,21 @@ func (ui *uiRegistry) acceptSelect(session context.Context, client *uiClient, re
 	a.timer = time.AfterFunc(time.Until(a.deadline), a.expire)
 	a.mu.Unlock()
 	return a
+}
+
+// A UI can omit the action name when activating the row's default action.
+func skipsFrecency(actions []wire.Action, name string) bool {
+	if name != "" {
+		return slices.ContainsFunc(actions, func(action wire.Action) bool {
+			return action.Name == name && action.NoFrecency
+		})
+	}
+	for _, action := range actions {
+		if action.Default {
+			return action.NoFrecency
+		}
+	}
+	return len(actions) > 0 && actions[0].NoFrecency
 }
 
 func (a *selectAction) pending() bool {
@@ -207,6 +261,17 @@ func (a *selectAction) completeLocked(resp wire.SelectResponse, next *wire.Actio
 	a.mu.Unlock()
 
 	resp.Type, resp.ActionID, resp.RequestID = wire.MsgSelectResponse, a.id, a.requestID
+	if a.wantsNavigation && resp.Success && next != nil {
+		switch next.Type {
+		case wire.ActionTypeOpen:
+			if validDestination(next.Destination) {
+				resp.Next = &wire.ActionNext{Type: next.Type, Destination: next.Destination,
+					Title: next.Title, Placeholder: next.Placeholder, Issuer: a.handler}
+			}
+		case "back":
+			resp.Next = &wire.ActionNext{Type: "back"}
+		}
+	}
 	err := a.client.send(&resp)
 	for _, fn := range cleanup {
 		fn()
@@ -231,6 +296,10 @@ func (ui *uiRegistry) routeSelect(ctx context.Context, mgr *plugins.Manager, reg
 	mgr.RUnlock()
 	if plugin == nil {
 		a.notRun(fmt.Sprintf("Plugin %q is unknown or disabled.", a.handler))
+		return
+	}
+	if a.handlerRule != nil && !slices.Contains(plugin.Config.Handlers, *a.handlerRule) {
+		a.notRun("The handler no longer declares this action.")
 		return
 	}
 	if a.handler == plugins.OverviewID {

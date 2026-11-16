@@ -224,9 +224,10 @@ func (s *pluginSession) writeReady() error {
 		if err := s.conn.SetWriteDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
 			return err
 		}
+		qid, row := a.handlerRow()
 		err := wire.WriteMsg(selectFrameWriter{s, a}, wire.SelectRequest{
-			Type: wire.MsgSelect, ActionID: s.actionID(a), QueryID: a.queryID,
-			ResultID: a.resultID, Action: a.action,
+			Type: wire.MsgSelect, ActionID: s.actionID(a), QueryID: qid,
+			ResultID: row, Action: a.action, Context: a.pluginContext,
 		})
 		_ = s.conn.SetWriteDeadline(time.Time{})
 		switch {

@@ -37,8 +37,9 @@ func (b *daemonBus) callPluginAction(ctx context.Context, plugin *plugins.Plugin
 		return
 	}
 
+	_, row := a.handlerRow()
 	data, err := b.requestPlugin(ctx, pluginCall{plugin: plugin, action: a}, wire.UIRequest{
-		Type: wire.MsgSelect, ResultID: a.resultID, Action: a.action,
+		Type: wire.MsgSelect, ResultID: row, Action: a.action, Context: a.pluginContext,
 	})
 	var response wire.SelectResponse
 	if err == nil {
@@ -129,7 +130,7 @@ func (b *daemonBus) runPluginCall(c pluginCall, data []byte) (json.RawMessage, e
 	}
 	switch req.Type {
 	case "query":
-		return invokeOnCallQuery(c.ctx, c.plugin, req.Text)
+		return invokeOnCallQuery(c.ctx, c.plugin, req.Text, req.Context)
 	case wire.MsgSelect:
 		ctx := c.ctx
 		if c.action != nil {
@@ -143,7 +144,7 @@ func (b *daemonBus) runPluginCall(c pluginCall, data []byte) (json.RawMessage, e
 			ctx, cancel = context.WithTimeout(b.ctx, b.actionSafetyLimit)
 			defer cancel()
 		}
-		response, err := runOnCallSelect(ctx, c.plugin, req.ResultID, req.Action, c.action)
+		response, err := runOnCallSelect(ctx, c.plugin, req.ResultID, req.Action, req.Context, c.action)
 		if err != nil {
 			// A normal nonzero exit is a definitive plugin-reported failure.
 			// A killed process or unreadable reply has no definitive outcome.
@@ -156,10 +157,15 @@ func (b *daemonBus) runPluginCall(c pluginCall, data []byte) (json.RawMessage, e
 		data, err := json.Marshal(response)
 		if len(data) > wire.MaxMessageSize {
 			response.Message = oversizedActionMessage
-			if response.Next != nil && response.Next.Type != "refresh" {
-				response.Next = nil
+			data, err = json.Marshal(response)
+			if len(data) > wire.MaxMessageSize {
+				if response.Next != nil && response.Next.Type == "refresh" {
+					response.Next = &wire.ActionNext{Type: "refresh"}
+				} else {
+					response.Next = nil
+				}
+				return json.Marshal(response)
 			}
-			return json.Marshal(response)
 		}
 		return data, err
 	default:

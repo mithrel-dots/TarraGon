@@ -7,11 +7,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 
 	"github.com/mithrel-dots/tarragon/internal/plugins"
 	"github.com/pelletier/go-toml/v2"
+	"github.com/pelletier/go-toml/v2/unstable"
 	"github.com/spf13/cobra"
 )
 
@@ -119,59 +121,29 @@ func rewriteManifestForSystem(manifest []byte, binaryPath string, fallbackName s
 
 	rewritten := manifest
 	if !filepath.IsAbs(cfg.Entrypoint) {
-		var found bool
-		rewritten, found = setSimpleTOMLStringKey(rewritten, "entrypoint", binaryPath)
-		if !found {
-			rewritten = appendWithNewline(rewritten, "entrypoint = "+strconv.Quote(binaryPath))
-		}
+		rewritten = setRootManifestString(rewritten, "entrypoint", binaryPath)
 	}
-
-	var sourceFound bool
-	rewritten, sourceFound = setSimpleTOMLStringKey(rewritten, "source", "system")
-	if !sourceFound {
-		rewritten = appendWithNewline(rewritten, "source = \"system\"")
-	}
+	rewritten = setRootManifestString(rewritten, "source", "system")
 
 	return rewritten, pluginName, nil
 }
 
-func setSimpleTOMLStringKey(content []byte, key string, value string) ([]byte, bool) {
-	lines := strings.Split(string(content), "\n")
+// The manifest was validated above. Edit only root values, preserving comments
+// and nested plugin-owned tables (including [[handlers]]).
+func setRootManifestString(content []byte, key, value string) []byte {
 	replacement := strconv.Quote(value)
-
-	for i, line := range lines {
-		idx := strings.Index(line, "=")
-		if idx < 0 {
-			continue
+	var parser unstable.Parser
+	parser.Reset(content)
+	for parser.NextExpression() {
+		node := parser.Expression()
+		if node.Kind != unstable.KeyValue {
+			break
 		}
-
-		if strings.TrimSpace(line[:idx]) != key {
-			continue
+		keys := node.Key()
+		if keys.Next() && keys.IsLast() && strings.EqualFold(string(keys.Node().Data), key) {
+			raw := node.Value().Raw
+			return slices.Replace(bytes.Clone(content), int(raw.Offset), int(raw.Offset+raw.Length), []byte(replacement)...)
 		}
-
-		comment := ""
-		rhs := line[idx+1:]
-		if commentIdx := strings.Index(rhs, "#"); commentIdx >= 0 {
-			comment = strings.TrimSpace(rhs[commentIdx:])
-		}
-
-		newLine := line[:idx+1] + " " + replacement
-		if comment != "" {
-			newLine += " " + comment
-		}
-
-		lines[i] = newLine
-		return []byte(strings.Join(lines, "\n")), true
 	}
-
-	return content, false
-}
-
-func appendWithNewline(content []byte, line string) []byte {
-	if len(content) > 0 && content[len(content)-1] != '\n' {
-		content = append(content, '\n')
-	}
-	content = append(content, []byte(line)...)
-	content = append(content, '\n')
-	return content
+	return append([]byte(key+" = "+replacement+"\n"), content...)
 }

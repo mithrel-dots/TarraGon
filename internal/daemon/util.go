@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -55,8 +56,14 @@ func captureOnCallOutput(cmd *exec.Cmd) (stdout, stderr *limitedOutput) {
 
 // onCallEnv gives ephemeral plugins the same identity and prefix context that
 // persistent plugins receive when the daemon starts them.
-func onCallEnv(p *plugins.Plugin) []string {
-	return append(os.Environ(),
+func onCallEnv(p *plugins.Plugin, pluginContext string) []string {
+	env := slices.DeleteFunc(os.Environ(), func(entry string) bool {
+		return strings.HasPrefix(entry, "TARRAGON_CONTEXT=")
+	})
+	if pluginContext != "" {
+		env = append(env, "TARRAGON_CONTEXT="+pluginContext)
+	}
+	return append(env,
 		fmt.Sprintf("TARRAGON_PLUGIN_NAME=%s", p.Config.ID),
 		fmt.Sprintf("TARRAGON_PLUGIN_ID=%s", p.Config.ID),
 		fmt.Sprintf("TARRAGON_PLUGIN_DISPLAY_NAME=%s", p.Config.Name),
@@ -66,14 +73,14 @@ func onCallEnv(p *plugins.Plugin) []string {
 }
 
 // invokeOnCallQuery runs an on-call plugin query command and returns its JSON output.
-func invokeOnCallQuery(ctx context.Context, p *plugins.Plugin, query string) (json.RawMessage, error) {
+func invokeOnCallQuery(ctx context.Context, p *plugins.Plugin, query, pluginContext string) (json.RawMessage, error) {
 	entry, err := resolveOnCallEntrypoint(p)
 	if err != nil {
 		return nil, err
 	}
 	cmd := exec.CommandContext(ctx, entry, "tarragon", "query", query)
 	cmd.WaitDelay = time.Second // Descendants may keep stdout/stderr open after cancellation.
-	cmd.Env = onCallEnv(p)
+	cmd.Env = onCallEnv(p, pluginContext)
 	stdout, stderr := captureOnCallOutput(cmd)
 	if err := cmd.Run(); err != nil {
 		return nil, fmt.Errorf("%s: %w; stderr=%s", p.Config.ID, err, stderr.diagnostic())
@@ -97,10 +104,10 @@ func invokeOnCallQuery(ctx context.Context, p *plugins.Plugin, query string) (js
 // If stdout is empty and exit status is zero, the action is treated as success.
 // JSON stdout can override success, supply a message, or request a continuation.
 func invokeOnCallSelect(ctx context.Context, p *plugins.Plugin, resultID, action string) (wire.SelectResponse, error) {
-	return runOnCallSelect(ctx, p, resultID, action, nil)
+	return runOnCallSelect(ctx, p, resultID, action, "", nil)
 }
 
-func runOnCallSelect(ctx context.Context, p *plugins.Plugin, resultID, action string, a *selectAction) (wire.SelectResponse, error) {
+func runOnCallSelect(ctx context.Context, p *plugins.Plugin, resultID, action, pluginContext string, a *selectAction) (wire.SelectResponse, error) {
 	entry, err := resolveOnCallEntrypoint(p)
 	if err != nil {
 		return wire.SelectResponse{}, err
@@ -112,7 +119,7 @@ func runOnCallSelect(ctx context.Context, p *plugins.Plugin, resultID, action st
 
 	cmd := exec.CommandContext(ctx, entry, args...)
 	cmd.WaitDelay = time.Second
-	cmd.Env = onCallEnv(p)
+	cmd.Env = onCallEnv(p, pluginContext)
 	stdout, stderr := captureOnCallOutput(cmd)
 	if a == nil {
 		err = cmd.Start()

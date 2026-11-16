@@ -314,6 +314,21 @@ func TestSelectionResolution(t *testing.T) {
 	}
 }
 
+func TestSetFileWithoutLibraryQuery(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "outside library.png")
+	mustWrite(t, path)
+	cfg := defaultConfig()
+	// A test backend checks the literal argv instead of changing the desktop.
+	cfg.Backend = "custom"
+	cfg.CustomCommand = []string{"test", "{path}", "=", path}
+	state := &State{path: filepath.Join(root, "state.json")}
+	p := &plugin{state: state, applier: NewApplier(cfg, state, &Logger{name: "test"})}
+	if resp := p.handleSelect(t.Context(), path, "set"); !resp.Success || state.Current() != path {
+		t.Fatalf("independent set: %+v, state %q", resp, state.Current())
+	}
+}
+
 func TestBuildResultsShape(t *testing.T) {
 	root := t.TempDir()
 	mustWrite(t, filepath.Join(root, "scenery", "forest_dawn.png"))

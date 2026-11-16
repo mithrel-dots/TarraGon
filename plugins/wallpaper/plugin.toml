@@ -11,3 +11,9 @@ require_prefix = true
 build_dependencies = ["go"]
 capabilities = ["suggest", "preview"]
 icon = "preferences-desktop-wallpaper"
+
+[[handlers]]
+action = "set"
+label = "Set as wallpaper"
+accepts = "file"
+mime = "image/*"

@@ -57,8 +57,10 @@ func resolveSocketPath(overrideEnv, filename string) string {
 // Message type constants (for plugins)
 const (
 	MsgHello          = "hello"
+	MsgEnd            = "end"
 	MsgRequest        = "request"
 	MsgResponse       = "response"
+	MsgLiveUpdate     = "live_update"
 	MsgSelect         = "select"
 	MsgSelectResponse = "select_response"
 	MsgActionProgress = "action_progress"
@@ -72,21 +74,41 @@ const ActionTypeQueryReplace = "query_replace"
 // dismissing the launcher after it succeeds.
 const ActionTypeKeepOpen = "keep_open"
 
+// ActionTypeOpen pushes a view and queries its destination without a select.
+const ActionTypeOpen = "open"
+
+type Destination struct {
+	Plugin  string `json:"plugin"`
+	Context string `json:"context,omitempty"`
+	Text    string `json:"text"`
+}
+
 // Action describes a named action a plugin can perform on a result.
 // Type is omitted for the default select behavior, or can request a UI mode
 // such as ActionTypeKeepOpen or ActionTypeQueryReplace.
 type Action struct {
-	Name        string `json:"name"`
-	Type        string `json:"type,omitempty"`
-	Query       string `json:"query,omitempty"`
-	Default     bool   `json:"default,omitempty"`
-	Description string `json:"description,omitempty"`
+	Name        string       `json:"name"`
+	Secondary   bool         `json:"secondary,omitempty"`
+	OfferID     string       `json:"offer_id,omitempty"`
+	Type        string       `json:"type,omitempty"`
+	Query       string       `json:"query,omitempty"`
+	Default     bool         `json:"default,omitempty"`
+	Description string       `json:"description,omitempty"`
+	Destination *Destination `json:"destination,omitempty"`
+	Title       string       `json:"title,omitempty"`
+	Placeholder string       `json:"placeholder,omitempty"`
+	Requires    []string     `json:"requires,omitempty"`
+	NoFrecency  bool         `json:"no_frecency,omitempty"`
 }
 
 // ActionNext is a continuation requested by the handler. The daemon consumes
 // "refresh" after sending the ordinary terminal reply to the owner.
 type ActionNext struct {
-	Type string `json:"type"`
+	Type        string       `json:"type"`
+	Destination *Destination `json:"destination,omitempty"`
+	Title       string       `json:"title,omitempty"`
+	Placeholder string       `json:"placeholder,omitempty"`
+	Issuer      string       `json:"issuer,omitempty"` // daemon-assigned handler ID on an open sent to a UI
 }
 
 // SelectResponse is the terminal outcome from a handler or from daemon to UI.
@@ -120,21 +142,25 @@ type UIRequest struct {
 	Type     string `json:"type"`
 	ClientID string `json:"client_id,omitempty"`
 	Text     string `json:"text,omitempty"`
+	Context  string `json:"context,omitempty"` // opaque, scoped to Plugin
 	// New queries supersede older queries in this stream on the same connection.
 	QueryStream string `json:"query_stream,omitempty"`
+	Watch       bool   `json:"watch,omitempty"`
 	// Optional fields for actions such as selection
 	QueryID    string   `json:"query_id,omitempty"`
 	Plugin     string   `json:"plugin,omitempty"`
 	ResultID   string   `json:"result_id,omitempty"`
 	Action     string   `json:"action,omitempty"`
+	OfferID    string   `json:"offer_id,omitempty"`
 	ID         string   `json:"id,omitempty"` // backward compatibility alias for ResultID
 	RequestID  string   `json:"request_id,omitempty"`
 	UIFeatures []string `json:"ui_features,omitempty"`
+	NoFrecency bool     `json:"no_frecency,omitempty"`
 }
 
-// AckMessage is sent from daemon to UI after receiving a query.
+// AckMessage acknowledges a query ("ack") or an explicit end ("ok").
 type AckMessage struct {
-	Type    string `json:"type"` // "ack"
+	Type    string `json:"type"`
 	QueryID string `json:"query_id"`
 }
 
@@ -198,18 +224,26 @@ type UpdateMessage struct {
 	Payload []byte `json:"payload"`
 }
 
+// ResultRef is the producer's independently usable value for a manifest handler.
+type ResultRef struct {
+	Type  string `json:"type"`
+	Value string `json:"value"`
+	MIME  string `json:"mime,omitempty"`
+}
+
 // ResultItem represents a normalized suggestion for UI rendering.
 type ResultItem struct {
-	ID            string   `json:"id"`
-	Label         string   `json:"label,omitempty"`
-	Description   string   `json:"description,omitempty"`
-	Icon          string   `json:"icon,omitempty"`
-	Category      string   `json:"category,omitempty"`
-	PreviewPath   string   `json:"preview_path,omitempty"`
-	Plugin        string   `json:"plugin"`
-	Score         float64  `json:"score,omitempty"`
-	FrecencyScore float64  `json:"frecency_score,omitempty"`
-	Actions       []Action `json:"actions,omitempty"`
+	ID            string     `json:"id"`
+	Label         string     `json:"label,omitempty"`
+	Description   string     `json:"description,omitempty"`
+	Icon          string     `json:"icon,omitempty"`
+	Category      string     `json:"category,omitempty"`
+	PreviewPath   string     `json:"preview_path,omitempty"`
+	Ref           *ResultRef `json:"ref,omitempty"`
+	Plugin        string     `json:"plugin"`
+	Score         float64    `json:"score,omitempty"`
+	FrecencyScore float64    `json:"frecency_score,omitempty"`
+	Actions       []Action   `json:"actions,omitempty"`
 }
 
 // PluginHello identifies the plugin to the daemon router.
@@ -223,11 +257,13 @@ type PluginRequest struct {
 	Type    string `json:"type"` // "request"
 	QueryID string `json:"query_id"`
 	Text    string `json:"text"`
+	Context string `json:"context,omitempty"`
 }
 
 // SelectRequest is sent from daemon to a plugin for action execution.
 type SelectRequest struct {
 	Type     string `json:"type"`
+	Context  string `json:"context,omitempty"`
 	Plugin   string `json:"plugin,omitempty"`
 	ResultID string `json:"result_id"`
 	Action   string `json:"action"`
@@ -240,6 +276,8 @@ type PluginResponse struct {
 	Type    string          `json:"type"` // "response"
 	QueryID string          `json:"query_id"`
 	Data    json.RawMessage `json:"data"`
+	Live    bool            `json:"live,omitempty"`  // response: this producer will push replacements
+	Final   bool            `json:"final,omitempty"` // live_update: last push from this producer
 }
 
 // MaxMessageSize limits one encoded JSON envelope, excluding the Unix newline.

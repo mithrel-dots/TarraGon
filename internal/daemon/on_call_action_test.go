@@ -184,7 +184,7 @@ func TestOnCallActionExpiredBeforeStart(t *testing.T) {
 	store := NewTransientQueryStore()
 	ui := newUIRegistry(store)
 	owner := &uiClient{out: make(chan any, 2), done: make(chan struct{})}
-	a := ui.acceptSelect(b.ctx, owner, wire.UIRequest{Type: wire.MsgSelect, Plugin: "plain", ResultID: "one"})
+	a := ui.acceptSelect(b.ctx, owner, wire.UIRequest{Type: wire.MsgSelect, Plugin: "plain", ResultID: "one"}, nil)
 	<-owner.out // receipt ack
 
 	// Simulate a late scheduler: the deadline has passed, but the UI timer's

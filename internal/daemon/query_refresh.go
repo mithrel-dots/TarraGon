@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"maps"
 	"slices"
 	"time"
 
@@ -11,14 +12,15 @@ import (
 )
 
 type resolvedQuery struct {
-	q         *queryState
-	text      string
-	daemonCtx context.Context
-	mgr       *plugins.Manager
-	registry  *pluginRegistry
-	requests  chan<- pluginRequest
-	store     *aggregateStore
-	ui        *uiRegistry
+	q             *queryState
+	text          string
+	pluginContext string
+	daemonCtx     context.Context
+	mgr           *plugins.Manager
+	registry      *pluginRegistry
+	requests      chan<- pluginRequest
+	store         *aggregateStore
+	ui            *uiRegistry
 }
 
 type dispatchReason uint8
@@ -39,8 +41,10 @@ type producerDispatch struct {
 	again       dispatchReason
 	conn        peerConn
 	updatesFrom peerConn       // connection that may replace its last result without a new request
+	live        bool           // updatesFrom opted in for this query
 	reason      dispatchReason // authorization to recheck when a queued write begins
 	started     time.Time
+	endCapable  bool // manifest promise at the start of this request's write
 }
 
 // Caller holds the manager read lock. Only on-call dispatch needs to
@@ -59,10 +63,14 @@ func (d *producerDispatch) eligible(reason dispatchReason) bool {
 	return d.eligiblePluginLocked(reason) != nil
 }
 
-func (q *queryState) hasRowLocked(producer, resultID string) bool {
-	return slices.ContainsFunc(q.Results[producer].items, func(item wire.ResultItem) bool {
-		return item.ID == resultID
-	})
+func (q *queryState) sourceRowLocked(producer, resultID string) *wire.ResultItem {
+	items := q.Results[producer].items
+	for i := range items {
+		if items[i].ID == resultID {
+			return &items[i]
+		}
+	}
+	return nil
 }
 
 func (s *aggregateStore) offeredRow(owner, queryID, producer, resultID string) bool {
@@ -72,7 +80,7 @@ func (s *aggregateStore) offeredRow(owner, queryID, producer, resultID string) b
 	}
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	return q.ctx.Err() == nil && q.hasRowLocked(producer, resultID)
+	return q.ctx.Err() == nil && q.sourceRowLocked(producer, resultID) != nil
 }
 
 // Called only by the terminal winner, after the owner has queued its answer.
@@ -88,7 +96,7 @@ func (s *aggregateStore) refreshAction(a *selectAction) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	d := q.producers[a.producer]
-	if d == nil || !q.hasRowLocked(a.producer, a.resultID) || !d.eligible(reason) {
+	if d == nil || q.sourceRowLocked(a.producer, a.resultID) == nil || !d.eligible(reason) {
 		return
 	}
 	if d.outstanding {
@@ -152,7 +160,14 @@ func (s *aggregateStore) beginQueryWrite(req pluginRequest, conn peerConn) bool 
 		return false
 	}
 	d.started = time.Now()
+	if d.updatesFrom != conn {
+		d.live = false
+	}
 	d.updatesFrom = conn
+	d.mgr.RLock()
+	p := d.mgr.Plugins[req.name]
+	d.endCapable = p != nil && slices.Contains(p.Config.Capabilities, wire.MsgEnd)
+	d.mgr.RUnlock()
 	q.mu.Unlock()
 	return true
 }
@@ -164,11 +179,18 @@ func (s *aggregateStore) receiveQuery(name string, conn peerConn, resp wire.Plug
 	}
 	q.mu.Lock()
 	d := q.producers[name]
-	if d == nil || d.updatesFrom != conn {
+	push := resp.Type == wire.MsgLiveUpdate
+	if d == nil || d.updatesFrom != conn || q.ctx.Err() != nil || push && !d.live {
 		q.mu.Unlock()
 		return
 	}
-	start := d.started // zero for an incremental update, even if a refresh is queued
+	start := d.started
+	if push {
+		start = time.Time{} // a push never completes a request, even if its write already started
+	} else if start.IsZero() && (d.live || resp.Live) {
+		q.mu.Unlock()
+		return // only a solicited response can start or renew a live subscription
+	}
 	q.mu.Unlock()
 	result, errMsg := parseResult(name, resp.Data, elapsedMillis(start))
 
@@ -179,6 +201,9 @@ func (s *aggregateStore) receiveQuery(name string, conn peerConn, resp wire.Plug
 	}
 	if !start.IsZero() {
 		d.conn, d.started = nil, time.Time{}
+		d.live = resp.Live
+	} else if push && resp.Final {
+		d.live = false
 	}
 	s.replaceResultLocked(q, name, result, errMsg, d.ui.publishSnapshot)
 	if !start.IsZero() {
@@ -187,27 +212,32 @@ func (s *aggregateStore) receiveQuery(name string, conn peerConn, resp wire.Plug
 }
 
 func (s *aggregateStore) retireQueries(name string, conn peerConn) {
-	type retired struct {
-		dispatch *producerDispatch
-		started  time.Time
-	}
-	var retiredQueries []retired
 	s.mu.RLock()
-	for _, q := range s.byID {
-		q.mu.Lock()
-		if d := q.producers[name]; d != nil {
-			if d.updatesFrom == conn {
-				d.updatesFrom = nil
-			}
-			if d.conn == conn {
-				retiredQueries = append(retiredQueries, retired{d, d.started})
-				d.conn, d.started = nil, time.Time{}
-			}
-		}
-		q.mu.Unlock()
-	}
+	queries := slices.Collect(maps.Values(s.byID))
 	s.mu.RUnlock()
-	for _, r := range retiredQueries {
-		r.dispatch.fail(r.started, "plugin disconnected")
+	for _, q := range queries {
+		q.mu.Lock()
+		d := q.producers[name]
+		if d == nil {
+			q.mu.Unlock()
+			continue
+		}
+		lostLive := d.updatesFrom == conn && d.live
+		if d.updatesFrom == conn {
+			d.updatesFrom, d.live = nil, false
+		}
+		lostRequest := d.conn == conn
+		start := d.started
+		if lostRequest {
+			d.conn, d.started = nil, time.Time{}
+		}
+		if !lostLive && !lostRequest {
+			q.mu.Unlock()
+			continue
+		}
+		s.submitErrorLocked(q, name, elapsedMillis(start), "plugin disconnected", d.ui.publishSnapshot)
+		if lostRequest {
+			d.complete()
+		}
 	}
 }

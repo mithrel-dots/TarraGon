@@ -112,7 +112,7 @@ func (b *daemonBus) startSession(base string, socket *net.UnixConn, handle func(
 		return err
 	}
 	ctx, cancel := context.WithCancel(b.ctx)
-	p := &subjectPeer{bus: b.conn, inbox: sub, out: base + ".out", ctx: ctx, cancel: cancel, socket: socket}
+	p := &subjectPeer{bus: b.conn, inbox: sub, out: base + ".out", ctx: ctx, cancel: cancel, socket: socket, idleTimeout: 90 * time.Second}
 	b.sessions.Add(1)
 	go func() {
 		defer b.sessions.Done()
@@ -125,15 +125,16 @@ func (b *daemonBus) startSession(base string, socket *net.UnixConn, handle func(
 // The subscription supplies the reader for the existing NDJSON decoder. An
 // outbound write is exactly one wire.WriteMsg frame, hence one NATS message.
 type subjectPeer struct {
-	bus      *nats.Conn
-	inbox    *nats.Subscription
-	out      string
-	ctx      context.Context
-	cancel   context.CancelFunc
-	socket   *net.UnixConn // nil for a native session
-	line     bytes.Buffer
-	writeMu  sync.Mutex
-	deadline time.Time
+	bus         *nats.Conn
+	inbox       *nats.Subscription
+	out         string
+	ctx         context.Context
+	cancel      context.CancelFunc
+	socket      *net.UnixConn // nil for a native session
+	idleTimeout time.Duration // native sessions only
+	line        bytes.Buffer
+	writeMu     sync.Mutex
+	deadline    time.Time
 }
 
 func (p *subjectPeer) Read(dst []byte) (int, error) {
@@ -141,7 +142,7 @@ func (p *subjectPeer) Read(dst []byte) (int, error) {
 		ctx := p.ctx
 		var cancel context.CancelFunc
 		if p.socket == nil {
-			ctx, cancel = context.WithTimeout(ctx, 90*time.Second)
+			ctx, cancel = context.WithTimeout(ctx, p.idleTimeout)
 		}
 		msg, err := p.inbox.NextMsgWithContext(ctx)
 		if cancel != nil {
