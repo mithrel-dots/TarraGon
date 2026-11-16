@@ -3,8 +3,10 @@ package daemon
 import (
 	"encoding/json"
 	"errors"
+	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"syscall"
 	"testing"
@@ -97,7 +99,11 @@ func TestEndQueryOnlyDispatchedParticipants(t *testing.T) {
 	// On each plugin reader the late frame precedes the valid response. By
 	// the time the second view completes, all the late frames were handled.
 	for _, p := range participants {
-		respond(p, first)
+		if p.Conn == pending.Conn || p.Conn == live.Conn {
+			watchFrame(t, p, first, wire.MsgResponse, `["late live"]`, true, false)
+		} else {
+			respond(p, first)
+		}
 		respond(p, second)
 	}
 	refreshSnapshot(t, read, second, func(q aggregate) bool {
@@ -110,6 +116,119 @@ func TestEndQueryOnlyDispatchedParticipants(t *testing.T) {
 	})
 	foreign.expectStatus(t)
 	query("writer fence") // catches a duplicate or an end on legacy/finished
+}
+
+func TestEndQueryBeforeFirstLiveResponse(t *testing.T) {
+	f := newAdmissionFixture(t, time.Second)
+	f.configure("p", plugins.LifecycleDaemon, true, "")
+	p := persistentPlugin(t, f, "p")
+	u := f.connectUI(t, f.requests)
+	removed := func(text string) string {
+		t.Helper()
+		id := pendingEndTestQuery(t, u, text, "")
+		expectPluginQueryFrame(t, p, wire.MsgRequest, id)
+		endTestQuery(t, u, id)
+		if f.store.query(id) != nil {
+			t.Fatal("released response before query removal")
+		}
+		return id
+	}
+	live, ordinary := removed("late live"), removed("late ordinary")
+	watchFrame(t, p, ordinary, wire.MsgResponse, `["ordinary"]`, false, false)
+	watchFrame(t, p, ordinary, wire.MsgResponse, `["unsolicited"]`, true, false)
+	watchFrame(t, p, live, wire.MsgLiveUpdate, `["push is not an opt-in"]`, true, false)
+	p.readBarrier(t)
+	fence := pendingEndTestQuery(t, u, "before opt-in", "")
+	expectPluginQueryFrame(t, p, wire.MsgRequest, fence)
+
+	watchFrame(t, p, live, wire.MsgResponse, `["started late"]`, true, false)
+	expectPluginQueryFrame(t, p, wire.MsgEnd, live)
+	watchFrame(t, p, live, wire.MsgResponse, `["duplicate"]`, true, false)
+	p.readBarrier(t)
+	fence = pendingEndTestQuery(t, u, "after stop", "")
+	expectPluginQueryFrame(t, p, wire.MsgRequest, fence)
+}
+
+func TestLateLiveResponseCannotStopReplacement(t *testing.T) {
+	f := newAdmissionFixture(t, time.Second)
+	f.configure("p", plugins.LifecycleDaemon, true, "")
+	server, client := net.Pipe()
+	t.Cleanup(func() { server.Close() })
+	t.Cleanup(func() { client.Close() })
+	old := admissionPeer{Conn: client, scanner: wire.NewScanner(client)}
+	go handlePluginConn(t.Context(), bufferedRetiredPeer{server}, f.registry, f.store, f.ui)
+	old.send(t, wire.PluginHello{Type: wire.MsgHello, Name: "p"})
+	old.readBarrier(t)
+	u := f.connectUI(t, f.requests)
+	id := pendingEndTestQuery(t, u, "original connection", "")
+	expectPluginQueryFrame(t, old, wire.MsgRequest, id)
+	endTestQuery(t, u, id)
+
+	replacement := persistentPlugin(t, f, "p")
+	watchFrame(t, old, id, wire.MsgResponse, `["buffered old"]`, true, false)
+	old.readBarrier(t)
+	watchFrame(t, replacement, id, wire.MsgResponse, `["unsolicited replacement"]`, true, false)
+	replacement.readBarrier(t)
+	fence := pendingEndTestQuery(t, u, "replacement fence", "")
+	expectPluginQueryFrame(t, replacement, wire.MsgRequest, fence)
+	old.expectNoWrite(t)
+}
+
+func TestLateLiveResponseWhileTerminalWatchPublishes(t *testing.T) {
+	f := newAdmissionFixture(t, time.Second)
+	f.configure("p", plugins.LifecycleDaemon, true, "")
+	p := persistentPlugin(t, f, "p")
+	u := f.connectUI(t, f.requests)
+	id := watchQuery(t, u, true)
+	watchRequest(t, p, id)
+	refreshSnapshot(t, func(v any) { u.read(t, v) }, id, func(q aggregate) bool { return q.Plugins["p"].State == "pending" })
+	f.store.WaitForPublications()
+	q := f.store.query(id)
+	publishing, release := make(chan struct{}), make(chan struct{})
+	done := sync.OnceFunc(func() { close(release) })
+	defer done()
+	go func() {
+		q.mu.Lock()
+		f.store.stopWatchLocked(q, "test budget error", func(update *wire.UpdateMessage, changed []string) {
+			close(publishing)
+			<-release
+			f.ui.publishSnapshot(update, changed)
+		})
+	}()
+	select {
+	case <-publishing:
+	case <-time.After(time.Second):
+		t.Fatal("terminal publisher did not start")
+	}
+	if got := f.store.query(id); got != q || q.ctx.Err() == nil {
+		t.Fatal("expected a canceled query still retained during terminal publication")
+	}
+	watchFrame(t, p, id, wire.MsgResponse, `["started late"]`, true, false)
+	p.readBarrier(t)
+	done()
+	watchError(t, u, id, "test budget error")
+	expectPluginQueryFrame(t, p, wire.MsgEnd, id)
+	fence := pendingEndTestQuery(t, u, "writer fence", "")
+	expectPluginQueryFrame(t, p, wire.MsgRequest, fence)
+}
+
+func TestEndQueryBoundsUnansweredRemovedRequests(t *testing.T) {
+	f := newAdmissionFixture(t, time.Second)
+	f.configure("p", plugins.LifecycleDaemon, true, "")
+	p := persistentPlugin(t, f, "p")
+	u := f.connectUI(t, f.requests)
+	session := f.registry.session("p")
+	for i := range maxUnansweredRemovedQueries {
+		if session.rememberRemovedQuery(strconv.Itoa(i)) {
+			t.Fatal("original connection exceeded its limit too early")
+		}
+	}
+	id := pendingEndTestQuery(t, u, "overflow", "")
+	expectPluginQueryFrame(t, p, wire.MsgRequest, id)
+	endTestQuery(t, u, id)
+	if f.registry.isConnected("p") {
+		t.Fatal("unanswered request was dropped without retiring its original connection")
+	}
 }
 
 func TestEndQuerySupersessionAndEviction(t *testing.T) {

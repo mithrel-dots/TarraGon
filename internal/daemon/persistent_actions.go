@@ -28,6 +28,9 @@ type pluginSession struct {
 	waiting  []*selectAction
 	inFlight map[string]*selectAction // keyed by the ID actually sent ("" for legacy)
 
+	removedQueries     map[string]struct{} // unanswered requests that did not get end
+	removedQueriesFull bool
+
 	unanswered bool      // the timed-out legacy invocation still owns the next final
 	replying   bool      // legacy final is being settled by the reader
 	reopened   time.Time // reject pre-recovery clicks delayed in the shared router queue
@@ -173,6 +176,7 @@ func (s *pluginSession) retire() []*selectAction {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.closed = true
+	s.removedQueries = nil
 	actions := s.waiting
 	s.waiting = nil
 	for _, a := range s.inFlight {

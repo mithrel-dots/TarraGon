@@ -190,32 +190,41 @@ func (s *aggregateStore) beginQueryWrite(req pluginRequest, encodingErr error) b
 	return true
 }
 
-func (s *aggregateStore) receiveQuery(name string, conn peerConn, resp wire.PluginResponse) {
+// Report removal so the original connection's reader can check for an unanswered request.
+func (s *aggregateStore) receiveQuery(name string, conn peerConn, resp wire.PluginResponse) bool {
 	q := s.query(resp.QueryID)
 	if q == nil {
-		return
+		return true
 	}
 	q.mu.Lock()
+	if q.ctx.Err() != nil {
+		q.mu.Unlock()
+		return s.receiveCanceledQuery(q, name, conn, resp)
+	}
 	d := q.producers[name]
 	push := resp.Type == wire.MsgLiveUpdate
-	if d == nil || d.updatesFrom != conn || q.ctx.Err() != nil || push && !d.live {
+	if d == nil || d.updatesFrom != conn || push && !d.live {
 		q.mu.Unlock()
-		return
+		return false
 	}
 	start := d.started
 	if push {
 		start = time.Time{} // a push never completes a request, even if its write already started
 	} else if start.IsZero() && (d.live || resp.Live) {
 		q.mu.Unlock()
-		return // only a solicited response can start or renew a live subscription
+		return false // only a solicited response can start or renew a live subscription
 	}
 	q.mu.Unlock()
 	result, errMsg := parseResult(name, resp.Data, elapsedMillis(start))
 
 	q.mu.Lock()
-	if current, _ := d.registry.getConn(name); current != conn || d.updatesFrom != conn || q.ctx.Err() != nil {
+	if q.ctx.Err() != nil {
 		q.mu.Unlock()
-		return // the producer or query was retired while decoding
+		return s.receiveCanceledQuery(q, name, conn, resp)
+	}
+	if current, _ := d.registry.getConn(name); current != conn || d.updatesFrom != conn {
+		q.mu.Unlock()
+		return false // the producer was retired while decoding
 	}
 	if !start.IsZero() {
 		d.conn, d.started = nil, time.Time{}
@@ -227,6 +236,27 @@ func (s *aggregateStore) receiveQuery(name string, conn peerConn, resp wire.Plug
 	if !start.IsZero() {
 		d.complete()
 	}
+	return false
+}
+
+// A terminal watch cancels before its final snapshot is published and removed.
+// Resolve the reply or defer to the removal record, under the same lock order as removal.
+func (s *aggregateStore) receiveCanceledQuery(q *queryState, name string, conn peerConn, resp wire.PluginResponse) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.byID[q.QueryID] != q {
+		return true
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	d := q.producers[name]
+	if resp.Type == wire.MsgResponse && d != nil && d.updatesFrom == conn && !d.started.IsZero() {
+		d.live = d.live || resp.Live
+		if !d.endCapable {
+			d.conn, d.started = nil, time.Time{}
+		}
+	}
+	return false
 }
 
 func (s *aggregateStore) retireQueries(name string, conn peerConn) {

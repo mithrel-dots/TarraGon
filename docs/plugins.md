@@ -262,7 +262,7 @@ A persistent plugin can add `end` to its manifest `capabilities` if it can cance
 
 Stop work for `q2` only; overlapping requests and selects are independent. No reply is required. A request may finish while `end` is in transit, so an already finished ID is a no-op. Once the daemon accepts a `live:true` response, that query also gets `end` without a manifest capability. Declare `end` to receive cancellation while the first response is still pending.
 
-An ordinary completed query gets no `end`. Neither does an undispatched request or a replacement connection. The daemon drops later data for the ended ID. On-call queries use process cancellation instead; their select processes are independent.
+An ordinary completed query gets no `end`. Neither does an undispatched request or a replacement connection. The daemon drops later data for the ended ID. If no `end` was sent while a request was pending and its first `response` arrives with `live:true`, the daemon sends one `end` on the original connection. An ordinary `response` or `live_update` cannot trigger this stop. The daemon disconnects a producer if more than 1,024 removed requests on that connection are still unanswered and were not sent `end`. On-call queries use process cancellation instead; their select processes are independent.
 
 ### Socket Locations
 

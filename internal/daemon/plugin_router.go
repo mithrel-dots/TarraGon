@@ -18,6 +18,7 @@ import (
 type pluginRegistry struct {
 	bus        *daemonBus
 	manager    *plugins.Manager
+	requests   chan<- pluginRequest
 	resume     chan *pluginSession
 	mu         sync.RWMutex
 	conns      map[string]*pluginSession
@@ -136,8 +137,8 @@ type pluginRequest struct {
 }
 
 func startPluginRouter(ctx context.Context, store *aggregateStore) (chan<- pluginRequest, *pluginRegistry) {
-	registry := &pluginRegistry{resume: make(chan *pluginSession)}
 	reqChan := make(chan pluginRequest, 256)
+	registry := &pluginRegistry{requests: reqChan, resume: make(chan *pluginSession)}
 	writeReady := func(s *pluginSession) {
 		if err := s.writeReady(); err != nil {
 			log.Printf("[PLUGINS] send select to %s failed: %v", s.name, err)
@@ -242,7 +243,12 @@ func handlePluginConn(ctx context.Context, conn peerConn, registry *pluginRegist
 
 		switch resp.Type {
 		case wire.MsgResponse, wire.MsgLiveUpdate:
-			store.receiveQuery(hello.Name, conn, resp)
+			if store.receiveQuery(hello.Name, conn, resp) && session.lateLiveResponse(resp) {
+				queryEnd{
+					requests: registry.requests, shutdown: ctx.Done(),
+					req: pluginRequest{name: hello.Name, conn: conn, queryID: resp.QueryID, end: true},
+				}.send()
+			}
 
 		case wire.MsgSelectResponse:
 			var resp wire.SelectResponse
