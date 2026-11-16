@@ -112,6 +112,10 @@ func (s *aggregateStore) refreshAction(a *selectAction) {
 func (d *producerDispatch) complete() {
 	d.q.mu.Lock()
 	defer d.q.mu.Unlock()
+	d.completeLocked()
+}
+
+func (d *producerDispatch) completeLocked() {
 	reason := d.again
 	d.again = initialDispatch
 	d.outstanding = reason != initialDispatch && d.q.ctx.Err() == nil
@@ -159,20 +163,20 @@ func (s *aggregateStore) beginQueryWrite(req pluginRequest, encodingErr error) b
 		return false
 	}
 	d.mgr.RLock()
-	p := d.mgr.Plugins[req.name]
-	if d.reason != initialDispatch && d.eligiblePluginLocked(d.reason) == nil {
+	p := d.eligiblePluginLocked(d.reason)
+	if p == nil || encodingErr != nil {
 		// Config may have changed while waiting for hello or the writer.
 		d.mgr.RUnlock()
 		d.conn = nil
-		q.mu.Unlock()
-		d.complete()
-		return false
-	}
-	if encodingErr != nil {
-		d.mgr.RUnlock()
-		d.conn = nil
-		s.submitErrorLocked(q, req.name, 0, encodingErr.Error(), d.ui.publishSnapshot)
-		d.complete()
+		d.completeLocked()
+		switch {
+		case p == nil && d.reason == initialDispatch:
+			s.submitErrorLocked(q, req.name, 0, "plugin disabled", d.ui.publishSnapshot)
+		case p != nil:
+			s.submitErrorLocked(q, req.name, 0, encodingErr.Error(), d.ui.publishSnapshot)
+		default:
+			q.mu.Unlock() // Config revoked a refresh, so leave its previous state intact.
+		}
 		return false
 	}
 	d.started = time.Now()
@@ -180,7 +184,7 @@ func (s *aggregateStore) beginQueryWrite(req pluginRequest, encodingErr error) b
 		d.live = false
 	}
 	d.updatesFrom = conn
-	d.endCapable = p != nil && slices.Contains(p.Config.Capabilities, wire.MsgEnd)
+	d.endCapable = slices.Contains(p.Config.Capabilities, wire.MsgEnd)
 	d.mgr.RUnlock()
 	q.mu.Unlock()
 	return true

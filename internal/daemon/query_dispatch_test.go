@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -104,4 +105,70 @@ func TestPersistentQueryRetiresTransportOnWriteError(t *testing.T) {
 	if err := snap.Plugins["p"].Error; err != "plugin disconnected" || f.registry.isConnected("p") {
 		t.Fatalf("transport failure did not retire the plugin: %q", err)
 	}
+}
+
+type gatedQueryDeadline struct {
+	peerConn
+	arm     chan struct{}
+	started chan struct{}
+	release chan struct{}
+}
+
+func (p *gatedQueryDeadline) SetWriteDeadline(deadline time.Time) error {
+	if !deadline.IsZero() {
+		select {
+		case <-p.arm:
+			close(p.started)
+			<-p.release
+			deadline = time.Now().Add(time.Second)
+		default:
+		}
+	}
+	return p.peerConn.SetWriteDeadline(deadline)
+}
+
+func TestPersistentInitialQueryRechecksEnabledAtWrite(t *testing.T) {
+	f := newAdmissionFixture(t, time.Second)
+	f.store.limit = 1
+	f.configure("p", plugins.LifecycleDaemon, true, "")
+	f.mgr.Plugins["p"].Config.Capabilities = []string{wire.MsgEnd}
+	server, p := admissionSocket(t)
+	writer := &gatedQueryDeadline{server, make(chan struct{}, 1), make(chan struct{}), make(chan struct{})}
+	release := sync.OnceFunc(func() { close(writer.release) })
+	defer release()
+	f.registry.set("p", writer)
+	owner, watcher := f.connectUI(t, f.requests), f.connectUI(t, f.requests)
+
+	old := pendingEndTestQuery(t, owner, "waiting for its response", "")
+	watchRequest(t, p, old)
+	writer.arm <- struct{}{}
+	id := watchQuery(t, watcher, true)
+	select {
+	case <-writer.started:
+	case <-time.After(time.Second):
+		t.Fatal("initial query did not reach the router")
+	}
+	f.mgr.Lock()
+	f.mgr.Plugins["p"].Config.Enabled = false
+	f.mgr.Unlock()
+	for range cap(f.requests) {
+		f.requests <- pluginRequest{name: "p", conn: writer, queryID: "expired"}
+	}
+	release()
+
+	snap := refreshSnapshot(t, func(v any) { watcher.read(t, v) }, id, func(q aggregate) bool {
+		return q.Plugins["p"].State == "error"
+	})
+	if err := snap.Plugins["p"].Error; err != "plugin disabled" {
+		t.Fatalf("unexpected error: %q", err)
+	}
+	// The rejected watch demotes and evicts the old query. Its end must
+	// drain through the full router queue without a write for the watch.
+	expectPluginQueryFrame(t, p, wire.MsgEnd, old)
+	endTestQuery(t, watcher, id)
+	f.mgr.Lock()
+	f.mgr.Plugins["p"].Config.Enabled = true
+	f.mgr.Unlock()
+	fence := pendingEndTestQuery(t, owner, "fence", "")
+	watchRequest(t, p, fence)
 }

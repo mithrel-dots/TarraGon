@@ -336,6 +336,21 @@ func TestRefreshRequiresOwnedOfferedRowAndConsent(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
+	f.mgr.Lock()
+	f.mgr.Plugins["p"].Config.Capabilities = []string{"replay"}
+	f.mgr.Unlock()
+	check("owner", "q", "row", "consumer", true)
+	select {
+	case req = <-out:
+	case <-time.After(time.Second):
+		t.Fatal("consumer refresh did not reach the writer")
+	}
+	f.mgr.Lock()
+	f.mgr.Plugins["p"].Config.Capabilities = nil
+	f.mgr.Unlock()
+	if f.store.beginQueryWrite(req, nil) {
+		t.Fatal("queued consumer refresh ignored revoked replay consent")
+	}
 	check("owner", "q", "row", "p", true)
 	select {
 	case req = <-out:
@@ -347,6 +362,11 @@ func TestRefreshRequiresOwnedOfferedRowAndConsent(t *testing.T) {
 	f.mgr.Unlock()
 	if f.store.beginQueryWrite(req, nil) {
 		t.Fatal("queued refresh was written after its producer was disabled")
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.producers["p"].outstanding || q.Plugins["p"].State != "done" || q.sourceRowLocked("p", "row") == nil {
+		t.Fatal("revoked refresh changed the last result or kept the dispatch slot")
 	}
 }
 
