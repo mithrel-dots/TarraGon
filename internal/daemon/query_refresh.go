@@ -141,21 +141,37 @@ func (d *producerDispatch) result(start time.Time, data json.RawMessage, err err
 	d.complete()
 }
 
-func (s *aggregateStore) beginQueryWrite(req pluginRequest, conn peerConn) bool {
+// Only a successfully encoded request can take ownership of replies and end.
+func (s *aggregateStore) beginQueryWrite(req pluginRequest, encodingErr error) bool {
 	q := s.query(req.queryID)
-	if q == nil || req.conn != conn {
+	if q == nil {
 		return false
 	}
 	q.mu.Lock()
 	d := q.producers[req.name]
-	if d == nil || d.conn != conn || !d.started.IsZero() || q.ctx.Err() != nil {
+	if d == nil || d.conn != req.conn || !d.started.IsZero() || q.ctx.Err() != nil {
 		q.mu.Unlock()
 		return false
 	}
-	if d.reason != initialDispatch && !d.eligible(d.reason) {
+	conn, _ := d.registry.getConn(req.name)
+	if conn != req.conn {
+		q.mu.Unlock()
+		return false
+	}
+	d.mgr.RLock()
+	p := d.mgr.Plugins[req.name]
+	if d.reason != initialDispatch && d.eligiblePluginLocked(d.reason) == nil {
 		// Config may have changed while waiting for hello or the writer.
+		d.mgr.RUnlock()
 		d.conn = nil
 		q.mu.Unlock()
+		d.complete()
+		return false
+	}
+	if encodingErr != nil {
+		d.mgr.RUnlock()
+		d.conn = nil
+		s.submitErrorLocked(q, req.name, 0, encodingErr.Error(), d.ui.publishSnapshot)
 		d.complete()
 		return false
 	}
@@ -164,8 +180,6 @@ func (s *aggregateStore) beginQueryWrite(req pluginRequest, conn peerConn) bool 
 		d.live = false
 	}
 	d.updatesFrom = conn
-	d.mgr.RLock()
-	p := d.mgr.Plugins[req.name]
 	d.endCapable = p != nil && slices.Contains(p.Config.Capabilities, wire.MsgEnd)
 	d.mgr.RUnlock()
 	q.mu.Unlock()

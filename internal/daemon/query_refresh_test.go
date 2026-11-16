@@ -261,7 +261,7 @@ func TestRefreshRequiresOwnedOfferedRowAndConsent(t *testing.T) {
 	if f.store.offeredRow("owner", "q", "p", "extra") {
 		t.Fatal("accepted rows before the first query write")
 	}
-	if !f.store.beginQueryWrite(req, server) {
+	if !f.store.beginQueryWrite(req, nil) {
 		t.Fatal("initial write lost")
 	}
 	premature := &selectAction{owner: "owner", queryID: "q", resultID: "row", producer: "p", handler: "p"}
@@ -311,7 +311,7 @@ func TestRefreshRequiresOwnedOfferedRowAndConsent(t *testing.T) {
 	if !stillPending {
 		t.Fatal("incremental rows completed a refresh before its write")
 	}
-	if !f.store.beginQueryWrite(req, server) {
+	if !f.store.beginQueryWrite(req, nil) {
 		t.Fatal("refresh write lost")
 	}
 	check("owner", "q", "row", "consumer", true)
@@ -345,7 +345,7 @@ func TestRefreshRequiresOwnedOfferedRowAndConsent(t *testing.T) {
 	f.mgr.Lock()
 	f.mgr.Plugins["p"].Config.Enabled = false
 	f.mgr.Unlock()
-	if f.store.beginQueryWrite(req, server) {
+	if f.store.beginQueryWrite(req, nil) {
 		t.Fatal("queued refresh was written after its producer was disabled")
 	}
 }

@@ -357,7 +357,8 @@ func (s *aggregateStore) scheduleLocked(q *queryState, plugin string, publish Sn
 		return
 	}
 	q.publishing = true
-	single := len(q.Plugins) == 1
+	// Watch publication can enqueue end frames on the plugin router.
+	single := len(q.Plugins) == 1 && q.watch == nil
 	s.publishers.Add(1)
 	q.mu.Unlock()
 	if single {

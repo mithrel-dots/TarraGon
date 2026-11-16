@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"log"
 	"slices"
 	"sort"
@@ -169,14 +170,25 @@ func startPluginRouter(ctx context.Context, store *aggregateStore) (chan<- plugi
 				if req.end {
 					frame = map[string]string{"type": wire.MsgEnd, "query_id": req.queryID}
 				} else {
-					if !store.beginQueryWrite(req, conn) {
-						continue // ended or retired while queued
-					}
 					frame = &wire.PluginRequest{Type: wire.MsgRequest, QueryID: req.queryID, Text: req.text, Context: req.pluginContext}
 				}
+				data, err := wire.EncodeMsg(frame)
+				if err != nil {
+					if !req.end {
+						store.beginQueryWrite(req, err)
+					}
+					continue
+				}
 				_ = conn.SetWriteDeadline(time.Now().Add(100 * time.Millisecond))
-				err := wire.WriteMsg(conn, frame)
+				if !req.end && !store.beginQueryWrite(req, nil) {
+					_ = conn.SetWriteDeadline(time.Time{})
+					continue // rejected, ended or retired while queued
+				}
+				n, err := conn.Write(data)
 				_ = conn.SetWriteDeadline(time.Time{})
+				if err == nil && n != len(data) {
+					err = io.ErrShortWrite
+				}
 				if err != nil {
 					log.Printf("[PLUGINS] send to %s failed: %v", req.name, err)
 					registry.remove(req.name, conn)

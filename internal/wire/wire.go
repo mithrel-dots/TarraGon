@@ -290,18 +290,24 @@ var ErrMessageTooLarge = errors.New("message exceeds the 8 MiB payload limit")
 // If multiple goroutines share the same connection/writer, callers must
 // serialize access (for example with a connection-scoped sync.Mutex).
 func WriteMsg(w io.Writer, v any) error {
-	b, err := json.Marshal(v)
+	b, err := EncodeMsg(v)
 	if err != nil {
 		return err
 	}
-	if len(b) > MaxMessageSize {
-		return ErrMessageTooLarge
-	}
+	_, err = w.Write(b)
+	return err
+}
 
-	if _, err := w.Write(append(b, '\n')); err != nil {
-		return err
+// EncodeMsg validates and returns one complete NDJSON frame.
+func EncodeMsg(v any) ([]byte, error) {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return nil, err
 	}
-	return nil
+	if len(b) > MaxMessageSize {
+		return nil, ErrMessageTooLarge
+	}
+	return append(b, '\n'), nil
 }
 
 // ReadMsg reads one NDJSON line from scanner and unmarshals it into v.
