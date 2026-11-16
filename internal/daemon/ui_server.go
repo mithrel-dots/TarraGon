@@ -21,13 +21,36 @@ import (
 
 var querySeq atomic.Uint64
 
-const invalidContextMessage = "context must be valid UTF-8, at most 4096 bytes, with no NUL"
+const (
+	maxPluginContextBytes = 4096
+	invalidContextMessage = "context must be a valid UTF-8 string, at most 4096 bytes, with no NUL"
+)
 
 func validPluginContext(value string) bool {
-	return len(value) <= 4096 && utf8.ValidString(value) && !strings.ContainsRune(value, 0)
+	return len(value) <= maxPluginContextBytes && utf8.ValidString(value) && !strings.ContainsRune(value, 0)
 }
 
-func validRequestContext(value string, frame []byte) bool {
+type incomingUIRequest struct {
+	wire.UIRequest
+	Context requestContext `json:"context"`
+}
+
+type requestContext struct {
+	value   string
+	invalid bool
+}
+
+func (c *requestContext) UnmarshalJSON(raw []byte) error {
+	if c.invalid || string(raw) == "null" {
+		return nil
+	}
+	// A valid byte uses at most six bytes in JSON, plus the enclosing quotes.
+	c.invalid = raw[0] != '"' || len(raw) > 6*maxPluginContextBytes+2 ||
+		json.Unmarshal(raw, &c.value) != nil || !validRequestContext(c.value, raw)
+	return nil // the request handler rejects invalid context without closing the session
+}
+
+func validRequestContext(value string, token []byte) bool {
 	if !validPluginContext(value) {
 		return false
 	}
@@ -35,12 +58,7 @@ func validRequestContext(value string, frame []byte) bool {
 		return true
 	}
 	// encoding/json silently replaces invalid bytes and unpaired surrogates.
-	// Only re-read the raw token if a replacement occurred or was supplied.
-	var field struct{ Context json.RawMessage }
-	if json.Unmarshal(frame, &field) != nil {
-		return false
-	}
-	raw := string(field.Context)
+	raw := string(token)
 	explicit := strings.Count(raw, "\uFFFD")
 	for {
 		_, escape, ok := strings.Cut(raw, `\`)
@@ -249,7 +267,7 @@ func handleUIClient(ctx context.Context, conn peerConn, mgr *plugins.Manager, re
 		default:
 		}
 
-		var parsed wire.UIRequest
+		var parsed incomingUIRequest
 		if err := wire.ReadMsg(scanner, &parsed); err != nil {
 			if eof, ok := err.(unixInputEOF); ok {
 				go func() {
@@ -270,6 +288,7 @@ func handleUIClient(ctx context.Context, conn peerConn, mgr *plugins.Manager, re
 			}
 			return
 		}
+		parsed.UIRequest.Context = parsed.Context.value
 
 		if parsed.ClientID != "" {
 			client.clientID = parsed.ClientID
@@ -285,7 +304,7 @@ func handleUIClient(ctx context.Context, conn peerConn, mgr *plugins.Manager, re
 			_ = client.send(map[string]any{"type": "ok"})
 			continue
 		case "select":
-			a := ui.acceptSelect(session, client, parsed, scanner.Bytes())
+			a := ui.acceptSelect(session, client, parsed.UIRequest, parsed.Context.invalid)
 			if a != nil {
 				if frecencyDB != nil && !a.noFrecency && a.producer != "" && a.resultID != "" {
 					history.Add(1)
@@ -323,12 +342,12 @@ func handleUIClient(ctx context.Context, conn peerConn, mgr *plugins.Manager, re
 			continue
 		}
 
-		if parsed.Context != "" && parsed.Plugin == "" {
-			_ = client.send(map[string]string{"type": "error", "error": "context requires an explicit plugin"})
+		if parsed.Context.invalid {
+			_ = client.send(map[string]string{"type": "error", "error": invalidContextMessage})
 			continue
 		}
-		if !validRequestContext(parsed.Context, scanner.Bytes()) {
-			_ = client.send(map[string]string{"type": "error", "error": invalidContextMessage})
+		if parsed.Context.value != "" && parsed.Plugin == "" {
+			_ = client.send(map[string]string{"type": "error", "error": "context requires an explicit plugin"})
 			continue
 		}
 		if parsed.Text == "" && parsed.Plugin == "" {
@@ -346,7 +365,7 @@ func handleUIClient(ctx context.Context, conn peerConn, mgr *plugins.Manager, re
 			mgr.RUnlock()
 		}
 		qid := fmt.Sprintf("q-%d-%d", time.Now().UnixNano(), querySeq.Add(1))
-		rejection := store.startUIQuery(ctx, qid, client.clientID, uid, parsed, targetName)
+		rejection := store.startUIQuery(ctx, qid, client.clientID, uid, parsed.UIRequest, targetName)
 		if err := client.send(&wire.AckMessage{Type: "ack", QueryID: qid}); err != nil {
 			return
 		}

@@ -47,7 +47,7 @@ type selectAction struct {
 	cleanup    []func()
 }
 
-func (ui *uiRegistry) acceptSelect(session context.Context, client *uiClient, req wire.UIRequest, frame []byte) *selectAction {
+func (ui *uiRegistry) acceptSelect(session context.Context, client *uiClient, req wire.UIRequest, invalidContext bool) *selectAction {
 	row := req.ID
 	if row == "" {
 		row = req.ResultID
@@ -78,7 +78,7 @@ func (ui *uiRegistry) acceptSelect(session context.Context, client *uiClient, re
 	if err := client.send(&wire.SelectAck{Type: "ok", ActionID: a.id, RequestID: a.requestID}); err != nil {
 		return nil
 	}
-	if !validRequestContext(req.Context, frame) {
+	if invalidContext {
 		a.notRun(invalidContextMessage)
 		return nil
 	}

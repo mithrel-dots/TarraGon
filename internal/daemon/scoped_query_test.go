@@ -111,27 +111,74 @@ esac
 	}
 }
 
-func TestScopedContextUnicode(t *testing.T) {
+func TestScopedContextDecoding(t *testing.T) {
 	for _, tc := range []struct {
 		token string
 		valid bool
 	}{
+		{`null`, true},
+		{`42`, false},
+		{`{}`, false},
+		{`[]`, false},
+		{`false`, false},
 		{`"�\uFFfd\\ufffd\uD83C\uDF31"`, true},
 		{`"\ud803"`, false},
 		{`"\\ufffd\udc03"`, false},
 		{"\"\xff\"", false},
 		{`"` + strings.Repeat("é", 2048) + `"`, true},
 		{`"` + strings.Repeat("é", 2048) + `a"`, false},
+		{`"` + strings.Repeat(`\u0061`, 4096) + `"`, true},
+		{`"` + strings.Repeat(`\u0061`, 4097) + `"`, false},
 	} {
 		frame := []byte(`{"context":` + tc.token + `}`)
-		var req wire.UIRequest
+		var req incomingUIRequest
 		if err := json.Unmarshal(frame, &req); err != nil {
 			t.Fatal(err)
 		}
-		if got := validRequestContext(req.Context, frame); got != tc.valid {
+		if got := !req.Context.invalid; got != tc.valid {
 			t.Errorf("context token %.30q: valid=%v, want %v", tc.token, got, tc.valid)
 		}
 	}
+}
+
+func TestInvalidContextKeepsUISessionAndWatch(t *testing.T) {
+	f := persistentFixture(t, true, 5*time.Second)
+	p := f.connectPlugin(t, "p")
+	u := f.connectUI(t, f.requests)
+	u.send(t, json.RawMessage(`{"type":"query","plugin":"p","query_stream":"view","watch":true,"context":null}`))
+	var watch wire.AckMessage
+	u.read(t, &watch)
+	if watch.Type != "ack" || watch.QueryID == "" {
+		t.Fatalf("bad watch ack: %+v", watch)
+	}
+	watchRequest(t, p, watch.QueryID)
+	watchFrame(t, p, watch.QueryID, wire.MsgResponse, `["first"]`, true, false)
+	watchRows(t, u, watch.QueryID, "first")
+
+	pending := u.selectRow(t, click("pending"))
+	p.expectSelect(t, "pending", pending.ActionID)
+	u.send(t, json.RawMessage(`{"type":"query","plugin":"p","query_stream":"view","watch":true,"context":42}`))
+	var rejection map[string]string
+	u.read(t, &rejection)
+	if rejection["type"] != "error" || rejection["error"] != invalidContextMessage {
+		t.Fatalf("bad query rejection: %v", rejection)
+	}
+	u.expectStatus(t)
+
+	u.send(t, json.RawMessage(`{"type":"select","plugin":"p","result_id":"invalid","request_id":"bad-context","context":42}`))
+	var receipt wire.SelectAck
+	u.read(t, &receipt)
+	if receipt.Type != "ok" || receipt.ActionID == "" || receipt.RequestID != "bad-context" {
+		t.Fatalf("bad select receipt: %+v", receipt)
+	}
+	u.outcome(t, receipt, false, "not_run")
+	u.expectStatus(t)
+
+	p.reply(t, pending.ActionID, "still running", true)
+	u.outcome(t, pending, true, "")
+	watchFrame(t, p, watch.QueryID, wire.MsgLiveUpdate, `["second"]`, false, false)
+	watchRows(t, u, watch.QueryID, "second")
+	p.expectNoWrite(t)
 }
 
 func TestScopedPersistentNativeFrames(t *testing.T) {

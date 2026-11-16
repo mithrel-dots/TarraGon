@@ -174,7 +174,7 @@ The effective prefix is what `tarragon plugin list`, `tarragon plugin config` an
 
 A UI can query an enabled plugin by its stable `plugin` ID, including a plugin with no prefix. Only that plugin receives the query. Its `text` is literal: `""`, surrounding spaces, and text starting with another plugin's prefix all pass through unchanged. An unknown or disabled ID gets an `ack` and a snapshot with `plugins[id].state:"error"` and no rows.
 
-The UI may include an opaque `context` string describing the destination. Use it for non-secret values such as a catalog ID. It must be valid Unicode encoded in at most **4096 UTF-8 bytes**, without NUL. Omitting it or sending `""` means no context. A query with invalid context or nonempty context without an explicit `plugin` gets an `error` before dispatch; a prefix in `text` does not qualify.
+The UI may include an opaque `context` string describing the destination. Use it for non-secret values such as a catalog ID. It must be valid Unicode encoded in at most **4096 UTF-8 bytes**, without NUL. Omitting it or sending `""` or `null` means no context. A query with invalid context (including other JSON types) or nonempty context without an explicit `plugin` gets an `error` before dispatch; a prefix in `text` does not qualify. Invalid context on a query or select leaves the UI session and its watches open.
 
 For a persistent plugin, context is an optional field on `request` and `select` on either transport:
 

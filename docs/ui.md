@@ -64,8 +64,11 @@ strings, surrounding spaces, and another plugin's prefix are passed through.
 An unknown or disabled target still gets an `ack` and a snapshot with that
 plugin in `error`; the daemon doesn't search other plugins.
 
-`context` is optional, non-secret UTF-8 (at most 4096 bytes, no NUL). A query
-with invalid context or context without a target gets `error` before dispatch.
+`context` is an optional, non-secret UTF-8 string (at most 4096 bytes, no NUL).
+Omission, `""`, and `null` mean no context. A query with invalid context or
+nonempty context without a target gets `error` before dispatch. A select with
+invalid context returns `ok` followed by `not_run`. Both leave the session and
+its watches active.
 A select on an owned source query uses its recorded context for that producer.
 A select naming another session's retained query returns `ok` followed by
 `not_run`. When the source is omitted or no longer retained, an ordinary select
