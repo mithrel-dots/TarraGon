@@ -387,7 +387,7 @@ func testQueuedWatchRenewal(t *testing.T, outcome string) {
 	}
 	f.store.armWatch("q", func(update *wire.UpdateMessage, _ []string) { updates <- update })
 	dispatchQuery(t.Context(), "text", "q", f.mgr, out, f.registry, f.store, f.ui, true, "p")
-	if !f.store.beginQueryWrite(next(), server) {
+	if !f.store.beginQueryWrite(next(), nil) {
 		t.Fatal("initial write lost")
 	}
 	f.store.receiveQuery("p", server, wire.PluginResponse{QueryID: "q", Data: json.RawMessage(`["row"]`), Live: true})
@@ -416,7 +416,7 @@ func testQueuedWatchRenewal(t *testing.T, outcome string) {
 	}
 	switch outcome {
 	case "renew":
-		if !f.store.beginQueryWrite(req, server) {
+		if !f.store.beginQueryWrite(req, nil) {
 			t.Fatal("refresh write lost")
 		}
 		f.store.receiveQuery("p", server, wire.PluginResponse{QueryID: "q", Data: json.RawMessage(`["renewed"]`), Live: true})
@@ -429,6 +429,7 @@ func testQueuedWatchRenewal(t *testing.T, outcome string) {
 		}
 		final.Data = json.RawMessage(`["finished"]`)
 		f.store.receiveQuery("p", server, final)
+		f.store.WaitForPublications()
 		if totalWatchUsage(f.store) != (watchUsage{}) || f.store.query("q") != q {
 			t.Fatal("final push without a refresh did not demote the renewed watch")
 		}
@@ -455,7 +456,7 @@ func testQueuedWatchRenewal(t *testing.T, outcome string) {
 	}, "q", func(s aggregate) bool { return s.WatchError != "" })
 	f.store.WaitForPublications()
 	if !strings.Contains(snap.WatchError, "refresh response") || len(snap.List) != 1 || snap.List[0].ID != "last" ||
-		totalWatchUsage(f.store) != (watchUsage{}) || f.store.query("q") != nil || f.store.beginQueryWrite(req, server) {
+		totalWatchUsage(f.store) != (watchUsage{}) || f.store.query("q") != nil || f.store.beginQueryWrite(req, nil) {
 		t.Fatalf("renewal timeout did not end the queued refresh and release the watch: %+v", snap)
 	}
 }
