@@ -186,7 +186,8 @@ func TestOnCallActionIgnoresMalformedNext(t *testing.T) {
 		{name: "explicit failure", stdout: `{"success":false,"message":"stale","next":{"type":"open","destination":{"plugin":"plain","context":42}}}`, message: "stale"},
 		{name: "bad success", stdout: `{"success":"yes","next":[]}`, code: "completion_unknown", message: "invalid select response JSON"},
 		{name: "bad message", stdout: `{"message":42,"next":[]}`, code: "completion_unknown", message: "invalid select response JSON"},
-		{name: "bad root", stdout: `null`, code: "completion_unknown", message: "invalid select response JSON"},
+		{name: "null defaults to success", stdout: `null`, success: true},
+		{name: "bad root", stdout: `[]`, code: "completion_unknown", message: "invalid select response JSON"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()

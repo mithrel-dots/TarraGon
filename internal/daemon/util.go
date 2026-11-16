@@ -147,16 +147,13 @@ func runOnCallSelect(ctx context.Context, p *plugins.Plugin, resultID, action, p
 		return resp, nil
 	}
 
-	var parsed *struct {
+	var parsed struct {
 		Success *bool           `json:"success"`
 		Message string          `json:"message"`
 		Next    json.RawMessage `json:"next"`
 	}
 	if err := json.Unmarshal(out, &parsed); err != nil {
 		return wire.SelectResponse{}, fmt.Errorf("%s: invalid select response JSON: %w", p.Config.ID, err)
-	}
-	if parsed == nil {
-		return wire.SelectResponse{}, fmt.Errorf("%s: invalid select response JSON: expected an object", p.Config.ID)
 	}
 	if parsed.Success != nil {
 		resp.Success = *parsed.Success
