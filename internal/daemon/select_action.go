@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"crypto/rand"
+	"encoding/json"
 	"fmt"
 	"log"
 	"slices"
@@ -218,6 +219,15 @@ func (a *selectAction) expire() {
 		return // a progress frame already reset this timer
 	}
 	a.failLocked("Action deadline expired.")
+}
+
+// Continuations are optional and cannot invalidate a handler's final outcome.
+func decodeActionNext(raw json.RawMessage) *wire.ActionNext {
+	var next *wire.ActionNext
+	if len(raw) != 0 && json.Unmarshal(raw, &next) == nil {
+		return next
+	}
+	return nil
 }
 
 func (a *selectAction) finish(success bool, message string, next *wire.ActionNext) bool {

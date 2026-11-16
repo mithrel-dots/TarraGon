@@ -251,10 +251,16 @@ func handlePluginConn(ctx context.Context, conn peerConn, registry *pluginRegist
 			}
 
 		case wire.MsgSelectResponse:
-			var resp wire.SelectResponse
-			if json.Unmarshal(raw, &resp) != nil {
+			type terminal wire.SelectResponse
+			var reply struct {
+				terminal
+				Next json.RawMessage `json:"next"`
+			}
+			if json.Unmarshal(raw, &reply) != nil {
 				continue
 			}
+			resp := wire.SelectResponse(reply.terminal)
+			resp.Next = decodeActionNext(reply.Next)
 			if session.final(resp) {
 				select {
 				case registry.resume <- session:

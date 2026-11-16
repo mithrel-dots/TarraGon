@@ -397,6 +397,8 @@ To show the effect of an action on the selected list, include a single `next` ob
 
 A persistent handler puts the same `next` on its `select_response`, with `action_id` if it declared that capability. An action can explicitly request refresh even with `success:false`, for example if it changed some state before failing. To keep the list visible after success, give the offered row action `type:"keep_open"`.
 
+If `next` is malformed, the daemon discards the continuation and still delivers the handler's outcome.
+
 The daemon consumes `next:{"type":"refresh"}`: it queues the action outcome, then sends only the **original producer** a query with the **original resolved text**, even if the prefix has since changed. The UI and persistent producer see the same `query_id` as before; an on-call producer receives the same query argv. Neither the select nor the other producers run again. A baseline UI just gets an ordinary full snapshot for the original query.
 
 Refresh requires a retained source query and row owned by the selecting UI, an enabled producer, and consent to replay. Asking to refresh your own result gives consent for that invocation. Declare `capabilities = ["replay"]` (alongside any existing capabilities) only if your queries are safe to repeat. Another handler cannot give consent for your plugin. A missing or ineligible source simply skips refresh; the original action outcome stands.

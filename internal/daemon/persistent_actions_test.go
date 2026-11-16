@@ -173,6 +173,33 @@ func TestPersistentLegacyQueueIsBoundedAndFIFO(t *testing.T) {
 	checkPersistentQuery(t, f, plugin)
 }
 
+func TestPersistentLegacyQueueAdvancesAfterMalformedNext(t *testing.T) {
+	f := persistentFixture(t, false, 2*time.Second)
+	plugin := persistentPlugin(t, f, "p")
+	ui := f.connectUI(t, f.requests)
+	a := ui.selectRow(t, click("a"))
+	plugin.expectSelect(t, "a", "")
+	b := ui.selectRow(t, click("b"))
+	ui.expectStatus(t)
+	checkPersistentQuery(t, f, plugin) // the second select has reached the router
+
+	for _, frame := range []json.RawMessage{
+		json.RawMessage(`{"type":"select_response","action_id":42,"success":true}`),
+		json.RawMessage(`{"type":"select_response","success":"yes"}`),
+		json.RawMessage(`{"type":"select_response","success":true,"message":42}`),
+		json.RawMessage(`{"type":"select_response","success":true,"message":"saved","next":{"type":"open","destination":{"plugin":"p","context":42}}}`),
+	} {
+		plugin.send(t, frame)
+	}
+	if r := ui.outcome(t, a, true, ""); r.Message != "saved" || r.Next != nil {
+		t.Fatalf("malformed next changed the terminal outcome: %+v", r)
+	}
+	plugin.expectSelect(t, "b", "")
+	plugin.reply(t, "", "second done", true)
+	ui.outcome(t, b, true, "")
+	ui.expectStatus(t) // neither action produced a second terminal reply
+}
+
 func TestPersistentLegacyQueuedExpiry(t *testing.T) {
 	f := persistentFixture(t, false, 2*time.Second)
 	p := persistentPlugin(t, f, "p")

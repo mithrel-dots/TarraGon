@@ -176,6 +176,32 @@ func TestOnCallActionStartAndExitFailures(t *testing.T) {
 	}
 }
 
+func TestOnCallActionIgnoresMalformedNext(t *testing.T) {
+	for _, tc := range []struct {
+		name, stdout, code, message string
+		success                     bool
+	}{
+		{name: "explicit success", stdout: `{"success":true,"message":"saved","next":{"type":"open","destination":{"plugin":"plain","context":42}}}`, success: true, message: "saved"},
+		{name: "default success", stdout: `{"message":"saved","next":[]}`, success: true, message: "saved"},
+		{name: "explicit failure", stdout: `{"success":false,"message":"stale","next":{"type":"open","destination":{"plugin":"plain","context":42}}}`, message: "stale"},
+		{name: "bad success", stdout: `{"success":"yes","next":[]}`, code: "completion_unknown", message: "invalid select response JSON"},
+		{name: "bad message", stdout: `{"message":42,"next":[]}`, code: "completion_unknown", message: "invalid select response JSON"},
+		{name: "bad root", stdout: `null`, code: "completion_unknown", message: "invalid select response JSON"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeScript(t, dir, "plain.sh", "#!/bin/sh\nprintf '%s' '"+tc.stdout+"'\n")
+			ui := openOnCallTestUI(t, testBus(t, t.Context()), dir, 2*time.Second)
+			ack := ui.selectRow(t, wire.UIRequest{Plugin: "plain", ResultID: "one"})
+			resp := ui.outcome(t, ack, tc.success, tc.code)
+			if resp.Next != nil || !strings.Contains(resp.Message, tc.message) {
+				t.Fatalf("unexpected outcome: %+v", resp)
+			}
+			ui.expectStatus(t)
+		})
+	}
+}
+
 func TestOnCallActionExpiredBeforeStart(t *testing.T) {
 	dir := t.TempDir()
 	writeScript(t, dir, "plain.sh", "#!/bin/sh\ntouch \"${0%/*}/ran\"\n")
