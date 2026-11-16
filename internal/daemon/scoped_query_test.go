@@ -211,14 +211,32 @@ func TestScopedPersistentNativeFrames(t *testing.T) {
 	sendPlugin(wire.PluginResponse{Type: wire.MsgResponse, QueryID: id, Data: json.RawMessage(`["row"]`)})
 	refreshSnapshot(t, read, id, func(q aggregate) bool { return q.Plugins["catalog"].State == "done" })
 	otherSend, otherRead := open("ui")
+	otherSend(wire.UIRequest{Type: wire.MsgSelect, ClientID: "shared", Plugin: "catalog", QueryID: id, ResultID: "row", Action: "mark", RequestID: "foreign"})
+	var receipt wire.SelectAck
+	otherRead(&receipt)
+	if receipt.Type != "ok" || receipt.ActionID == "" || receipt.RequestID != "foreign" {
+		t.Fatalf("bad receipt for foreign select: %+v", receipt)
+	}
+	var rejected wire.SelectResponse
+	otherRead(&rejected)
+	if rejected.Type != wire.MsgSelectResponse || rejected.ActionID != receipt.ActionID || rejected.RequestID != receipt.RequestID ||
+		rejected.Success || rejected.Code != "not_run" {
+		t.Fatalf("bad outcome for foreign select: %+v", rejected)
+	}
+	// Fence the foreign select before checking the next plugin frame.
+	otherSend(wire.UIRequest{Type: wire.MsgStatus})
+	var status wire.StatusResponse
+	otherRead(&status)
+	if status.Type != wire.MsgStatus {
+		t.Fatalf("unexpected frame after foreign select outcome: %+v", status)
+	}
 	for _, tc := range []struct {
 		send                        func(any)
 		read                        func(any)
 		queryID, supplied, expected string
 	}{
 		{send, read, id, "override", "show:42"},
-		{otherSend, otherRead, id, "", ""},
-		{send, read, "", "direct", "direct"},
+		{otherSend, otherRead, "", "direct", "direct"},
 	} {
 		tc.send(wire.UIRequest{Type: wire.MsgSelect, ClientID: "shared", Plugin: "catalog", QueryID: tc.queryID, ResultID: "row", Action: "mark", Context: tc.supplied})
 		var receipt wire.SelectAck

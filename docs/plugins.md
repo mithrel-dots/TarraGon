@@ -185,7 +185,7 @@ UI → daemon       {"type":"select","plugin":"catalog","query_id":"q2","result_
 daemon → catalog  {"type":"select","query_id":"q2","context":"show:42","result_id":"episode:2","action":"play"}
 ```
 
-A select can supply `context` directly. When the same UI selects from its retained query for that handler, the recorded context takes precedence, including an empty context. Another UI cannot inherit it by copying the query ID. Invalid select context yields the normal `ok` followed by `select_response` with `code:"not_run"`. A producer refresh reuses the recorded text and context.
+A select can supply `context` directly. When the same UI selects from its retained query for that handler, the recorded context takes precedence, including an empty context. A select naming another UI's retained query or supplying invalid context yields the normal `ok` followed by `select_response` with `code:"not_run"`. A producer refresh reuses the recorded text and context.
 
 An `on_call` plugin reads nonempty context from **`TARRAGON_CONTEXT`** for that invocation. Without context the variable is absent, even if it was set in the daemon's environment. The example above runs `entrypoint tarragon query ""` and `entrypoint tarragon select "episode:2" "play"`; context adds no argv slot.
 

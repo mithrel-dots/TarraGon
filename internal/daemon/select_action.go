@@ -83,7 +83,11 @@ func (ui *uiRegistry) acceptSelect(session context.Context, client *uiClient, re
 		return nil
 	}
 	invalidOffer := req.OfferID != "" || legacyOfferName(req.Action)
-	if q := ui.store.query(a.queryID); q != nil && q.session == a.owner {
+	if q := ui.store.query(a.queryID); q != nil {
+		if q.session != a.owner {
+			a.notRun("The source query belongs to another UI session.")
+			return nil
+		}
 		a.wantsNavigation = slices.Contains(q.uiFeatures, navigationFeature)
 		q.mu.Lock()
 		if q.ctx.Err() == nil && (q.target == a.handler || q.producers[a.handler] != nil) {

@@ -67,7 +67,9 @@ plugin in `error`; the daemon doesn't search other plugins.
 `context` is optional, non-secret UTF-8 (at most 4096 bytes, no NUL). A query
 with invalid context or context without a target gets `error` before dispatch.
 A select on an owned source query uses its recorded context for that producer.
-For a direct select without that source, supply the plugin's context explicitly.
+A select naming another session's retained query returns `ok` followed by
+`not_run`. When the source is omitted or no longer retained, an ordinary select
+can supply the plugin's context explicitly.
 
 ### Ending one query
 
