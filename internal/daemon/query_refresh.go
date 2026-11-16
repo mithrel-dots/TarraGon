@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"maps"
 	"slices"
 	"time"
@@ -171,8 +172,10 @@ func (d *producerDispatch) result(start time.Time, data json.RawMessage, err err
 	d.runFollowup(reason)
 }
 
-// Only a successfully encoded request can take ownership of replies and end.
-func (s *aggregateStore) beginQueryWrite(req pluginRequest, encodingErr error) bool {
+var errUnansweredRemovedQueries = errors.New("plugin has too many unanswered ended queries")
+
+// Only an admitted, successfully encoded request can take ownership of replies and end.
+func (s *aggregateStore) beginQueryWrite(req pluginRequest, writeErr error) bool {
 	q := s.query(req.queryID)
 	if q == nil {
 		return false
@@ -183,14 +186,18 @@ func (s *aggregateStore) beginQueryWrite(req pluginRequest, encodingErr error) b
 		q.mu.Unlock()
 		return false
 	}
-	conn, _ := d.registry.getConn(req.name)
-	if conn != req.conn {
+	session := d.registry.session(req.name)
+	if session == nil || session.conn != req.conn {
 		q.mu.Unlock()
 		return false
 	}
 	d.mgr.RLock()
 	p := d.eligiblePluginLocked(d.reason)
-	if p == nil || encodingErr != nil {
+	endCapable := p != nil && slices.Contains(p.Config.Capabilities, wire.MsgEnd)
+	if p != nil && writeErr == nil && !endCapable && session.removedQueryLimitReached() {
+		writeErr = errUnansweredRemovedQueries
+	}
+	if p == nil || writeErr != nil {
 		// Config may have changed while waiting for hello or the writer.
 		d.mgr.RUnlock()
 		d.conn = nil
@@ -201,7 +208,7 @@ func (s *aggregateStore) beginQueryWrite(req pluginRequest, encodingErr error) b
 		}
 		message := "plugin disabled"
 		if p != nil {
-			message = encodingErr.Error()
+			message = writeErr.Error()
 		}
 		reason := d.completeLocked()
 		s.submitErrorLocked(q, req.name, 0, message, d.ui.publishSnapshot)
@@ -209,11 +216,11 @@ func (s *aggregateStore) beginQueryWrite(req pluginRequest, encodingErr error) b
 		return false
 	}
 	d.started = time.Now()
-	if d.updatesFrom != conn {
+	if d.updatesFrom != req.conn {
 		d.live = false
 	}
-	d.updatesFrom = conn
-	d.endCapable = slices.Contains(p.Config.Capabilities, wire.MsgEnd)
+	d.updatesFrom = req.conn
+	d.endCapable = endCapable
 	d.mgr.RUnlock()
 	q.mu.Unlock()
 	return true

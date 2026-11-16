@@ -212,23 +212,56 @@ func TestLateLiveResponseWhileTerminalWatchPublishes(t *testing.T) {
 	expectPluginQueryFrame(t, p, wire.MsgRequest, fence)
 }
 
-func TestEndQueryBoundsUnansweredRemovedRequests(t *testing.T) {
-	f := newAdmissionFixture(t, time.Second)
+func TestEndQueryBackpressurePreservesPluginSession(t *testing.T) {
+	f := newAdmissionFixture(t, 2*time.Second)
 	f.configure("p", plugins.LifecycleDaemon, true, "")
 	p := persistentPlugin(t, f, "p")
 	u := f.connectUI(t, f.requests)
+	owner := f.connectUI(t, f.requests)
+	live := watchQuery(t, owner, true)
+	watchRequest(t, p, live)
+	watchFrame(t, p, live, wire.MsgResponse, `["live"]`, true, false)
+	watchRows(t, owner, live, "live")
+	selection := owner.selectRow(t, click("selected"))
+	p.expectSelect(t, "selected", "")
+
+	// Both requests are on the wire before the first removal reaches the limit.
+	first := pendingEndTestQuery(t, u, "at limit", "")
+	expectPluginQueryFrame(t, p, wire.MsgRequest, first)
+	second := pendingEndTestQuery(t, u, "already dispatched", "")
+	expectPluginQueryFrame(t, p, wire.MsgRequest, second)
 	session := f.registry.session("p")
-	for i := range maxUnansweredRemovedQueries {
-		if session.rememberRemovedQuery(strconv.Itoa(i)) {
-			t.Fatal("original connection exceeded its limit too early")
-		}
+	for i := range maxUnansweredRemovedQueries - 1 {
+		session.rememberRemovedQuery(strconv.Itoa(i))
 	}
-	id := pendingEndTestQuery(t, u, "overflow", "")
-	expectPluginQueryFrame(t, p, wire.MsgRequest, id)
-	endTestQuery(t, u, id)
-	if f.registry.isConnected("p") {
-		t.Fatal("unanswered request was dropped without retiring its original connection")
+	endTestQuery(t, u, first)
+	endTestQuery(t, u, second)
+	expectRejected := func() {
+		t.Helper()
+		id := pendingEndTestQuery(t, u, "backpressure", "")
+		refreshSnapshot(t, func(v any) { u.read(t, v) }, id, func(q aggregate) bool {
+			return q.Plugins["p"].Error == errUnansweredRemovedQueries.Error()
+		})
 	}
+	expectRejected()
+
+	p.reply(t, "", "completed", true)
+	owner.outcome(t, selection, true, "")
+	watchFrame(t, p, live, wire.MsgLiveUpdate, `["still live"]`, false, false)
+	watchRows(t, owner, live, "still live")
+
+	watchFrame(t, p, second, wire.MsgResponse, `["late opt-in"]`, true, false)
+	expectPluginQueryFrame(t, p, wire.MsgEnd, second)
+	watchFrame(t, p, second, wire.MsgResponse, `["duplicate"]`, true, false)
+	p.readBarrier(t)
+	expectRejected() // this reply cleared only one ID, leaving the count at the limit
+
+	watchFrame(t, p, first, wire.MsgResponse, `["ordinary reply"]`, false, false)
+	p.readBarrier(t)
+	recovered := pendingEndTestQuery(t, u, "recovered", "")
+	expectPluginQueryFrame(t, p, wire.MsgRequest, recovered)
+	watchFrame(t, p, recovered, wire.MsgResponse, `["recovered"]`, false, false)
+	watchRows(t, u, recovered, "recovered")
 }
 
 func TestEndQuerySupersessionAndEviction(t *testing.T) {
