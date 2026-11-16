@@ -22,7 +22,7 @@ type aggResult struct {
 	items          []wire.ResultItem   // normalized, with the original plugin scores
 	watchBytes     int64               // charged only while this query holds a reservation
 	ordered        bool                // preserve array order only in a targeted query
-	blockedSelects map[string][]string // row ID → names hidden or reserved for navigation
+	blockedSelects map[string][]string // row ID → unavailable or non-select action names
 }
 
 type aggPluginState struct {
@@ -451,7 +451,7 @@ func parseResult(plugin string, raw json.RawMessage, elapsed float64) (aggResult
 		errMsg := readStringField(obj, "error")
 		for _, k := range []string{"suggestions", "variants", "items", "choices", "results"} {
 			if arr, ok := obj[k]; ok {
-				if items := parseArrayItems(plugin, arr); len(items) > 0 {
+				if items := result.parseArrayItems(plugin, arr); len(items) > 0 {
 					result.items = items
 					result.ordered = string(obj["ordered"]) == "true"
 					return result, errMsg
@@ -459,23 +459,23 @@ func parseResult(plugin string, raw json.RawMessage, elapsed float64) (aggResult
 			}
 		}
 		// Single object with id/label/title/text.
-		if item, ok := parseObjectItem(plugin, obj); ok {
+		if item, ok := result.parseObjectItem(plugin, obj); ok {
 			result.items = []wire.ResultItem{item}
 		}
 		return result, errMsg
 	}
 	// Top-level array.
-	result.items = parseArrayItems(plugin, raw)
+	result.items = result.parseArrayItems(plugin, raw)
 	return result, ""
 }
 
-func parseArrayItems(plugin string, raw json.RawMessage) []wire.ResultItem {
+func (r *aggResult) parseArrayItems(plugin string, raw json.RawMessage) []wire.ResultItem {
 	// Array of objects.
 	var objs []map[string]json.RawMessage
 	if json.Unmarshal(raw, &objs) == nil && len(objs) > 0 {
 		out := make([]wire.ResultItem, 0, len(objs))
 		for _, o := range objs {
-			if item, ok := parseObjectItem(plugin, o); ok {
+			if item, ok := r.parseObjectItem(plugin, o); ok {
 				out = append(out, item)
 			}
 		}
@@ -495,7 +495,7 @@ func parseArrayItems(plugin string, raw json.RawMessage) []wire.ResultItem {
 	return nil
 }
 
-func parseObjectItem(plugin string, obj map[string]json.RawMessage) (wire.ResultItem, bool) {
+func (r *aggResult) parseObjectItem(plugin string, obj map[string]json.RawMessage) (wire.ResultItem, bool) {
 	id := readStringField(obj, "id")
 	label := readStringField(obj, "label")
 	if label == "" {
@@ -511,7 +511,7 @@ func parseObjectItem(plugin string, obj map[string]json.RawMessage) (wire.Result
 		id = label
 	}
 	score := readFloatField(obj, "score")
-	actions := readActionsField(obj, "actions")
+	actions := r.readActions(id, obj["actions"])
 	description := readStringField(obj, "description")
 	icon := readStringField(obj, "icon")
 	category := readStringField(obj, "category")
@@ -554,21 +554,57 @@ func readFloatField(obj map[string]json.RawMessage, key string) float64 {
 	return 0
 }
 
-func readActionsField(obj map[string]json.RawMessage, key string) []wire.Action {
-	raw, ok := obj[key]
-	if !ok {
+func (r *aggResult) readActions(row string, raw json.RawMessage) []wire.Action {
+	if len(raw) == 0 {
 		return nil
 	}
 	var actions []wire.Action
-	if json.Unmarshal(raw, &actions) == nil {
-		// Only the daemon can issue a cross-plugin offer.
-		for i := range actions {
-			actions[i].Secondary = false
-			actions[i].OfferID = ""
-		}
-		return actions
+	if json.Unmarshal(raw, &actions) != nil {
+		actions = r.recoverActions(row, raw)
 	}
-	return nil
+	// Only the daemon can issue a cross-plugin offer.
+	for i := range actions {
+		actions[i].Secondary = false
+		actions[i].OfferID = ""
+	}
+	return actions
+}
+
+func (r *aggResult) recoverActions(row string, raw json.RawMessage) []wire.Action {
+	var entries []json.RawMessage
+	if json.Unmarshal(raw, &entries) != nil {
+		return nil
+	}
+	actions := make([]wire.Action, 0, len(entries))
+	var hasDefault, brokenFirst, brokenDefault bool
+	for i, entry := range entries {
+		var action wire.Action
+		if json.Unmarshal(entry, &action) == nil {
+			actions = append(actions, action)
+			hasDefault = hasDefault || action.Default
+			continue
+		}
+		var header struct {
+			Name    string
+			Default json.RawMessage
+		}
+		_ = json.Unmarshal(entry, &header)
+		if header.Name != "" {
+			r.blockSelect(row, header.Name)
+		}
+		brokenFirst = brokenFirst || i == 0
+		// A malformed default flag could have been intended to select this action.
+		switch string(header.Default) {
+		case "", "false", "null":
+		default:
+			brokenDefault = brokenDefault || !hasDefault
+		}
+	}
+	if brokenDefault || brokenFirst && !hasDefault {
+		// Projection must not use a surviving action as an implicit primary.
+		r.blockSelect(row, "")
+	}
+	return actions
 }
 
 func orderResults(items []wire.ResultItem, mode string, frecencyScores map[string]float64, weight float64) []wire.ResultItem {

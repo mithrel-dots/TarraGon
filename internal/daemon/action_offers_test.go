@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -14,6 +15,58 @@ import (
 )
 
 var wallpaperRule = plugins.Handler{Plugin: "wallpaper", Action: "set", Label: "Set as wallpaper", Accepts: "file", MIME: "image/*"}
+
+func TestMalformedRowActions(t *testing.T) {
+	f := newAdmissionFixture(t, 5*time.Second)
+	f.configure("finder", plugins.LifecycleDaemon, true, "")
+	finder := f.connectPlugin(t, "finder")
+	owner := f.connectUI(t, f.requests)
+	owner.send(t, wire.UIRequest{Type: "query", Plugin: "finder", UIFeatures: []string{navigationFeature}})
+	var ack wire.AckMessage
+	owner.read(t, &ack)
+	var query wire.PluginRequest
+	finder.read(t, &query)
+
+	const raw = `{"id":"opens","actions":[{"name":"open","type":"open","destination":{"plugin":"finder","context":"child"},"default":true,"secondary":true,"offer_id":"forged","future":{"flag":true}},{"name":"bad","requires":"navigation"}]}`
+	finder.send(t, wire.PluginResponse{Type: wire.MsgResponse, QueryID: query.QueryID, Data: json.RawMessage(raw)})
+	snap := refreshSnapshot(t, func(v any) { owner.read(t, v) }, ack.QueryID, func(a aggregate) bool {
+		return a.Plugins["finder"].State == "done"
+	})
+	if len(snap.List) != 1 || string(snap.Results["finder"].Data) != raw {
+		t.Fatalf("changed rows or raw data: %+v", snap)
+	}
+	row := snap.List[0]
+	if len(row.Actions) != 1 {
+		t.Fatalf("wanted only the valid Open: %+v", row.Actions)
+	}
+	open := row.Actions[0]
+	if open.Name != "open" || open.Type != wire.ActionTypeOpen || !open.Default || open.Secondary ||
+		open.OfferID != "" || open.Destination == nil || open.Destination.Context != "child" {
+		t.Fatalf("Open changed or forged an offer: %+v", open)
+	}
+	choice := wire.UIRequest{QueryID: ack.QueryID, Plugin: row.Plugin, ResultID: row.ID, Action: "bad"}
+	owner.outcome(t, owner.selectRow(t, choice), false, "not_run")
+	finder.expectNoWrite(t)
+}
+
+func TestMalformedPrimaryActionMarksImplicitSelectBlocked(t *testing.T) {
+	const raw = `[
+		{"id":"default","actions":[{"name":"delete"},{"name":"open","type":"open","default":true,"requires":42}]},
+		{"id":"first","actions":[{"name":"open","type":"open","requires":"navigation"},{"name":"delete"}]},
+		{"id":"sole","actions":[{"name":"open","type":"open","requires":42}]},
+		{"id":"later-default","actions":[{"name":"open","type":"open","requires":42},{"name":"delete","default":true}]}
+	]`
+	res, _ := parseResult("finder", json.RawMessage(raw), 0)
+	want := []string{"open", ""}
+	for _, row := range []string{"default", "first", "sole"} {
+		if got := res.blockedSelects[row]; !slices.Equal(got, want) {
+			t.Errorf("%s blocked %q, want %q", row, got, want)
+		}
+	}
+	if got := res.blockedSelects["later-default"]; !slices.Equal(got, []string{"open"}) {
+		t.Errorf("valid explicit default was blocked: %q", got)
+	}
+}
 
 func TestActionOfferProjection(t *testing.T) {
 	mgr := plugins.NewManager(t.TempDir())
