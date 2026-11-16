@@ -95,6 +95,8 @@ A reserved view survives other clients' searches, including while the first repl
 
 Check `watch_error` in the **decoded snapshot**. If capacity is unavailable, the daemon acknowledges the query, then sends an empty snapshot explaining the refusal; no plugin is invoked. If a replacement would exceed the byte budget, the final snapshot keeps the previous valid rows and explains the limit. A watch still waiting for initial replies ends after five seconds unless a producer has confirmed a live feed. After that deadline, silent producers cannot keep the reservation when the last live feed stops. Other watches are unaffected. The separate 8 MiB **encoded envelope** limit still yields a query-scoped `error` instead of the oversized update; it does not disconnect the session.
 
+If a producer sends its final live update while its refresh is queued or running, the watch stays reserved for up to five seconds while that refresh (or its queued follow-up) can renew the feed with `live:true`. If no feed remains, completing the refresh without renewal returns the query to ordinary history; a timeout ends the watch with `watch_error`.
+
 ## Reading snapshots and control replies
 
 Multiple queries can run concurrently on one session. Read continuously and dispatch messages by `type`. A snapshot is the whole list so far. The aggregate publisher can combine multiple plugin responses, and the UI writer can replace a queued snapshot with a newer one for the same `query_id`. Replacement only happens between control messages or flush barriers: a terminal reply is never coalesced, and a later snapshot cannot overtake it. Use the `plugins` map to detect pending/empty/error states instead of counting updates; `started_at_unix_ms` gives the query's start time.

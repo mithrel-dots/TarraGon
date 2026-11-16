@@ -42,6 +42,7 @@ type producerDispatch struct {
 	conn        peerConn
 	updatesFrom peerConn       // connection that may replace its last result without a new request
 	live        bool           // updatesFrom opted in for this query
+	renewal     *time.Timer    // watch hold after a final push during a refresh
 	reason      dispatchReason // authorization to recheck when a queued write begins
 	started     time.Time
 	endCapable  bool // manifest promise at the start of this request's write
@@ -110,16 +111,36 @@ func (s *aggregateStore) refreshAction(a *selectAction) {
 // Only a definite end to this request releases the dispatch slot. In
 // particular, a quiet but connected legacy plugin may still answer later.
 func (d *producerDispatch) complete() {
-	d.q.mu.Lock()
-	defer d.q.mu.Unlock()
-	d.completeLocked()
+	q := d.q
+	q.mu.Lock()
+	held := d.renewal != nil
+	reason := d.completeLocked()
+	demote := held && !q.publishing && q.watchFinishedLocked()
+	q.mu.Unlock()
+	if demote {
+		// The writer may be the caller; eviction can enqueue an end on it.
+		go d.store.demoteWatch(q)
+	}
+	d.runFollowup(reason)
 }
 
-func (d *producerDispatch) completeLocked() {
+// Settle the slot and watch hold before publishing its answer. A queued
+// follow-up can still renew the watch within the same deadline.
+func (d *producerDispatch) completeLocked() dispatchReason {
 	reason := d.again
 	d.again = initialDispatch
 	d.outstanding = reason != initialDispatch && d.q.ctx.Err() == nil
-	if d.outstanding {
+	if d.live || !d.outstanding {
+		d.stopWatchRenewalLocked()
+	}
+	if !d.outstanding {
+		return initialDispatch
+	}
+	return reason
+}
+
+func (d *producerDispatch) runFollowup(reason dispatchReason) {
+	if reason != initialDispatch {
 		go d.run(reason)
 	}
 }
@@ -132,8 +153,10 @@ func elapsedMillis(start time.Time) float64 {
 }
 
 func (d *producerDispatch) fail(start time.Time, message string) {
-	d.store.submitError(d.q.QueryID, d.name, elapsedMillis(start), message, d.ui.publishSnapshot)
-	d.complete()
+	d.q.mu.Lock()
+	reason := d.completeLocked()
+	d.store.submitErrorLocked(d.q, d.name, elapsedMillis(start), message, d.ui.publishSnapshot)
+	d.runFollowup(reason)
 }
 
 func (d *producerDispatch) result(start time.Time, data json.RawMessage, err error) {
@@ -141,8 +164,11 @@ func (d *producerDispatch) result(start time.Time, data json.RawMessage, err err
 		d.fail(start, err.Error())
 		return
 	}
-	d.store.SubmitResponse(d.name, wire.PluginResponse{QueryID: d.q.QueryID, Data: data}, elapsedMillis(start), d.ui.publishSnapshot)
-	d.complete()
+	result, errMsg := parseResult(d.name, data, elapsedMillis(start))
+	d.q.mu.Lock()
+	reason := d.completeLocked()
+	d.store.replaceResultLocked(d.q, d.name, result, errMsg, d.ui.publishSnapshot)
+	d.runFollowup(reason)
 }
 
 // Only a successfully encoded request can take ownership of replies and end.
@@ -168,15 +194,18 @@ func (s *aggregateStore) beginQueryWrite(req pluginRequest, encodingErr error) b
 		// Config may have changed while waiting for hello or the writer.
 		d.mgr.RUnlock()
 		d.conn = nil
-		d.completeLocked()
-		switch {
-		case p == nil && d.reason == initialDispatch:
-			s.submitErrorLocked(q, req.name, 0, "plugin disabled", d.ui.publishSnapshot)
-		case p != nil:
-			s.submitErrorLocked(q, req.name, 0, encodingErr.Error(), d.ui.publishSnapshot)
-		default:
-			q.mu.Unlock() // Config revoked a refresh, so leave its previous state intact.
+		if p == nil && d.reason != initialDispatch {
+			q.mu.Unlock()
+			d.complete() // Revoked refresh: release its hold without replacing prior rows.
+			return false
 		}
+		message := "plugin disabled"
+		if p != nil {
+			message = encodingErr.Error()
+		}
+		reason := d.completeLocked()
+		s.submitErrorLocked(q, req.name, 0, message, d.ui.publishSnapshot)
+		d.runFollowup(reason)
 		return false
 	}
 	d.started = time.Now()
@@ -222,20 +251,23 @@ func (s *aggregateStore) receiveQuery(name string, conn peerConn, resp wire.Plug
 		q.mu.Unlock()
 		return s.receiveCanceledQuery(q, name, conn, resp)
 	}
-	if current, _ := d.registry.getConn(name); current != conn || d.updatesFrom != conn {
+	if current, _ := d.registry.getConn(name); current != conn || d.updatesFrom != conn || push && !d.live {
 		q.mu.Unlock()
 		return false // the producer was retired while decoding
 	}
+	reason := initialDispatch
 	if !start.IsZero() {
 		d.conn, d.started = nil, time.Time{}
 		d.live = resp.Live
+		reason = d.completeLocked()
 	} else if push && resp.Final {
 		d.live = false
+		if q.watch != nil && d.outstanding {
+			d.holdWatchRenewalLocked()
+		}
 	}
 	s.replaceResultLocked(q, name, result, errMsg, d.ui.publishSnapshot)
-	if !start.IsZero() {
-		d.complete()
-	}
+	d.runFollowup(reason)
 	return false
 }
 
@@ -283,9 +315,11 @@ func (s *aggregateStore) retireQueries(name string, conn peerConn) {
 			q.mu.Unlock()
 			continue
 		}
-		s.submitErrorLocked(q, name, elapsedMillis(start), "plugin disconnected", d.ui.publishSnapshot)
+		reason := initialDispatch
 		if lostRequest {
-			d.complete()
+			reason = d.completeLocked()
 		}
+		s.submitErrorLocked(q, name, elapsedMillis(start), "plugin disconnected", d.ui.publishSnapshot)
+		d.runFollowup(reason)
 	}
 }

@@ -373,13 +373,17 @@ func (s *aggregateStore) drain(q *queryState, publish SnapshotPublisher) {
 	for {
 		q.mu.Lock()
 		changed := q.changed
+		finished := q.watchFinishedLocked()
 		if len(changed) == 0 {
 			q.publishing = false
 			q.mu.Unlock()
+			if finished {
+				s.demoteWatch(q)
+			}
 			return
 		}
 		q.changed = nil
-		terminal, finished := q.WatchError != "", q.watchFinishedLocked()
+		terminal := q.WatchError != ""
 		if data, ok := s.encodeUnlocked(q); ok && s.query(q.QueryID) == q {
 			publish(&wire.UpdateMessage{Type: "update", QueryID: q.QueryID, Payload: data}, changed)
 		}

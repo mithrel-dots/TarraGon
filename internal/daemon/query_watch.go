@@ -92,6 +92,9 @@ func (s *aggregateStore) forgetRetentionLocked(q *queryState) {
 		return
 	}
 	q.stopWatchTimerLocked()
+	for _, d := range q.producers {
+		d.stopWatchRenewalLocked()
+	}
 	s.watches.change(q.session, -1, -q.watch.bytes)
 	q.watch = nil
 }
@@ -132,6 +135,35 @@ func (s *aggregateStore) expireInitialWatch(q *queryState) {
 	s.stopWatchLocked(q, "watch timed out waiting for initial responses", q.watch.publish)
 }
 
+func (d *producerDispatch) holdWatchRenewalLocked() {
+	if d.renewal != nil {
+		return
+	}
+	q := d.q
+	// Once a live feed has ended, only its refresh can extend this hold.
+	q.stopWatchTimerLocked()
+	var timer *time.Timer
+	timer = time.AfterFunc(d.store.watches.timeout, func() {
+		q.mu.Lock()
+		if d.renewal == timer && q.ctx.Err() == nil {
+			d.renewal = nil
+			if q.watchFinishedLocked() {
+				d.store.stopWatchLocked(q, "watch timed out waiting for a refresh response", q.watch.publish)
+				return
+			}
+		}
+		q.mu.Unlock()
+	})
+	d.renewal = timer
+}
+
+func (d *producerDispatch) stopWatchRenewalLocked() {
+	if d.renewal != nil {
+		d.renewal.Stop()
+		d.renewal = nil
+	}
+}
+
 func (q *queryState) stopWatchTimerLocked() {
 	if q.watch.timer != nil {
 		q.watch.timer.Stop()
@@ -157,7 +189,15 @@ func (s *aggregateStore) stopWatchLocked(q *queryState, reason string, publish S
 }
 
 func (q *queryState) watchFinishedLocked() bool {
-	return q.watch != nil && q.WatchError == "" && q.watch.timer == nil && !q.hasLiveProducerLocked()
+	if q.watch == nil || q.WatchError != "" || q.watch.timer != nil {
+		return false
+	}
+	for _, d := range q.producers {
+		if d.live || d.renewal != nil {
+			return false
+		}
+	}
+	return true
 }
 
 func (q *queryState) hasLiveProducerLocked() bool {

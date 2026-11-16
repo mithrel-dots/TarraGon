@@ -3,6 +3,7 @@ package daemon
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"strings"
 	"testing"
 	"time"
@@ -281,12 +282,19 @@ func TestWatchMultipleProducersAndDisconnect(t *testing.T) {
 
 func TestLivePushDoesNotCompleteRefresh(t *testing.T) {
 	f := newAdmissionFixture(t, time.Second)
+	f.store.limit = 1
 	f.configure("p", plugins.LifecycleDaemon, true, "")
+	f.configure("silent", plugins.LifecycleDaemon, true, "")
 	p := f.connectPlugin(t, "p")
+	silent := f.connectPlugin(t, "silent")
 	other := f.connectPlugin(t, "foreign")
 	a := f.connectUI(t, f.requests)
-	id := watchQuery(t, a, true)
+	a.send(t, wire.UIRequest{Type: "query", Text: "all", Watch: true})
+	var ack wire.AckMessage
+	a.read(t, &ack)
+	id := ack.QueryID
 	watchRequest(t, p, id)
+	watchRequest(t, silent, id)
 	watchFrame(t, p, id, wire.MsgResponse, `["row"]`, true, false)
 	watchRows(t, a, id, "row")
 	q := f.store.query(id)
@@ -295,8 +303,15 @@ func TestLivePushDoesNotCompleteRefresh(t *testing.T) {
 	watchRequest(t, p, id)
 	f.store.refreshAction(action)
 	watchFrame(t, other, id, wire.MsgLiveUpdate, `["foreign"]`, false, false)
-	watchFrame(t, p, id, wire.MsgLiveUpdate, `["push"]`, false, false)
+	watchFrame(t, p, id, wire.MsgLiveUpdate, `["push"]`, false, true)
 	watchRows(t, a, id, "push")
+	f.store.WaitForPublications()
+	for _, ordinary := range []string{"older", "newer"} {
+		f.store.create(ordinary, "other", "ordinary history")
+	}
+	if f.store.query(id) != q || totalWatchUsage(f.store).count != 1 {
+		t.Fatal("final push demoted the watch while a refresh was running")
+	}
 	q.mu.Lock()
 	d := q.producers["p"]
 	held := d.outstanding && !d.started.IsZero() && d.again == producerRefresh
@@ -304,9 +319,23 @@ func TestLivePushDoesNotCompleteRefresh(t *testing.T) {
 	if !held {
 		t.Fatal("push acknowledged the outstanding refresh or cleared its dirty bit")
 	}
-	watchFrame(t, p, id, wire.MsgResponse, `["answer"]`, true, false)
+	watchFrame(t, p, id, wire.MsgResponse, `["answer"]`, false, false)
 	watchRequest(t, p, id) // exactly one queued replay
 	watchRows(t, a, id, "answer")
+	f.store.WaitForPublications()
+	f.store.create("another", "other", "ordinary history")
+	if f.store.query(id) != q || totalWatchUsage(f.store).count != 1 {
+		t.Fatal("watch demoted before the queued follow-up could renew it")
+	}
+	watchFrame(t, p, id, wire.MsgResponse, `["renewed"]`, true, false)
+	watchRows(t, a, id, "renewed")
+	watchFrame(t, p, id, wire.MsgLiveUpdate, `["back live"]`, false, false)
+	watchRows(t, a, id, "back live")
+	action.resultID = "back live"
+	f.store.refreshAction(action)
+	watchRequest(t, p, id)
+	watchFrame(t, p, id, wire.MsgLiveUpdate, `["last"]`, false, true)
+	watchRows(t, a, id, "last")
 	watchFrame(t, p, id, wire.MsgResponse, `["complete"]`, false, false)
 	watchRows(t, a, id, "complete")
 	f.store.WaitForPublications()
@@ -320,6 +349,115 @@ func TestLivePushDoesNotCompleteRefresh(t *testing.T) {
 	watchFrame(t, p, next, wire.MsgResponse, `["next"]`, false, false)
 	watchRows(t, a, next, "next")
 	a.expectStatus(t)
+}
+
+func TestWatchRenewalBeforeWriter(t *testing.T) {
+	for _, outcome := range []string{"renew", "disconnect", "timeout"} {
+		t.Run(outcome, func(t *testing.T) { testQueuedWatchRenewal(t, outcome) })
+	}
+}
+
+func testQueuedWatchRenewal(t *testing.T, outcome string) {
+	t.Helper()
+	f := newAdmissionFixture(t, time.Second)
+	f.store.limit = 1
+	if outcome == "timeout" {
+		f.store.watches.timeout = 250 * time.Millisecond
+	}
+	f.configure("p", plugins.LifecycleDaemon, true, "")
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+	f.registry.set("p", server)
+	defer f.registry.remove("p", server)
+	out := make(chan pluginRequest, 1)
+	next := func() pluginRequest {
+		t.Helper()
+		select {
+		case req := <-out:
+			return req
+		case <-time.After(time.Second):
+			t.Fatal("no request queued")
+			return pluginRequest{}
+		}
+	}
+	updates := make(chan *wire.UpdateMessage, 4)
+	if reason := f.store.startUIQuery(t.Context(), "q", "label", "owner", wire.UIRequest{Watch: true}, "p"); reason != "" {
+		t.Fatal(reason)
+	}
+	f.store.armWatch("q", func(update *wire.UpdateMessage, _ []string) { updates <- update })
+	dispatchQuery(t.Context(), "text", "q", f.mgr, out, f.registry, f.store, f.ui, true, "p")
+	if !f.store.beginQueryWrite(next(), server) {
+		t.Fatal("initial write lost")
+	}
+	f.store.receiveQuery("p", server, wire.PluginResponse{QueryID: "q", Data: json.RawMessage(`["row"]`), Live: true})
+	f.store.refreshAction(&selectAction{queryID: "q", owner: "owner", producer: "p", handler: "p", resultID: "row", offered: true})
+	req := next() // final push arrives before the queued refresh reaches the writer
+	final := wire.PluginResponse{Type: wire.MsgLiveUpdate, QueryID: "q", Data: json.RawMessage(`["last"]`), Final: true}
+	f.store.receiveQuery("p", server, final)
+	q := f.store.query("q")
+	f.store.create("ordinary-1", "other", "older")
+	f.store.create("ordinary-2", "other", "newer")
+	q.mu.Lock()
+	d := q.producers["p"]
+	timer := d.renewal
+	pending := q.watch != nil && d.outstanding && d.started.IsZero()
+	q.mu.Unlock()
+	if !pending || timer == nil || f.store.query("q") != q || totalWatchUsage(f.store).count != 1 {
+		t.Fatal("refresh queued before the writer did not hold the reservation")
+	}
+	final.Data = json.RawMessage(`["unsolicited"]`)
+	f.store.receiveQuery("p", server, final)
+	q.mu.Lock()
+	reset := d.renewal != timer
+	q.mu.Unlock()
+	if reset {
+		t.Fatal("unsolicited push changed the renewal timer")
+	}
+	switch outcome {
+	case "renew":
+		if !f.store.beginQueryWrite(req, server) {
+			t.Fatal("refresh write lost")
+		}
+		f.store.receiveQuery("p", server, wire.PluginResponse{QueryID: "q", Data: json.RawMessage(`["renewed"]`), Live: true})
+		f.store.create("ordinary-3", "other", "newest")
+		q.mu.Lock()
+		renewed := d.live && d.renewal == nil && !d.outstanding
+		q.mu.Unlock()
+		if !renewed || !f.store.offeredRow("owner", "q", "p", "renewed") || totalWatchUsage(f.store).count != 1 {
+			t.Fatal("solicited live reply did not renew the watch")
+		}
+		final.Data = json.RawMessage(`["finished"]`)
+		f.store.receiveQuery("p", server, final)
+		if totalWatchUsage(f.store) != (watchUsage{}) || f.store.query("q") != q {
+			t.Fatal("final push without a refresh did not demote the renewed watch")
+		}
+		return
+	case "disconnect":
+		f.registry.remove("p", server)
+		f.store.retireQueries("p", server)
+		f.store.WaitForPublications()
+		q.mu.Lock()
+		disconnected := !d.outstanding && d.renewal == nil && q.Plugins["p"].Error == "plugin disconnected"
+		q.mu.Unlock()
+		if !disconnected || totalWatchUsage(f.store) != (watchUsage{}) || f.store.query("q") != q {
+			t.Fatal("disconnect did not retire the queued refresh and demote the watch")
+		}
+		return
+	}
+	snap := refreshSnapshot(t, func(v any) {
+		select {
+		case update := <-updates:
+			*v.(*wire.UpdateMessage) = *update
+		case <-time.After(time.Second):
+			t.Fatal("watch did not publish its renewal timeout")
+		}
+	}, "q", func(s aggregate) bool { return s.WatchError != "" })
+	f.store.WaitForPublications()
+	if !strings.Contains(snap.WatchError, "refresh response") || len(snap.List) != 1 || snap.List[0].ID != "last" ||
+		totalWatchUsage(f.store) != (watchUsage{}) || f.store.query("q") != nil || f.store.beginQueryWrite(req, server) {
+		t.Fatalf("renewal timeout did not end the queued refresh and release the watch: %+v", snap)
+	}
 }
 
 func TestWatchEnvelopeLimit(t *testing.T) {
