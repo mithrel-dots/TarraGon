@@ -19,33 +19,56 @@ var wallpaperRule = plugins.Handler{Plugin: "wallpaper", Action: "set", Label: "
 func TestMalformedRowActions(t *testing.T) {
 	f := newAdmissionFixture(t, 5*time.Second)
 	f.configure("finder", plugins.LifecycleDaemon, true, "")
+	f.configure("wallpaper", plugins.LifecycleDaemon, true, "")
+	f.mgr.Plugins["wallpaper"].BaseConfig.Handlers = []plugins.Handler{wallpaperRule}
+	if err := f.mgr.ApplyOverrides(); err != nil {
+		t.Fatal(err)
+	}
 	finder := f.connectPlugin(t, "finder")
 	owner := f.connectUI(t, f.requests)
-	owner.send(t, wire.UIRequest{Type: "query", Plugin: "finder", UIFeatures: []string{navigationFeature}})
+	owner.send(t, wire.UIRequest{Type: "query", Plugin: "finder", UIFeatures: []string{navigationFeature, actionOffersFeature}})
 	var ack wire.AckMessage
 	owner.read(t, &ack)
 	var query wire.PluginRequest
 	finder.read(t, &query)
 
-	const raw = `{"id":"opens","actions":[{"name":"open","type":"open","destination":{"plugin":"finder","context":"child"},"default":true,"secondary":true,"offer_id":"forged","future":{"flag":true}},{"name":"bad","requires":"navigation"}]}`
+	const ref = `"ref":{"type":"file","value":"/pictures/sky.png","mime":"image/png"}`
+	const raw = `{"ordered":true,"items":[` +
+		`{"id":"opens",` + ref + `,"actions":[{"name":"open","type":"open","destination":{"plugin":"finder","context":"child"},"default":true,"secondary":true,"offer_id":"forged","future":{"flag":true}},{"name":"bad","requires":"navigation"}]},` +
+		`{"id":"bad-default",` + ref + `,"actions":[{"name":"open","type":"open","destination":{"plugin":"finder"},"default":true,"requires":42},{"name":"delete"}]},` +
+		`{"id":"bad-sole",` + ref + `,"actions":[{"name":"open","type":"open","destination":{"plugin":"finder"},"requires":"navigation"}]},` +
+		`{"id":"null-first",` + ref + `,"actions":[null,{"name":"delete"}]},` +
+		`{"id":"null-only",` + ref + `,"actions":[null]},` +
+		`{"id":"wrong-entry",` + ref + `,"actions":["delete"]},` +
+		`{"id":"wrong-container",` + ref + `,"actions":42},` +
+		`{"id":"legacy","actions":[null,{"default":true}]}]}`
 	finder.send(t, wire.PluginResponse{Type: wire.MsgResponse, QueryID: query.QueryID, Data: json.RawMessage(raw)})
 	snap := refreshSnapshot(t, func(v any) { owner.read(t, v) }, ack.QueryID, func(a aggregate) bool {
 		return a.Plugins["finder"].State == "done"
 	})
-	if len(snap.List) != 1 || string(snap.Results["finder"].Data) != raw {
+	if len(snap.List) != 2 || snap.List[0].ID != "opens" || snap.List[1].ID != "legacy" ||
+		string(snap.Results["finder"].Data) != raw {
 		t.Fatalf("changed rows or raw data: %+v", snap)
 	}
-	row := snap.List[0]
-	if len(row.Actions) != 1 {
-		t.Fatalf("wanted only the valid Open: %+v", row.Actions)
+	actions := snap.List[0].Actions
+	if len(actions) != 2 || !actions[1].Secondary || actions[1].OfferID == "" || actions[1].Name != wallpaperRule.Label {
+		t.Fatalf("wanted the valid Open and a matching offer: %+v", actions)
 	}
-	open := row.Actions[0]
+	open := actions[0]
 	if open.Name != "open" || open.Type != wire.ActionTypeOpen || !open.Default || open.Secondary ||
 		open.OfferID != "" || open.Destination == nil || open.Destination.Context != "child" {
 		t.Fatalf("Open changed or forged an offer: %+v", open)
 	}
-	choice := wire.UIRequest{QueryID: ack.QueryID, Plugin: row.Plugin, ResultID: row.ID, Action: "bad"}
-	owner.outcome(t, owner.selectRow(t, choice), false, "not_run")
+	if actions := snap.List[1].Actions; len(actions) != 1 || actions[0].Name != "" || !actions[0].Default {
+		t.Fatalf("lost the legacy unnamed default: %+v", actions)
+	}
+	for _, blocked := range []struct{ row, name string }{
+		{"opens", "bad"}, {"bad-default", "open"}, {"bad-sole", "open"},
+		{"bad-default", ""}, {"bad-sole", ""}, {"null-first", ""}, {"null-only", ""}, {"wrong-entry", ""}, {"wrong-container", ""},
+	} {
+		choice := wire.UIRequest{QueryID: ack.QueryID, Plugin: "finder", ResultID: blocked.row, Action: blocked.name}
+		owner.outcome(t, owner.selectRow(t, choice), false, "not_run")
+	}
 	finder.expectNoWrite(t)
 }
 

@@ -32,9 +32,9 @@ func replacementQuery(mgr *plugins.Manager, d *wire.Destination) (string, bool) 
 
 // projectRow reports whether the row has a safe projection for this view.
 // The original plugin JSON remains in aggResult.Data.
-func (r *aggResult) projectRow(row *wire.ResultItem, features []string, mgr *plugins.Manager) bool {
+func (r *aggResult) projectRow(row *wire.ResultItem, features []string, mgr *plugins.Manager, lostPrimary bool) bool {
 	if len(row.Actions) == 0 {
-		return true
+		return !lostPrimary
 	}
 	defaultIndex := max(0, slices.IndexFunc(row.Actions, func(a wire.Action) bool { return a.Default }))
 	actions := row.Actions[:0]
@@ -45,7 +45,7 @@ func (r *aggResult) projectRow(row *wire.ResultItem, features []string, mgr *plu
 			r.blockSelect(row.ID, action.Name)
 		}
 		if allowed {
-			if i == defaultIndex {
+			if !lostPrimary && i == defaultIndex {
 				projectedDefault = len(actions)
 			}
 			actions = append(actions, action)
@@ -53,7 +53,9 @@ func (r *aggResult) projectRow(row *wire.ResultItem, features []string, mgr *plu
 	}
 	if projectedDefault < 0 {
 		if row.Plugin != plugins.OverviewID || len(actions) == 0 || actions[0].Name != "details" {
-			r.blockSelect(row.ID, "")
+			if !lostPrimary {
+				r.blockSelect(row.ID, "")
+			}
 			return false
 		}
 		// The built-in handles both "details" and an unnamed select as read-only.

@@ -276,10 +276,12 @@ func (s *aggregateStore) replaceResultLocked(q *queryState, plugin string, resul
 	if d := q.producers[plugin]; d != nil {
 		mgr = d.mgr
 	}
+	// Projection can add blocks for another row with the same ID.
+	decodeBlocks := maps.Clone(result.blockedSelects)
 	var hidden []bool
 	for i := range result.items {
 		row := &result.items[i]
-		if !result.projectRow(row, q.uiFeatures, mgr) {
+		if !result.projectRow(row, q.uiFeatures, mgr, slices.Contains(decodeBlocks[row.ID], "")) {
 			if hidden == nil {
 				hidden = make([]bool, len(result.items))
 			}
@@ -565,12 +567,15 @@ func (r *aggResult) readActions(row string, raw json.RawMessage) []wire.Action {
 	}
 	var actions []wire.Action
 	if json.Unmarshal(raw, &actions) != nil {
-		actions = r.recoverActions(row, raw)
+		return r.recoverActions(row, raw)
 	}
 	// Only the daemon can issue a cross-plugin offer.
 	for i := range actions {
-		actions[i].Secondary = false
-		actions[i].OfferID = ""
+		// A null entry decodes to an unnamed zero value; keep legacy unnamed objects.
+		if actions[i].Name == "" {
+			return r.recoverActions(row, raw)
+		}
+		actions[i].Secondary, actions[i].OfferID = false, ""
 	}
 	return actions
 }
@@ -578,13 +583,15 @@ func (r *aggResult) readActions(row string, raw json.RawMessage) []wire.Action {
 func (r *aggResult) recoverActions(row string, raw json.RawMessage) []wire.Action {
 	var entries []json.RawMessage
 	if json.Unmarshal(raw, &entries) != nil {
+		r.blockSelect(row, "")
 		return nil
 	}
 	actions := make([]wire.Action, 0, len(entries))
 	var hasDefault, brokenFirst, brokenDefault bool
 	for i, entry := range entries {
 		var action wire.Action
-		if json.Unmarshal(entry, &action) == nil {
+		if entry[0] == '{' && json.Unmarshal(entry, &action) == nil {
+			action.Secondary, action.OfferID = false, ""
 			actions = append(actions, action)
 			hasDefault = hasDefault || action.Default
 			continue
