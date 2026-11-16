@@ -83,6 +83,26 @@ type Destination struct {
 	Text    string `json:"text"`
 }
 
+func (d *Destination) UnmarshalJSON(raw []byte) error {
+	type fields Destination
+	decoded := struct {
+		fields
+		Context ContextField `json:"context"`
+	}{
+		fields:  fields(*d),
+		Context: ContextField{Value: d.Context},
+	}
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		return err
+	}
+	if decoded.Context.Invalid {
+		return ErrInvalidContext
+	}
+	*d = Destination(decoded.fields)
+	d.Context = decoded.Context.Value
+	return nil
+}
+
 // Action describes a named action a plugin can perform on a result.
 // Type is omitted for the default select behavior, or can request a UI mode
 // such as ActionTypeKeepOpen or ActionTypeQueryReplace.

@@ -11,7 +11,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-	"unicode/utf8"
 
 	"github.com/mithrel-dots/tarragon/internal/config"
 	"github.com/mithrel-dots/tarragon/internal/db"
@@ -21,56 +20,9 @@ import (
 
 var querySeq atomic.Uint64
 
-const (
-	maxPluginContextBytes = 4096
-	invalidContextMessage = "context must be a valid UTF-8 string, at most 4096 bytes, with no NUL"
-)
-
-func validPluginContext(value string) bool {
-	return len(value) <= maxPluginContextBytes && utf8.ValidString(value) && !strings.ContainsRune(value, 0)
-}
-
 type incomingUIRequest struct {
 	wire.UIRequest
-	Context requestContext `json:"context"`
-}
-
-type requestContext struct {
-	value   string
-	invalid bool
-}
-
-func (c *requestContext) UnmarshalJSON(raw []byte) error {
-	if c.invalid || string(raw) == "null" {
-		return nil
-	}
-	// A valid byte uses at most six bytes in JSON, plus the enclosing quotes.
-	c.invalid = raw[0] != '"' || len(raw) > 6*maxPluginContextBytes+2 ||
-		json.Unmarshal(raw, &c.value) != nil || !validRequestContext(c.value, raw)
-	return nil // the request handler rejects invalid context without closing the session
-}
-
-func validRequestContext(value string, token []byte) bool {
-	if !validPluginContext(value) {
-		return false
-	}
-	if !strings.ContainsRune(value, utf8.RuneError) {
-		return true
-	}
-	// encoding/json silently replaces invalid bytes and unpaired surrogates.
-	raw := string(token)
-	explicit := strings.Count(raw, "\uFFFD")
-	for {
-		_, escape, ok := strings.Cut(raw, `\`)
-		if !ok {
-			break
-		}
-		if len(escape) >= 5 && strings.EqualFold(escape[:5], "ufffd") {
-			explicit++
-		}
-		raw = escape[1:] // skip the escaped character, including a literal backslash
-	}
-	return explicit == strings.Count(value, "\uFFFD")
+	Context wire.ContextField `json:"context"`
 }
 
 // uiClient tracks a connected UI.
@@ -288,7 +240,7 @@ func handleUIClient(ctx context.Context, conn peerConn, mgr *plugins.Manager, re
 			}
 			return
 		}
-		parsed.UIRequest.Context = parsed.Context.value
+		parsed.UIRequest.Context = parsed.Context.Value
 
 		if parsed.ClientID != "" {
 			client.clientID = parsed.ClientID
@@ -304,7 +256,7 @@ func handleUIClient(ctx context.Context, conn peerConn, mgr *plugins.Manager, re
 			_ = client.send(map[string]any{"type": "ok"})
 			continue
 		case "select":
-			a := ui.acceptSelect(session, client, parsed.UIRequest, parsed.Context.invalid)
+			a := ui.acceptSelect(session, client, parsed.UIRequest, parsed.Context.Invalid)
 			if a != nil {
 				if frecencyDB != nil && !a.noFrecency && a.producer != "" && a.resultID != "" {
 					history.Add(1)
@@ -342,11 +294,11 @@ func handleUIClient(ctx context.Context, conn peerConn, mgr *plugins.Manager, re
 			continue
 		}
 
-		if parsed.Context.invalid {
-			_ = client.send(map[string]string{"type": "error", "error": invalidContextMessage})
+		if parsed.Context.Invalid {
+			_ = client.send(map[string]string{"type": "error", "error": wire.ErrInvalidContext.Error()})
 			continue
 		}
-		if parsed.Context.value != "" && parsed.Plugin == "" {
+		if parsed.Context.Value != "" && parsed.Plugin == "" {
 			_ = client.send(map[string]string{"type": "error", "error": "context requires an explicit plugin"})
 			continue
 		}

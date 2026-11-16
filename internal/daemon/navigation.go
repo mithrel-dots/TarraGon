@@ -10,7 +10,7 @@ import (
 const navigationFeature = "navigation"
 
 func validDestination(d *wire.Destination) bool {
-	return d != nil && d.Plugin != "" && validPluginContext(d.Context)
+	return d != nil && d.Plugin != "" && wire.ValidContext(d.Context)
 }
 
 // Prefix queries trim their text and can collide. Only offer the replacement

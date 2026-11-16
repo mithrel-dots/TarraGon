@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"maps"
 	"net"
 	"os"
@@ -114,29 +115,49 @@ esac
 func TestScopedContextDecoding(t *testing.T) {
 	for _, tc := range []struct {
 		token string
+		value string
 		valid bool
 	}{
-		{`null`, true},
-		{`42`, false},
-		{`{}`, false},
-		{`[]`, false},
-		{`false`, false},
-		{`"�\uFFfd\\ufffd\uD83C\uDF31"`, true},
-		{`"\ud803"`, false},
-		{`"\\ufffd\udc03"`, false},
-		{"\"\xff\"", false},
-		{`"` + strings.Repeat("é", 2048) + `"`, true},
-		{`"` + strings.Repeat("é", 2048) + `a"`, false},
-		{`"` + strings.Repeat(`\u0061`, 4096) + `"`, true},
-		{`"` + strings.Repeat(`\u0061`, 4097) + `"`, false},
+		{"", "", true},
+		{`null`, "", true},
+		{`""`, "", true},
+		{`42`, "", false},
+		{`{}`, "", false},
+		{`[]`, "", false},
+		{`false`, "", false},
+		{`"�\uFFfd\\ufffd\uD83C\uDF31"`, "��\\ufffd🌱", true},
+		{`"\ud803"`, "", false},
+		{`"\\ufffd\udc03"`, "", false},
+		{`"\u0000"`, "", false},
+		{"\"\xff\"", "", false},
+		{`"` + strings.Repeat("é", 2048) + `"`, strings.Repeat("é", 2048), true},
+		{`"` + strings.Repeat("é", 2048) + `a"`, "", false},
+		{`"` + strings.Repeat(`\u0061`, 4096) + `"`, strings.Repeat("a", 4096), true},
+		{`"` + strings.Repeat(`\u0061`, 4097) + `"`, "", false},
 	} {
-		frame := []byte(`{"context":` + tc.token + `}`)
+		frame := `{"plugin":"p","text":"literal"`
+		if tc.token != "" {
+			frame += `,"context":` + tc.token
+		}
+		frame += `}`
 		var req incomingUIRequest
-		if err := json.Unmarshal(frame, &req); err != nil {
+		if err := json.Unmarshal([]byte(frame), &req); err != nil {
 			t.Fatal(err)
 		}
-		if got := !req.Context.invalid; got != tc.valid {
-			t.Errorf("context token %.30q: valid=%v, want %v", tc.token, got, tc.valid)
+		if valid := !req.Context.Invalid; valid != tc.valid || valid && req.Context.Value != tc.value {
+			t.Errorf("request context token %.30q: got %.30q (valid=%v), want %.30q (valid=%v)",
+				tc.token, req.Context.Value, valid, tc.value, tc.valid)
+		}
+		var next wire.ActionNext
+		err := json.Unmarshal([]byte(`{"type":"open","destination":`+frame+`}`), &next)
+		if !tc.valid {
+			if !errors.Is(err, wire.ErrInvalidContext) {
+				t.Errorf("destination context token %.30q: got %v, want invalid context", tc.token, err)
+			}
+			continue
+		}
+		if want := (wire.Destination{Plugin: "p", Text: "literal", Context: tc.value}); err != nil || next.Destination == nil || *next.Destination != want {
+			t.Errorf("destination context token %.30q: decoded incorrectly (%v)", tc.token, err)
 		}
 	}
 }
@@ -160,7 +181,7 @@ func TestInvalidContextKeepsUISessionAndWatch(t *testing.T) {
 	u.send(t, json.RawMessage(`{"type":"query","plugin":"p","query_stream":"view","watch":true,"context":42}`))
 	var rejection map[string]string
 	u.read(t, &rejection)
-	if rejection["type"] != "error" || rejection["error"] != invalidContextMessage {
+	if rejection["type"] != "error" || rejection["error"] != wire.ErrInvalidContext.Error() {
 		t.Fatalf("bad query rejection: %v", rejection)
 	}
 	u.expectStatus(t)

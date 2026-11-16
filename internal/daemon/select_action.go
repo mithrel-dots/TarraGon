@@ -80,7 +80,7 @@ func (ui *uiRegistry) acceptSelect(session context.Context, client *uiClient, re
 		return nil
 	}
 	if invalidContext {
-		a.notRun(invalidContextMessage)
+		a.notRun(wire.ErrInvalidContext.Error())
 		return nil
 	}
 	invalidOffer := req.OfferID != "" || legacyOfferName(req.Action)

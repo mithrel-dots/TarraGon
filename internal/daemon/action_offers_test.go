@@ -34,9 +34,11 @@ func TestMalformedRowActions(t *testing.T) {
 
 	const ref = `"ref":{"type":"file","value":"/pictures/sky.png","mime":"image/png"}`
 	const raw = `{"ordered":true,"items":[` +
-		`{"id":"opens",` + ref + `,"actions":[{"name":"open","type":"open","destination":{"plugin":"finder","context":"child"},"default":true,"secondary":true,"offer_id":"forged","future":{"flag":true}},{"name":"bad","requires":"navigation"}]},` +
+		`{"id":"opens",` + ref + `,"actions":[{"name":"open","type":"open","destination":{"plugin":"finder","context":"child"},"default":true,"secondary":true,"offer_id":"forged","future":{"flag":true}},{"name":"bad","requires":"navigation"},{"name":"bad-context","type":"open","destination":{"plugin":"finder","context":"\ud800"}}]},` +
 		`{"id":"bad-default",` + ref + `,"actions":[{"name":"open","type":"open","destination":{"plugin":"finder"},"default":true,"requires":42},{"name":"delete"}]},` +
 		`{"id":"bad-sole",` + ref + `,"actions":[{"name":"open","type":"open","destination":{"plugin":"finder"},"requires":"navigation"}]},` +
+		`{"id":"bad-context-default",` + ref + `,"actions":[{"name":"delete"},{"name":"open","type":"open","default":true,"destination":{"plugin":"finder","context":"\ud800"}}]},` +
+		`{"id":"bad-context-sole",` + ref + `,"actions":[{"name":"open","type":"open","destination":{"plugin":"finder","context":42}}]},` +
 		`{"id":"null-first",` + ref + `,"actions":[null,{"name":"delete"}]},` +
 		`{"id":"null-only",` + ref + `,"actions":[null]},` +
 		`{"id":"wrong-entry",` + ref + `,"actions":["delete"]},` +
@@ -65,6 +67,7 @@ func TestMalformedRowActions(t *testing.T) {
 	for _, blocked := range []struct{ row, name string }{
 		{"opens", "bad"}, {"bad-default", "open"}, {"bad-sole", "open"},
 		{"bad-default", ""}, {"bad-sole", ""}, {"null-first", ""}, {"null-only", ""}, {"wrong-entry", ""}, {"wrong-container", ""},
+		{"opens", "bad-context"}, {"bad-context-default", "open"}, {"bad-context-default", ""}, {"bad-context-sole", "open"}, {"bad-context-sole", ""},
 	} {
 		choice := wire.UIRequest{QueryID: ack.QueryID, Plugin: "finder", ResultID: blocked.row, Action: blocked.name}
 		owner.outcome(t, owner.selectRow(t, choice), false, "not_run")
