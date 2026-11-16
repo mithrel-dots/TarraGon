@@ -3,8 +3,8 @@ package daemon
 import (
 	"encoding/json"
 	"fmt"
-	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -352,7 +352,7 @@ func TestLivePushDoesNotCompleteRefresh(t *testing.T) {
 }
 
 func TestWatchRenewalBeforeWriter(t *testing.T) {
-	for _, outcome := range []string{"renew", "disconnect", "timeout"} {
+	for _, outcome := range []string{"renew", "disconnect", "timeout", "revoked", "encoding failure"} {
 		t.Run(outcome, func(t *testing.T) { testQueuedWatchRenewal(t, outcome) })
 	}
 }
@@ -365,9 +365,11 @@ func testQueuedWatchRenewal(t *testing.T, outcome string) {
 		f.store.watches.timeout = 250 * time.Millisecond
 	}
 	f.configure("p", plugins.LifecycleDaemon, true, "")
-	server, client := net.Pipe()
-	defer server.Close()
-	defer client.Close()
+	f.mgr.Plugins["p"].Config.Capabilities = []string{"replay"}
+	socket, p := admissionSocket(t)
+	server := &gatedQueryDeadline{socket, make(chan struct{}, 1), make(chan struct{}), make(chan struct{})}
+	release := sync.OnceFunc(func() { close(server.release) })
+	defer release()
 	f.registry.set("p", server)
 	defer f.registry.remove("p", server)
 	out := make(chan pluginRequest, 1)
@@ -381,21 +383,20 @@ func testQueuedWatchRenewal(t *testing.T, outcome string) {
 			return pluginRequest{}
 		}
 	}
-	updates := make(chan *wire.UpdateMessage, 4)
-	if reason := f.store.startUIQuery(t.Context(), "q", "label", "owner", wire.UIRequest{Watch: true}, "p"); reason != "" {
-		t.Fatal(reason)
-	}
-	f.store.armWatch("q", func(update *wire.UpdateMessage, _ []string) { updates <- update })
-	dispatchQuery(t.Context(), "text", "q", f.mgr, out, f.registry, f.store, f.ui, true, "p")
-	if !f.store.beginQueryWrite(next(), nil) {
-		t.Fatal("initial write lost")
-	}
-	f.store.receiveQuery("p", server, wire.PluginResponse{QueryID: "q", Data: json.RawMessage(`["row"]`), Live: true})
-	f.store.refreshAction(&selectAction{queryID: "q", owner: "owner", producer: "p", handler: "p", resultID: "row", offered: true})
+	owner := f.connectUI(t, out)
+	id := watchQuery(t, owner, true)
+	f.requests <- next()
+	watchRequest(t, p, id)
+	f.store.receiveQuery("p", server, wire.PluginResponse{QueryID: id, Data: json.RawMessage(`["row"]`), Live: true})
+	watchRows(t, owner, id, "row")
+	q := f.store.query(id)
+	action := &selectAction{queryID: id, owner: q.session, producer: "p", handler: "consumer", resultID: "row", offered: true}
+	f.store.refreshAction(action)
 	req := next() // final push arrives before the queued refresh reaches the writer
-	final := wire.PluginResponse{Type: wire.MsgLiveUpdate, QueryID: "q", Data: json.RawMessage(`["last"]`), Final: true}
+	final := wire.PluginResponse{Type: wire.MsgLiveUpdate, QueryID: id, Data: json.RawMessage(`["last"]`), Final: true}
 	f.store.receiveQuery("p", server, final)
-	q := f.store.query("q")
+	watchRows(t, owner, id, "last")
+	f.store.WaitForPublications()
 	f.store.create("ordinary-1", "other", "older")
 	f.store.create("ordinary-2", "other", "newer")
 	q.mu.Lock()
@@ -403,7 +404,7 @@ func testQueuedWatchRenewal(t *testing.T, outcome string) {
 	timer := d.renewal
 	pending := q.watch != nil && d.outstanding && d.started.IsZero()
 	q.mu.Unlock()
-	if !pending || timer == nil || f.store.query("q") != q || totalWatchUsage(f.store).count != 1 {
+	if !pending || timer == nil || f.store.query(id) != q || totalWatchUsage(f.store).count != 1 {
 		t.Fatal("refresh queued before the writer did not hold the reservation")
 	}
 	final.Data = json.RawMessage(`["unsolicited"]`)
@@ -415,22 +416,83 @@ func testQueuedWatchRenewal(t *testing.T, outcome string) {
 		t.Fatal("unsolicited push changed the renewal timer")
 	}
 	switch outcome {
-	case "renew":
-		if !f.store.beginQueryWrite(req, nil) {
-			t.Fatal("refresh write lost")
+	case "revoked":
+		observer := f.connectUI(t, f.requests)
+		old := watchQuery(t, observer, false)
+		watchRequest(t, p, old)
+		f.store.receiveQuery("p", server, wire.PluginResponse{QueryID: old, Data: json.RawMessage(`["old"]`), Live: true})
+		watchRows(t, observer, old, "old")
+		server.arm <- struct{}{}
+		f.requests <- req
+		select {
+		case <-server.started:
+		case <-time.After(time.Second):
+			t.Fatal("refresh did not reach the writer")
 		}
-		f.store.receiveQuery("p", server, wire.PluginResponse{QueryID: "q", Data: json.RawMessage(`["renewed"]`), Live: true})
+		f.mgr.Lock()
+		f.mgr.Plugins["p"].Config.Capabilities = nil
+		f.mgr.Unlock()
+		for range cap(f.requests) {
+			f.requests <- pluginRequest{name: "p", conn: server, queryID: "expired"}
+		}
+		release()
+		expectPluginQueryFrame(t, p, wire.MsgEnd, old) // demotion evicts the old live query through the full writer
+		f.store.WaitForPublications()
+		owner.expectStatus(t) // revocation does not publish an update
+		q.mu.Lock()
+		revoked := !d.outstanding && d.renewal == nil && q.Plugins["p"].State == "done"
+		q.mu.Unlock()
+		if !revoked || totalWatchUsage(f.store) != (watchUsage{}) || !f.store.offeredRow(q.session, id, "p", "last") {
+			t.Fatal("revocation did not demote the watch with its prior rows")
+		}
+		if timer.Stop() {
+			t.Fatal("revocation left the renewal timer running")
+		}
+		return
+	case "encoding failure":
+		action.resultID = "last"
+		f.store.refreshAction(action)
+		out <- pluginRequest{queryID: "held-fence"} // make the queue for the follow-up full
+		req.text = strings.Repeat("<", wire.MaxMessageSize/6+1)
+		f.requests <- req
+		snap := refreshSnapshot(t, func(v any) { owner.read(t, v) }, id, func(s aggregate) bool {
+			return s.Plugins["p"].State == "error"
+		})
+		if snap.Plugins["p"].Error != wire.ErrMessageTooLarge.Error() || len(snap.List) != 1 || snap.List[0].ID != "last" {
+			t.Fatalf("local encoding failure displaced prior rows: %+v", snap)
+		}
+		f.requests <- pluginRequest{name: "p", conn: server, queryID: "writer-fence", end: true}
+		expectPluginQueryFrame(t, p, wire.MsgEnd, "writer-fence")
+		if next().queryID != "held-fence" {
+			t.Fatal("coalesced follow-up bypassed the held queue")
+		}
+		req = next()
+		q.mu.Lock()
+		held := d.outstanding && d.renewal == timer && d.started.IsZero()
+		q.mu.Unlock()
+		if !held || totalWatchUsage(f.store).count != 1 {
+			t.Fatal("local encoding failure lost or restarted the follow-up's renewal hold")
+		}
+		fallthrough
+	case "renew":
+		f.requests <- req
+		watchRequest(t, p, id)
+		f.store.receiveQuery("p", server, wire.PluginResponse{QueryID: id, Data: json.RawMessage(`["renewed"]`), Live: true})
+		watchRows(t, owner, id, "renewed")
 		f.store.create("ordinary-3", "other", "newest")
 		q.mu.Lock()
 		renewed := d.live && d.renewal == nil && !d.outstanding
 		q.mu.Unlock()
-		if !renewed || !f.store.offeredRow("owner", "q", "p", "renewed") || totalWatchUsage(f.store).count != 1 {
+		if !renewed || !f.store.offeredRow(q.session, id, "p", "renewed") || totalWatchUsage(f.store).count != 1 {
 			t.Fatal("solicited live reply did not renew the watch")
+		}
+		if timer.Stop() {
+			t.Fatal("successful renewal left the old timer running")
 		}
 		final.Data = json.RawMessage(`["finished"]`)
 		f.store.receiveQuery("p", server, final)
 		f.store.WaitForPublications()
-		if totalWatchUsage(f.store) != (watchUsage{}) || f.store.query("q") != q {
+		if totalWatchUsage(f.store) != (watchUsage{}) || f.store.query(id) != q {
 			t.Fatal("final push without a refresh did not demote the renewed watch")
 		}
 		return
@@ -441,22 +503,15 @@ func testQueuedWatchRenewal(t *testing.T, outcome string) {
 		q.mu.Lock()
 		disconnected := !d.outstanding && d.renewal == nil && q.Plugins["p"].Error == "plugin disconnected"
 		q.mu.Unlock()
-		if !disconnected || totalWatchUsage(f.store) != (watchUsage{}) || f.store.query("q") != q {
+		if !disconnected || totalWatchUsage(f.store) != (watchUsage{}) || f.store.query(id) != q {
 			t.Fatal("disconnect did not retire the queued refresh and demote the watch")
 		}
 		return
 	}
-	snap := refreshSnapshot(t, func(v any) {
-		select {
-		case update := <-updates:
-			*v.(*wire.UpdateMessage) = *update
-		case <-time.After(time.Second):
-			t.Fatal("watch did not publish its renewal timeout")
-		}
-	}, "q", func(s aggregate) bool { return s.WatchError != "" })
+	snap := watchError(t, owner, id, "refresh response")
 	f.store.WaitForPublications()
-	if !strings.Contains(snap.WatchError, "refresh response") || len(snap.List) != 1 || snap.List[0].ID != "last" ||
-		totalWatchUsage(f.store) != (watchUsage{}) || f.store.query("q") != nil || f.store.beginQueryWrite(req, nil) {
+	if len(snap.List) != 1 || snap.List[0].ID != "last" ||
+		totalWatchUsage(f.store) != (watchUsage{}) || f.store.query(id) != nil || f.store.beginQueryWrite(req, nil) {
 		t.Fatalf("renewal timeout did not end the queued refresh and release the watch: %+v", snap)
 	}
 }
