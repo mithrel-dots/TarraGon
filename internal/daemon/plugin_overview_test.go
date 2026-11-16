@@ -178,6 +178,7 @@ func TestPluginOverviewOverUIConnection(t *testing.T) {
 
 func TestOverviewActionsRespectRoutingAndLifecycle(t *testing.T) {
 	f := newAdmissionFixture(t, time.Second)
+	f.store.limit = 1
 	entry := writeScript(t, t.TempDir(), "probe", "#!/bin/sh\nprintf '[\"%s\"]' \"$TARRAGON_PLUGIN_ID\"\n")
 	f.configure("a", plugins.LifecycleDaemon, true, "")
 	f.configure("b", plugins.LifecycleOnCall, true, entry)
@@ -192,9 +193,11 @@ func TestOverviewActionsRespectRoutingAndLifecycle(t *testing.T) {
 		peer := f.connectUI(t, f.requests)
 		u := navigationUI{views: []navigationView{{destination: wire.Destination{Text: "@plugins"}}}, features: features}
 		overview := navigationSnapshot(t, peer, u.query(), plugins.OverviewID)
+		u.current().queryID = overview.QueryID
 		if len(overview.List) != 5 {
 			t.Fatalf("expected five overview rows, got %+v", overview.List)
 		}
+		var cachedDetails *wire.UIRequest
 		for _, row := range overview.List {
 			if row.ID == plugins.OverviewID {
 				continue
@@ -230,6 +233,24 @@ func TestOverviewActionsRespectRoutingAndLifecycle(t *testing.T) {
 			}
 			if !row.Actions[0].Default || !slices.Equal(names, want) {
 				t.Fatalf("%s, features %v: unexpected actions %+v", row.ID, features, row.Actions)
+			}
+			if len(features) == 0 && row.ID == "d" {
+				open := peer.selectRow(t, wire.UIRequest{QueryID: overview.QueryID, Plugin: row.Plugin, ResultID: row.ID, Action: "open"})
+				peer.outcome(t, open, false, "not_run")
+				cachedDetails = u.activate(row, row.Actions[0])
+			}
+		}
+		if cachedDetails != nil {
+			navigationSnapshot(t, peer, &wire.UIRequest{Type: "query", Text: "@plugins d"}, plugins.OverviewID)
+			if f.store.query(cachedDetails.QueryID) != nil {
+				t.Fatal("expected cached overview to be evicted")
+			}
+			for _, name := range []string{cachedDetails.Action, ""} {
+				cachedDetails.Action = name
+				ack := peer.selectRow(t, *cachedDetails)
+				if resp := peer.outcome(t, ack, true, ""); !strings.Contains(resp.Message, "enabled, ready") {
+					t.Fatalf("cached default did not show details: %+v", resp)
+				}
 			}
 		}
 	}

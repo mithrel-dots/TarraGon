@@ -276,10 +276,29 @@ func (s *aggregateStore) replaceResultLocked(q *queryState, plugin string, resul
 	if d := q.producers[plugin]; d != nil {
 		mgr = d.mgr
 	}
+	var hidden []bool
 	for i := range result.items {
-		result.projectRow(&result.items[i], q.uiFeatures, mgr)
+		row := &result.items[i]
+		if !result.projectRow(row, q.uiFeatures, mgr) {
+			if hidden == nil {
+				hidden = make([]bool, len(result.items))
+			}
+			hidden[i] = true
+			// Keep duplicate IDs in the offer check without offering actions on hidden rows.
+			row.Ref = nil
+		}
 	}
 	q.addOffersLocked(result.items, mgr)
+	if hidden != nil {
+		visible := result.items[:0]
+		for i, row := range result.items {
+			if !hidden[i] {
+				visible = append(visible, row)
+			}
+		}
+		clear(result.items[len(visible):])
+		result.items = visible
+	}
 	if q.watch != nil {
 		result.watchBytes = resultWatchBytes(result)
 		delta := result.watchBytes - q.Results[plugin].watchBytes + int64(len(errMsg)-len(q.Plugins[plugin].Error))

@@ -112,6 +112,7 @@ cd "${0%/*}" || exit 1
 echo "$2:$3:$4:$TARRAGON_CONTEXT" >> calls
 case "$2:$4" in
   query:) cat rows.json ;;
+  select:) echo '{"success":true,"message":"Selected"}' ;;
   select:Mark|select:Continue) echo '{"success":true,"message":"Saved","next":{"type":"open","issuer":"forged","destination":{"plugin":"catalog","context":"episode:7","text":""},"title":"Episode 7"}}' ;;
   select:Done) echo '{"success":true,"next":{"type":"back"}}' ;;
   *) exit 1 ;;
@@ -133,8 +134,16 @@ esac
 		query := func(req *wire.UIRequest) wire.ResultItem {
 			t.Helper()
 			snap := navigationSnapshot(t, peer, req, "catalog")
-			if !bytes.Equal(snap.Results["catalog"].Data, compact.Bytes()) || len(snap.List) != 2 {
-				t.Fatalf("lost original plugin payload or rows: %+v", snap)
+			want := []string{"show", "legacy"}
+			if len(features) != 0 {
+				want = []string{"show", "private-view", "unsafe-open", "unsafe-required", "legacy"}
+			}
+			var ids []string
+			for _, row := range snap.List {
+				ids = append(ids, row.ID)
+			}
+			if !bytes.Equal(snap.Results["catalog"].Data, compact.Bytes()) || !slices.Equal(ids, want) || snap.Plugins["catalog"].Count != len(want) {
+				t.Fatalf("wrong raw payload, visible rows or count: %+v", snap)
 			}
 			u.current().queryID, u.current().rows = snap.QueryID, snap.List
 			return snap.List[0]
@@ -160,24 +169,36 @@ esac
 		reject("private-view", "Open")
 		if len(features) == 0 {
 			// A client that treats unknown action types as select sees none.
-			if len(root.Actions) != 2 || root.Actions[0].Name != "Search" || root.Actions[0].Type != "query_replace" ||
+			if len(root.Actions) != 2 || !root.Actions[0].Default || root.Actions[0].Name != "Search" || root.Actions[0].Type != "query_replace" ||
 				root.Actions[0].Query != "@cat summary" || root.Actions[1].Name != "Mark" {
 				t.Fatalf("baseline menu: %+v", root.Actions)
 			}
-			hidden := u.current().rows[1]
-			if len(hidden.Actions) != 0 {
-				t.Fatalf("baseline received context-only Open or a secondary offer with no primary: %+v", hidden.Actions)
+			legacy := u.current().rows[1]
+			if len(legacy.Actions) != 0 {
+				t.Fatalf("baseline legacy actionless row received actions: %+v", legacy)
 			}
-			reject(hidden.ID, "")
+			reject("private-view", "")
+			reject("unsafe-open", "")
+			reject("unsafe-open", "Open")
+			reject("unsafe-required", "")
+			reject("unsafe-required", "Continue")
 			reject(root.ID, "Continue")
+			cachedSelect := u.activate(legacy, wire.Action{})
 			row := query(u.activate(root, root.Actions[0]))
 			if resp := selectRow(u.activate(row, row.Actions[1])); resp.Next != nil || resp.Message != "Saved" {
 				t.Fatalf("wrong baseline outcome: %+v", resp)
 			}
+			if f.store.query(cachedSelect.QueryID) != nil {
+				t.Fatal("expected the baseline view to be evicted")
+			}
+			selectRow(cachedSelect)
 			continue
 		}
 		if len(root.Actions) != 6 || root.Actions[0].Type != "open" || root.Actions[3].Name != "Continue" {
 			t.Fatalf("navigation menu: %+v", root.Actions)
+		}
+		if actions := u.current().rows[2].Actions; len(actions) != 3 || actions[1].Name != "Delete" || !actions[2].Secondary {
+			t.Fatalf("lost native or secondary choices from the navigation view: %+v", actions)
 		}
 		child := query(u.activate(root, root.Actions[0]))
 		view := u.current()
@@ -201,13 +222,13 @@ esac
 		if view.queryID == firstID || view.selectedPlugin != "catalog" || view.selectedID != "show" || view.scroll != 37 {
 			t.Fatalf("Back failed to restore the evicted view: %+v", view)
 		}
-		if u.back() != nil || len(u.current().rows) != 2 || u.back() != nil || len(u.views) != 1 {
+		if u.back() != nil || len(u.current().rows) != 5 || u.back() != nil || len(u.views) != 1 {
 			t.Fatal("Back must restore cached root state, then do nothing at the root")
 		}
 	}
 	data, err := os.ReadFile(filepath.Join(dir, "calls"))
 	want := []string{
-		"query:root::", "query:summary::", "select:show:Mark:",
+		"query:root::", "query:summary::", "select:show:Mark:", "select:legacy::",
 		"query:root::", "query:::show:42", "select:show:Continue:show:42",
 		"query:::episode:7", "select:show:Done:episode:7", "query:::show:42",
 	}

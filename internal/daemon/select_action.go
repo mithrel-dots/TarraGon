@@ -93,12 +93,12 @@ func (ui *uiRegistry) acceptSelect(session context.Context, client *uiClient, re
 		if q.ctx.Err() == nil && (q.target == a.handler || q.producers[a.handler] != nil) {
 			a.pluginContext = q.pluginContext
 		}
+		if q.ctx.Err() == nil && !invalidOffer && slices.Contains(q.Results[a.producer].blockedSelects[a.resultID], req.Action) {
+			q.mu.Unlock()
+			a.notRun("This choice is not a selectable plugin action for this view.")
+			return nil
+		}
 		if row := q.sourceRowLocked(a.producer, a.resultID); row != nil && q.ctx.Err() == nil {
-			if !invalidOffer && slices.Contains(q.Results[a.producer].blockedSelects[row.ID], req.Action) {
-				q.mu.Unlock()
-				a.notRun("This choice is not a selectable plugin action for this view.")
-				return nil
-			}
 			a.offered = true
 			a.noFrecency = a.noFrecency || skipsFrecency(row.Actions, a.action)
 			for _, selected := range row.Actions {

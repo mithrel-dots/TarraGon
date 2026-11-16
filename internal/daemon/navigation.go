@@ -30,35 +30,42 @@ func replacementQuery(mgr *plugins.Manager, d *wire.Destination) (string, bool) 
 	return query, ok && id == d.Plugin && text == d.Text
 }
 
-// Project newly decoded rows for this owner before caching or publishing them.
+// projectRow reports whether the row has a safe projection for this view.
 // The original plugin JSON remains in aggResult.Data.
-func (r *aggResult) projectRow(row *wire.ResultItem, features []string, mgr *plugins.Manager) {
+func (r *aggResult) projectRow(row *wire.ResultItem, features []string, mgr *plugins.Manager) bool {
 	if len(row.Actions) == 0 {
-		return
+		return true
 	}
+	defaultIndex := max(0, slices.IndexFunc(row.Actions, func(a wire.Action) bool { return a.Default }))
 	actions := row.Actions[:0]
-	lostDefault := false
-	for _, action := range row.Actions {
+	projectedDefault := -1
+	for i, action := range row.Actions {
 		allowed := projectAction(&action, features, mgr)
 		if action.Name != "" && (!allowed || isNavigation(action)) {
 			r.blockSelect(row.ID, action.Name)
 		}
 		if allowed {
+			if i == defaultIndex {
+				projectedDefault = len(actions)
+			}
 			actions = append(actions, action)
-		} else if action.Default {
-			lostDefault = true
 		}
 	}
-	first := slices.IndexFunc(actions, func(a wire.Action) bool { return a.Default })
-	if first < 0 && len(actions) > 0 {
-		first = 0 // a baseline UI implicitly activates the first action
-		actions[0].Default = lostDefault
+	if projectedDefault < 0 {
+		if row.Plugin != plugins.OverviewID || len(actions) == 0 || actions[0].Name != "details" {
+			r.blockSelect(row.ID, "")
+			return false
+		}
+		// The built-in handles both "details" and an unnamed select as read-only.
+		actions[0].Default = true
+		projectedDefault = 0
 	}
-	if first < 0 || isNavigation(actions[first]) {
+	if isNavigation(actions[projectedDefault]) {
 		r.blockSelect(row.ID, "")
 	}
 	clear(row.Actions[len(actions):])
 	row.Actions = actions
+	return true
 }
 
 func (r *aggResult) blockSelect(row, name string) {
